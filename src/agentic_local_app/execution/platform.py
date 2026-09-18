@@ -160,7 +160,10 @@ class PosixProcessTable(ProcessTable):
         try:
             line = (self._proc / str(pid) / "stat").read_text(encoding="ascii", errors="replace")
             ticks = parse_proc_stat_start_ticks(line)
-            clk_tck = os.sysconf("SC_CLK_TCK")
+            sysconf = getattr(os, "sysconf", None)  # absent on Windows (mypy --platform win32)
+            if sysconf is None:
+                return None
+            clk_tck = int(sysconf("SC_CLK_TCK"))
         except (OSError, ValueError, AttributeError):
             return None
         boot = self._boot_time()
