@@ -169,6 +169,11 @@ class FakeCommandExecutor(CommandExecutor):
 
         pid = self._next_pid
         self._next_pid += 1
+        if scripted.hold:
+            # Create the barrier *before* announcing the spawn so that a test doing
+            # ``await wait_spawned(id)`` then ``release_all()`` cannot race the lazily created
+            # gate (Python 3.12's ``wait_for`` wakes the awaiting test one loop hop earlier).
+            self._gate(spec.task_id)
         if on_spawn is not None:
             on_spawn(pid, pid)
         self._mark_spawned(spec.task_id)
