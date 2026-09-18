@@ -4,7 +4,7 @@
 - ``executor``          CommandExecutor (ABC), SubprocessCommandExecutor, CommandSpec, RawExecution
 - ``payload_guard``     PayloadGuard: budgets, truncation, message cap, chunk serving
 - ``result_collector``  ResultCollector: one execution_result per terminal plan
-- ``plan_runner``       PlanRunner (phase 5)
+- ``plan_runner``       PlanRunner: DAG, locks, workers, stop conditions, drains -> PlanOutcome
 """
 
 from agentic_local_app.execution.executor import (
@@ -22,6 +22,16 @@ from agentic_local_app.execution.payload_guard import (
     TruncatedOutput,
     decode_output,
 )
+from agentic_local_app.execution.plan_runner import (
+    BUDGET_DURATION_STOP_REASON,
+    BUDGET_EXCEEDED_REASON,
+    INTERRUPT_REASON,
+    PLAN_STOPPED_REASON,
+    SPAWN_FAILED_REASON,
+    FailureRecorder,
+    PlanOutcome,
+    PlanRunner,
+)
 from agentic_local_app.execution.platform import (
     LaunchSpec,
     PlatformAdapter,
@@ -33,14 +43,22 @@ from agentic_local_app.execution.platform import (
 from agentic_local_app.execution.result_collector import ResultCollector
 
 __all__ = [
+    "BUDGET_DURATION_STOP_REASON",
+    "BUDGET_EXCEEDED_REASON",
+    "INTERRUPT_REASON",
+    "PLAN_STOPPED_REASON",
+    "SPAWN_FAILED_REASON",
     "CancellationToken",
     "ChunkError",
     "ChunkResult",
     "CommandExecutor",
     "CommandSpec",
+    "FailureRecorder",
     "LaunchSpec",
     "OutputChunk",
     "PayloadGuard",
+    "PlanOutcome",
+    "PlanRunner",
     "PlatformAdapter",
     "PosixPlatformAdapter",
     "ProcessTable",
