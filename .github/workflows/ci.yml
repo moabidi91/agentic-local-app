@@ -30,10 +30,15 @@ jobs:
         run: uv sync --extra dev --python ${{ matrix.python }}
 
       - name: Lint (ruff)
-        run: uv run ruff check src tests examples
+        run: uv run ruff check src tests examples tools
 
       - name: Type-check (mypy)
         run: uv run mypy
+
+      # the conformance report is generated from the battery: a case changed without the report
+      # being regenerated would leave the two out of step
+      - name: Conformance report up to date
+        run: uv run python tools/protocol_conformance_report.py --check
 
       - name: Unit + integration tests
         shell: bash

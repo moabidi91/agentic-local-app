@@ -133,21 +133,29 @@ Quatre comportements possibles, et un seul est choisi selon la nature de la faut
 
 Une réponse que le **codec** ne sait même pas lire (pas d'enveloppe du tout : du texte nu, un JSON invalide, un chemin absent) ne passe pas par l'adaptateur : c'est une `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY` levée au niveau du transport, avec un extrait brut de la réponse (ADR-021) — même politique (1 ou 2), mais aucune enveloppe à persister.
 
-## 3. Vue d'ensemble
+## 3. Ce que la campagne a corrigé
+
+La batterie a été écrite contre l'application telle qu'elle était, sans rien changer d'abord. Trois défauts sont apparus et ont été corrigés dans la foulée ; les cas correspondants vérifient désormais le comportement corrigé, et échoueraient si l'ancien revenait :
+
+1. **Une réponse qui n'est pas un objet JSON faisait planter la boucle** (`env-array-reply`, `env-string-reply`, `env-scalar-reply`). `_persist_rejected` construisait le payload du rejet avec `dict(reply.messages[0])` : un tableau, une chaîne nue ou un nombre levaient `TypeError` / `ValueError` **avant** toute persistance. Le résultat était un `SYSTEM_ERROR / UNHANDLED_EXCEPTION` remontant jusqu'à l'appelant, sans `message.rejected`, sans trace de ce que le modèle avait envoyé, et `protocol_error_count` inchangé — la faute la plus banale d'un modèle bavard était aussi la moins bien traitée. La forme brute est maintenant conservée telle quelle (`{{"raw": …}}`) et le rejet suit la politique 1 (`SCHEMA_INVALID`).
+2. **Un lot vide rendu par un GET faisait planter la boucle** (`env-empty-batch`). `wait_for_reply` promet au moins un message ; `parse_inbound([])` levait donc un `ValueError` de programmation. Un provider tiers (ADR-020) dont le long-poll rend une page vide tombait dessus. C'est désormais une `MODEL_PROTOCOL_ERROR / EMPTY_REPLY`, traitée comme toute réponse inutilisable.
+3. **Le rejet de l'ACK d'une rotation ne laissait pas de trace** (`seq-rejected-ack-trail`). Le `RotationCoordinator` comptait l'erreur et publiait `message.rejected`, mais n'écrivait aucun `MessageRecord` — la réponse fautive était invisible après coup, contrairement à tous les autres rejets — et le cycle `resume` de la conversation enfant restait `RUNNING` derrière une session `FAILED`. Le rejet est maintenant persisté comme ailleurs et le cycle clos en `FAILED` avec son `cycle.ended`.
+
+## 4. Vue d'ensemble
 
 {summary}
 
 **Total : {total} cas — {by_verdict.get("conforme", 0)} conformes, {by_verdict.get("à surveiller", 0)} à surveiller, {by_verdict.get("écart", 0)} écarts.**
 
-## 4. La matrice
+## 5. La matrice
 
 {chr(10).join(sections)}
 
-## 5. Constats et recommandations
+## 6. Constats et recommandations
 
 {findings}
 
-## 6. Comment rejouer la batterie
+## 7. Comment rejouer la batterie
 
 ```bash
 uv run pytest -m conformance -q                     # la batterie seule

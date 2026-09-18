@@ -145,6 +145,7 @@ Le détail de chaque couche et le mapping vers les modules Python est dans [`doc
 | [`docs/guides/`](docs/guides/README.md) | **Guides pratiques** : [prendre en main l'application](docs/guides/01-prise-en-main.md), [brancher un modèle par configuration](docs/guides/02-brancher-un-modele.md), [écrire un provider de transport](docs/guides/03-ecrire-un-provider.md), [écrire un codec de messages](docs/guides/04-ecrire-un-codec.md) |
 | [`examples/`](examples/README.md) | Un provider et un codec écrits **hors de l'application** (`acme_model_plugin`), sélectionnés par chemin d'import dans [`examples/config.acme.toml`](examples/config.acme.toml), couverts par les tests |
 | [`src/agentic_local_app/transport/README.md`](src/agentic_local_app/transport/README.md) | Carte du paquet transport : contrat, base HTTP, registres, codecs, invariants |
+| [`docs/reports/`](docs/reports/conformance-protocole.md) | **Rapport de conformité protocolaire** : ce que fait l'application face à un modèle qui se trompe (114 cas exécutables, généré depuis `tests/conformance`) |
 
 ## 6. Démarrage rapide
 

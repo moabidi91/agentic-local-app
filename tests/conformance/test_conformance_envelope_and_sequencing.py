@@ -245,105 +245,68 @@ ENVELOPE = "Enveloppe et forme du message"
     "env-array-reply",
     category=ENVELOPE,
     sends="un tableau JSON à la place de l'objet enveloppe",
-    expects="l'orchestrateur lève TypeError en persistant le rejet ; aucun message enregistré",
-    code="SYSTEM_ERROR / UNHANDLED_EXCEPTION",
-    policy="échec (exception propagée hors de la boucle)",
+    expects="rejet à l'étape enveloppe ; la forme brute est persistée sous `raw`",
+    code="SCHEMA_INVALID",
+    policy="échec",
     ref="§12 · ADR-007 · ADR-015",
-    verdict="écart",
-    note=(
-        "`_persist_rejected` fait `dict(reply.messages[0])` : une enveloppe qui n'est pas un objet "
-        "fait lever TypeError/ValueError avant la persistance. Le rejet devient un "
-        "SYSTEM_ERROR / UNHANDLED_EXCEPTION, la réponse fautive n'est pas persistée, "
-        "`protocol_error_count` reste à 0, aucun `message.rejected` n'est publié et l'exception "
-        "remonte jusqu'à `ConversationManager.wait`. Attendu : MODEL_PROTOCOL_ERROR / "
-        "SCHEMA_INVALID avec la réponse brute persistée. Correctif : garder la forme brute telle "
-        "quelle dans le payload (`{\"raw\": ...}`) quand l'élément n'est pas un objet."
-    ),
 )
-async def given_initial_user_request_when_model_replies_with_a_json_array_then_loop_crashes_instead_of_rejecting() -> (
+async def given_initial_user_request_when_model_replies_with_a_json_array_then_schema_invalid() -> (
     None
 ):
     rig = make_rig()
 
-    with pytest.raises((TypeError, ValueError)):
-        await run_rejecting(rig, [1, 2, 3])
+    await run_rejecting(rig, [1, 2, 3])
 
-    failure = only_failure(rig)
-    assert (failure.error_type, failure.error_code) == (
-        ErrorType.SYSTEM_ERROR,
-        "UNHANDLED_EXCEPTION",
-    )
-    assert failure.details["type"] == "TypeError"
-    assert rig.session(SESSION).status is SessionState.FAILED
-    conversation = rig.conversation(CONV)
-    assert conversation.status is ConversationState.FAILED
-    assert conversation.protocol_error_count == 0  # the reply was never counted
-    assert inbound_records(rig) == []  # nor persisted
-    assert rig.events(EventType.MESSAGE_REJECTED) == []
+    failure = assert_rejected_then_failed(rig, "SCHEMA_INVALID")
+    assert failure.details["stage"] == "envelope"
+    # the raw form is kept: it is the only trace of what the model answered
+    records = inbound_records(rig)
+    assert len(records) == 1
+    assert records[0].validation_status == "invalid"
+    assert records[0].payload == {"raw": [1, 2, 3]}
+    assert records[0].message_type is MessageType.SYSTEM_ERROR  # no readable type in the reply
 
 
 @case(
     "env-string-reply",
     category=ENVELOPE,
     sends="une chaîne de caractères à la place de l'objet enveloppe (codec passthrough)",
-    expects="l'orchestrateur lève ValueError en persistant le rejet ; aucun message enregistré",
-    code="SYSTEM_ERROR / UNHANDLED_EXCEPTION",
-    policy="échec (exception propagée hors de la boucle)",
+    expects="rejet à l'étape enveloppe ; le texte est persisté sous `raw`",
+    code="SCHEMA_INVALID",
+    policy="échec",
     ref="§12 · ADR-007 · ADR-015",
-    verdict="écart",
-    note=(
-        'Même cause que `env-array-reply` : `dict("...")` lève ValueError. Le protocole attend '
-        "SCHEMA_INVALID avec la réponse persistée en `validation_status = invalid`."
-    ),
 )
-async def given_initial_user_request_when_model_replies_with_a_bare_string_then_loop_crashes_instead_of_rejecting() -> (
+async def given_initial_user_request_when_model_replies_with_a_bare_string_then_schema_invalid() -> (
     None
 ):
     rig = make_rig()
 
-    with pytest.raises(ValueError):
-        await run_rejecting(rig, "I cannot produce a plan right now.")
+    await run_rejecting(rig, "I cannot produce a plan right now.")
 
-    failure = only_failure(rig)
-    assert (failure.error_type, failure.error_code) == (
-        ErrorType.SYSTEM_ERROR,
-        "UNHANDLED_EXCEPTION",
-    )
-    assert failure.details["type"] == "ValueError"
-    assert inbound_records(rig) == []
-    assert rig.conversation(CONV).protocol_error_count == 0
+    assert_rejected_then_failed(rig, "SCHEMA_INVALID")
+    records = inbound_records(rig)
+    assert len(records) == 1
+    assert records[0].payload == {"raw": "I cannot produce a plan right now."}
 
 
 @case(
     "env-scalar-reply",
     category=ENVELOPE,
     sends="un nombre, puis null, à la place de l'objet enveloppe",
-    expects="l'orchestrateur lève TypeError en persistant le rejet ; aucun message enregistré",
-    code="SYSTEM_ERROR / UNHANDLED_EXCEPTION",
-    policy="échec (exception propagée hors de la boucle)",
+    expects="rejet à l'étape enveloppe ; le scalaire est persisté sous `raw`",
+    code="SCHEMA_INVALID",
+    policy="échec",
     ref="§12 · ADR-007 · ADR-015",
-    verdict="écart",
-    note=(
-        "Même cause que `env-array-reply` : `dict(123)` et `dict(None)` lèvent TypeError. "
-        "Un scalaire est la faute la plus banale d'un modèle bavard et elle casse la boucle."
-    ),
 )
-async def given_initial_user_request_when_model_replies_with_a_scalar_then_loop_crashes_instead_of_rejecting() -> (
-    None
-):
+async def given_initial_user_request_when_model_replies_with_a_scalar_then_schema_invalid() -> None:
     for scalar in (123, None):
         rig = make_rig()
 
-        with pytest.raises(TypeError):
-            await run_rejecting(rig, scalar)
+        await run_rejecting(rig, scalar)
 
-        failure = only_failure(rig)
-        assert (failure.error_type, failure.error_code) == (
-            ErrorType.SYSTEM_ERROR,
-            "UNHANDLED_EXCEPTION",
-        )
-        assert inbound_records(rig) == []
-        assert rig.conversation(CONV).protocol_error_count == 0
+        assert_rejected_then_failed(rig, "SCHEMA_INVALID")
+        records = inbound_records(rig)
+        assert len(records) == 1 and records[0].payload == {"raw": scalar}
 
 
 @case(
@@ -721,36 +684,35 @@ async def given_initial_user_request_when_model_never_replies_then_session_fails
     "env-empty-batch",
     category=ENVELOPE,
     sends="un GET qui rend un lot vide (aucun message) au lieu d'attendre",
-    expects="l'adaptateur lève ValueError ; la boucle s'arrête sur une erreur système",
-    code="SYSTEM_ERROR / UNHANDLED_EXCEPTION",
-    policy="échec (exception propagée hors de la boucle)",
-    ref="§3.12 · ADR-004",
-    verdict="à surveiller",
-    note=(
-        "`wait_for_reply` promet au moins un message, donc `parse_inbound([])` lève un ValueError "
-        "de programmation que l'orchestrateur transforme en SYSTEM_ERROR / UNHANDLED_EXCEPTION et "
-        "propage. Un transport tiers (ADR-020) qui rend un lot vide sur un long-poll fait donc "
-        "planter la boucle plutôt que de retomber sur MODEL_GET_TIMEOUT. À traiter comme une "
-        "réponse inutilisable dans `_receive`."
-    ),
+    expects="rejet comme réponse inutilisable ; la boucle ne plante pas",
+    code="EMPTY_REPLY",
+    policy="échec",
+    ref="§3.12 · ADR-004 · ADR-020",
 )
-async def given_initial_user_request_when_get_returns_an_empty_batch_then_loop_raises_a_system_error() -> (
-    None
-):
+async def given_initial_user_request_when_get_returns_an_empty_batch_then_empty_reply() -> None:
+    """``wait_for_reply`` promet au moins un message : un provider tiers (ADR-020) dont le
+    long-poll rend une page vide casse ce contrat, et c'est traité comme toute réponse
+    inutilisable — jamais comme une erreur de programmation."""
     rig = make_rig()
     rig.transport.enqueue_messages(REMOTE_1, [])
 
-    with pytest.raises(ValueError):
-        await rig.run()
+    await rig.run()
 
     failure = only_failure(rig)
     assert (failure.error_type, failure.error_code) == (
-        ErrorType.SYSTEM_ERROR,
-        "UNHANDLED_EXCEPTION",
+        ErrorType.MODEL_PROTOCOL_ERROR,
+        "EMPTY_REPLY",
     )
+    assert failure.retryable is False
+    assert failure.details["expected"] == 1 and failure.details["received"] == 0
     assert rig.session(SESSION).status is SessionState.FAILED
-    assert rig.conversation(CONV).protocol_error_count == 0
-    assert inbound_records(rig) == []
+    conversation = rig.conversation(CONV)
+    assert conversation.status is ConversationState.FAILED
+    assert conversation.protocol_error_count == 1
+    # nothing was sent, so the persisted record keeps an empty batch rather than a fake message
+    records = inbound_records(rig)
+    assert len(records) == 1 and records[0].payload == {"messages": []}
+    assert rig.app.audit.verify(SESSION).valid is True
 
 
 # ================================================================================================
@@ -1148,26 +1110,20 @@ async def given_context_resume_request_sent_when_ack_is_negative_then_ack_not_ac
     category=SEQUENCING,
     sends="un `context_resume_ack` refusé pendant une rotation (trace laissée)",
     expects=(
-        "le rejet est compté et publié mais la réponse fautive n'est pas persistée, et le cycle "
-        "`resume` de l'enfant reste RUNNING"
+        "le rejet est compté, publié, **persisté** comme ailleurs, et le cycle `resume` de "
+        "l'enfant est clos en FAILED"
     ),
     code="ACK_NOT_ACKNOWLEDGED",
     policy="échec de la rotation, session FAILED",
     ref="§10 · §16 · ADR-014 · ADR-015",
-    verdict="à surveiller",
-    note=(
-        "Le chemin de rejet du `RotationCoordinator` n'est pas celui de l'orchestrateur : "
-        "`_accept_ack` incrémente `protocol_error_count`, avance le curseur et publie "
-        "`message.rejected`, mais n'écrit **aucun** `MessageRecord` — la réponse fautive du modèle "
-        "n'est donc visible nulle part après coup, contrairement au rejet de `_persist_rejected`. "
-        "Et le cycle `resume` ouvert dans l'enfant reste RUNNING alors que la session est FAILED : "
-        "`_fail_cycle` ne connaît que le cycle courant de l'orchestrateur (celui du parent). "
-        "Correctif : persister le rejet comme ailleurs et clore le cycle de reprise."
-    ),
 )
-async def given_rotation_rejected_on_the_ack_when_session_fails_then_no_record_and_resume_cycle_left_running() -> (
+async def given_rotation_rejected_on_the_ack_when_session_fails_then_reply_persisted_and_cycle_failed() -> (
     None
 ):
+    """Le chemin de rejet du `RotationCoordinator` laisse la même trace que celui de
+    l'orchestrateur : sans le `MessageRecord`, la réponse fautive du modèle serait invisible
+    après coup, et un cycle `resume` laissé RUNNING derrière une session FAILED serait un état
+    incohérent."""
     rig = make_rig()
     sid = await completed_then_warning(rig)
     rig.reply(REMOTE_1, out_of_grammar_follow_up())
@@ -1181,16 +1137,20 @@ async def given_rotation_rejected_on_the_ack_when_session_fails_then_no_record_a
     assert child.protocol_error_count == 1
     assert child.get_cursor == "model-ack-0002"
     assert child.last_model_response_state == "received_invalid"
-    # counted and published, but nothing persisted to show what the model actually sent
-    assert inbound_records(rig, CHILD) == []
+    records = inbound_records(rig, CHILD)
+    assert len(records) == 1
+    assert records[0].message_id == "model-ack-0002"
+    assert records[0].validation_status == "invalid"
+    assert records[0].message_type is MessageType.CONTEXT_RESUME_ACK
+    assert child.last_inbound_message_id == "model-ack-0002"
     rejected = [
         event for event in rig.events(EventType.MESSAGE_REJECTED) if event.conversation_id == CHILD
     ]
     assert len(rejected) == 1 and rejected[0].payload["error_code"] == "ACK_NOT_ACKNOWLEDGED"
-    # the resume cycle of the child is never closed
+    # the resume cycle of the child is closed, not left running behind a failed session
     child_cycles = rig.cycles(CHILD)
     assert [(cycle.cycle_type.value, cycle.status) for cycle in child_cycles] == [
-        ("resume", CycleState.RUNNING)
+        ("resume", CycleState.FAILED)
     ]
     assert rig.app.audit.verify(sid).valid is True
 

@@ -12,5 +12,6 @@ Ces règles sont fixées par le propriétaire du dépôt et priment sur toute co
 ## Conventions du dépôt
 
 - Messages de commit : `type(portée): résumé` (`feat`, `fix`, `docs`, `test`, `chore`, `ci`), en anglais, résumé ≤ 100 caractères.
-- Avant tout commit : `uv run ruff check src tests examples`, `uv run ruff format src tests examples`, `uv run mypy`, `uv run pytest -q` doivent être verts (`examples/` contient le plugin hors dépôt cité par les guides ; il est vérifié et testé comme le code de l'application).
+- Avant tout commit : `uv run ruff check src tests examples tools`, `uv run ruff format src tests examples tools`, `uv run mypy`, `uv run pytest -q` doivent être verts (`examples/` contient le plugin hors dépôt cité par les guides ; il est vérifié et testé comme le code de l'application).
+- Toute modification d'un cas de `tests/conformance` impose de régénérer le rapport : `uv run python tools/protocol_conformance_report.py` (la CI vérifie sa fraîcheur avec `--check`). Ne jamais éditer `docs/reports/conformance-protocole.md` à la main.
 - Ne pas modifier `docs/spec/SPEC-v1.1.md` : c'est la source de vérité ; toute décision qui la précise passe par un ADR dans `docs/adr/`.
