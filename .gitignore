@@ -38,3 +38,6 @@ Thumbs.db
 .env
 .env.*
 *.env
+
+# Transfer artifacts (bundles/tarballs exchanged with the workstation)
+_transfer/
