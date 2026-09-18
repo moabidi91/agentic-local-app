@@ -50,6 +50,7 @@ asyncio_mode = "auto"
 timeout = 30
 addopts = "-ra --strict-markers"
 markers = [
+    "phase0: foundation (domain, config, bus, in-memory store)",
     "phase1: state machines",
     "phase2: protocol layer",
     "phase3: persistence layer",

@@ -13,6 +13,7 @@ import pytest
 from agentic_local_app.config import AppConfig, AppSection
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.lifecycle.conversation_lifecycle import ConversationLifecycleManager
 from agentic_local_app.observability.event_bus import EventBus, RecordingSubscriber
 from agentic_local_app.persistence.memory import InMemoryConversationStore
 
@@ -49,3 +50,10 @@ def recorder(bus: EventBus) -> RecordingSubscriber:
 def config(tmp_path: Path) -> AppConfig:
     """Default configuration with a temporary data directory."""
     return AppConfig(app=AppSection(data_dir=str(tmp_path / "data")))
+
+
+@pytest.fixture
+def lifecycle(
+    store: InMemoryConversationStore, bus: EventBus, clock: FakeClock, ids: SequentialIdGenerator
+) -> ConversationLifecycleManager:
+    return ConversationLifecycleManager(store, bus, clock, ids)
