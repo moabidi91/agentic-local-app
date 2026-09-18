@@ -34,7 +34,7 @@ src/agentic_local_app/
 │   ├── result_collector.py        ResultCollector : un execution_result par plan
 │   └── plan_runner.py             PlanRunner : DAG, locks, workers, stop conditions, drain     [phase 5]
 ├── interruption/
-│   └── handler.py                 InterruptSignal, InterruptionHandler                          [phase 6]
+│   └── handler.py                 InterruptionHandler (jeton = CancellationToken par session)   [phase 6]
 ├── transport/
 │   ├── gateway.py                 TransportGateway (ABC), HttpTransportGateway                  [phase 7]
 │   └── fake.py                    FakeTransportGateway (scénarios scriptés)
@@ -113,7 +113,7 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | `PayloadGuard(config.payload)` | `apply(stdout: bytes, stderr: bytes, budget: int) -> TruncatedOutput` · `fit_message(result: ExecutionResultContent, max_message_bytes) -> ExecutionResultContent` · `serve_chunk(store, session_id, ref_task_id, stream, offset, max_bytes) -> ChunkResult` · `effective_budget(task, plan_default) -> int` |
 | `ResultCollector()` | `build(plan: PlanRecord, tasks: list[TaskRecord], task_outputs: dict[str, TruncatedOutput], chunk_results: dict[str, ChunkResult]) -> ExecutionResultContent` |
 | `PlanRunner(store, bus, executor, payload_guard, clock, ids, config, *, failure_manager=None)` | `async run(plan: PlanRecord, tasks: list[TaskRecord], session: SessionRecord, *, interrupt: CancellationToken) -> PlanOutcome(plan, tasks, execution_result \| None, interrupted, budget_exceeded, stop_reason)` |
-| `InterruptionHandler(store, bus, lifecycle, clock, config)` | `async interrupt(session_id) -> InterruptionReport` (borné par `interrupt_drain_timeout_ms`) · `signal: InterruptSignal` |
+| `InterruptionHandler(store, bus, lifecycle, clock, ids, config, *, transport=None)` | `token_for(session_id) -> CancellationToken` · `register_loop(session_id) -> asyncio.Event` · `loop_finished(session_id)` · `async interrupt(session_id, *, reason="user_interrupt") -> InterruptionReport` (borné par `interrupt_drain_timeout_ms`) · `is_interrupting(session_id)` · `raise_if_interrupted(session_id)` |
 | `HttpTransportGateway(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` | `async init_conversation(instructions, metadata) -> str` · `async post_message(remote_conversation_id, payload) -> PostAck` · `async get_messages(remote_conversation_id, after) -> GetResult` · `async wait_for_reply(remote_conversation_id, after) -> GetResult` (polling borné, `MODEL_GET_TIMEOUT`) · `async close_conversation(remote_conversation_id)` · `abandon()` |
 | `FailureManager(config, store, bus, clock, ids, retry=None, breaker=None)` | `classify(exc) -> NormalizedError` · `decide(error, attempt, *, operation) -> Decision(kind: retry \| abort \| rotate \| fail, delay_ms, reason)` · `record(error, *, session_id, conversation_id=None, plan_id=None, task_id=None) -> FailureRecord` · `record_decision(...) -> RetryDecisionRecord` · `handle(exc, attempt, *, operation, session_id, ...) -> (NormalizedError, Decision)` · `note_success()` |
 | `RetryController(config.retry)` | `delay_ms(attempt) -> int` · `can_retry(attempt) -> bool` |
