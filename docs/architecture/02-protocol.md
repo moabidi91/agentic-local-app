@@ -172,7 +172,7 @@ Les codes de l'adaptateur sont ceux de [`protocol/adapter.py`](../../src/agentic
 
 Avertissements (jamais des erreurs) portés par `InboundMessage.warnings` et publiés en `audit.warning` : `CONTRADICTORY_FLAGS:<task_id>` (ADR-009), `DEFAULT_WORKERS_APPLIED` (`parallel` sans `max_parallel_workers` ⇒ 1), `WORKERS_IGNORED_IN_SEQUENTIAL` (`max_parallel_workers` déclaré en `sequential`).
 
-Conséquences d'une erreur de protocole : jamais de retry de transport (§7.2) ; `FailureRecord` ; `protocol_error_count` de la conversation incrémenté ; au seuil `context.protocol_errors_before_rotation` (2), la fenêtre passe `SATURATED` et la rotation retransmet le message en attente dans l'enfant (ADR-013, ADR-014) ; en dessous du seuil, la politique d'échec de [05](05-transport-and-failures.md#4-flowchart-de-décision-du-failuremanager-7-adr-013) s'applique.
+Conséquences d'une erreur de protocole : jamais de retry de transport (§7.2) ; `FailureRecord` ; `protocol_error_count` de la conversation incrémenté (observabilité) ; si la fenêtre est en `WARNING`, la rotation retransmet le message en attente dans l'enfant (ADR-019 §2, ADR-014) ; sinon, la politique d'échec de [05](05-transport-and-failures.md#4-flowchart-de-décision-du-failuremanager-7-adr-013) s'applique.
 
 ## 6. Séquences
 

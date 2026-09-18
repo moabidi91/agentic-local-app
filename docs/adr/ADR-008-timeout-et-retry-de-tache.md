@@ -1,6 +1,6 @@
 # ADR-008 — `timeout_ms` par tâche, aucun retry automatique de tâche
 
-**Statut** : accepté (2026-09-18)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
 
 ## Contexte
 

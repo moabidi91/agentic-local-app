@@ -105,7 +105,7 @@ Le disjoncteur n'est **pas** une erreur de transport : c'est le `FailureManager`
 | `NETWORK_ERROR` | connexion, 502, 503 | oui | oui | `retry` borné (si le disjoncteur autorise), puis `fail` | §7.1 |
 | `TIMEOUT_ERROR` | 408, 504, délai client, `MODEL_GET_TIMEOUT` | oui | oui | `retry` borné, puis `fail` | §7.1 |
 | `RATE_LIMIT_ERROR` | 429 | oui | oui | `retry` (délai ≥ `Retry-After`), puis `fail` | §7.1 |
-| `MODEL_PROTOCOL_ERROR` | `ProtocolAdapter` (catalogue [02 §5.3](02-protocol.md#53-catalogue-des-codes-protocolerror)), corps de réponse invalide | non | non | `fail` (§7.2) — l'orchestrateur évalue **avant** le seuil `protocol_errors_before_rotation` d'ADR-013 et rotate si atteint ; voir *Points ouverts* n°1 | §7.2, ADR-013 |
+| `MODEL_PROTOCOL_ERROR` | `ProtocolAdapter` (catalogue [02 §5.3](02-protocol.md#53-catalogue-des-codes-protocolerror)), corps de réponse invalide | non | non | `fail` (§7.2) — sauf si la fenêtre de contexte est en `WARNING` : l'orchestrateur rotate une fois (ADR-019 §2) | §7.2, ADR-013 |
 | `MODEL_CONTEXT_WINDOW_ERROR` | 413, `context_window_exceeded` | non | oui | `rotate` ; l'orchestrateur transforme en `ROTATION_FAILED` si `max_rotations_per_session` est atteint | §10, ADR-013 |
 | `TASK_EXECUTION_ERROR` | `CommandExecutor` : `SPAWN_FAILED` | non (non transitoire) | oui | aucune décision de boucle : tâche `FAILED`, `FailureRecord`, le plan suit ses drapeaux | ADR-008 §4 |
 | `PERSISTENCE_ERROR` | store : `SQLITE_ERROR` (transitoire quand la base est verrouillée ou occupée), `AUDIT_APPEND_ONLY_VIOLATION`, `BLOB_NOT_FOUND`… | transitoire seulement | transitoire seulement | `fail` par la politique de phase 7 (non listée comme rejouable) ; un retry court des seules erreurs transitoires est proposé en *Points ouverts* n°5 | §7.2 |
@@ -124,7 +124,7 @@ Attributs normalisés (`NormalizedError`) : `error_type`, `error_code`, `severit
 flowchart TD
     E["Exception ou erreur normalisee"] --> CL["classify : NormalizedError (transport deja classe,<br/>httpx/OSError => NETWORK_FAILURE, autre => UNHANDLED_EXCEPTION)"]
     CL --> REC["record : FailureRecord persiste, failure.recorded publie"]
-    REC --> PRE{"Orchestrateur : MODEL_PROTOCOL_ERROR<br/>et protocol_error_count >= protocol_errors_before_rotation ?"}
+    REC --> PRE{"Orchestrateur : réponse inutilisable<br/>et fenêtre en WARNING ? (ADR-019)"}
     PRE -- oui --> ROT
     PRE -- non --> T{"decide : error_type ?"}
     T -- "MODEL_CONTEXT_WINDOW_ERROR" --> ROT{"Orchestrateur : rotations_count < max_rotations_per_session ?"}

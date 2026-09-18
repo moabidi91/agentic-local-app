@@ -121,7 +121,7 @@ stateDiagram-v2
 | ACTIVE → FAILED | échec non rejouable (AUTHN/AUTHZ à l'init, retries épuisés) | ConversationLifecycleManager | `conversation.state_changed` | §7 |
 | WAITING_MODEL_RESPONSE → RUNNING_PLAN | plan (`discovery_plan`, `execution_plan`, `priority_clarification`) valide, persisté `PENDING`, budget `max_plans` / durée vérifié ; `current_plan_id` écrit dans la même écriture | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §5.1, §14, ADR-012 |
 | WAITING_MODEL_RESPONSE → COMPLETED | `final_answer` valide ; `final_answer_received = true` | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §5.1, §11 |
-| WAITING_MODEL_RESPONSE → ROTATING | GET en `MODEL_CONTEXT_WINDOW_ERROR`, ou `protocol_error_count ≥ context.protocol_errors_before_rotation` | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed`, puis `rotation.started` | ADR-007 (ajoutée), ADR-013 §3 |
+| WAITING_MODEL_RESPONSE → ROTATING | GET en `MODEL_CONTEXT_WINDOW_ERROR`, ou réponse inutilisable (erreur de protocole, GET épuisé) alors que la fenêtre est en `WARNING` (ADR-019 §2) | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed`, puis `rotation.started` | ADR-007 (ajoutée), ADR-013 §3 |
 | WAITING_MODEL_RESPONSE → INTERRUPTED | interruption ; les appels de transport en vol sont abandonnés | ConversationLifecycleManager | `conversation.state_changed` | §2.9, ADR-006 |
 | WAITING_MODEL_RESPONSE → FAILED | retries épuisés, erreur non rejouable, `BUDGET_EXCEEDED` (`max_cycles`) | ConversationLifecycleManager | `conversation.state_changed` | §7, ADR-012 |
 | RUNNING_PLAN → WAITING_MODEL_RESPONSE | plan terminal (autre qu'`INTERRUPTED`), `execution_result` construit, persisté, POST engagé ; `last_completed_plan_id` renseigné | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §5.1, §19.9 |
@@ -258,7 +258,7 @@ stateDiagram-v2
 | De → vers | Déclencheur | Propriétaire | Événement publié | Réf. |
 |---|---|---|---|---|
 | HEALTHY → WARNING | `context_bytes ≥ warning_ratio × budget_bytes` (0,70 × 400 000 par défaut) après un POST accepté ou un GET valide | ConversationLifecycleManager (ContextWindowMonitor via ProtocolOrchestrator) | `context.window_state_changed` (`from, to, reason, context_bytes`) | §5.4, ADR-013 §3 |
-| HEALTHY → SATURATED | saut direct : `MODEL_CONTEXT_WINDOW_ERROR` du transport (413 ou corps explicite), ou `protocol_error_count ≥ protocol_errors_before_rotation` | idem | `context.window_state_changed` | ADR-013 §3 (ajoutée) |
+| HEALTHY → SATURATED | saut direct : `MODEL_CONTEXT_WINDOW_ERROR` du transport (413 ou corps explicite), ou réponse inutilisable en `WARNING` (ADR-019 §2) | idem | `context.window_state_changed` | ADR-013 §3 (ajoutée) |
 | WARNING → SATURATED | `context_bytes ≥ saturation_ratio × budget_bytes` (0,90) ; **ou** `context_bytes + taille(prochain message sortant) > budget_bytes` (contrôle avant POST) ; **ou** les erreurs ci-dessus | idem | `context.window_state_changed` | §5.4, §10, ADR-013 §3 |
 | SATURATED → HEALTHY | sur la conversation **enfant** (créée `SATURATED`), à la réception du `context_resume_ack` | idem | `context.window_state_changed` | §5.4, §10 étape 9, ADR-007, ADR-014 §3 |
 

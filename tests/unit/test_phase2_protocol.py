@@ -1422,7 +1422,7 @@ def given_limits_declared_above_caps_when_projected_then_caps_applied_and_declar
     )
     _, (task,) = _records(adapter, inbound, clock)
     assert task.max_output_bytes == 10_000_000
-    assert task.max_output_bytes_applied == config.payload.hard_max_output_bytes == 262_144
+    assert task.max_output_bytes_applied == config.payload.hard_max_output_bytes == 131_072
     assert task.timeout_ms == 10_000_000
     assert task.timeout_ms_applied == config.execution.max_task_timeout_ms == 900_000
 
@@ -1729,15 +1729,15 @@ def given_custom_config_when_instructions_rendered_then_custom_values_replace_de
         payload=PayloadSection(
             default_max_output_bytes=1111,
             hard_max_output_bytes=22222,
-            max_message_bytes=333333,
+            max_message_bytes=133333,
             max_state_summary_bytes=4444,
         ),
         execution=ExecutionSection(default_task_timeout_ms=55555, max_task_timeout_ms=666666),
     )
     text = render_instructions(custom)
-    for value in ("1111", "22222", "333333", "4444", "55555", "666666"):
+    for value in ("1111", "22222", "133333", "4444", "55555", "666666"):
         assert value in text
-    assert "8192" not in text and "262144" not in text and "900000" not in text
+    assert "8192" not in text and "131072" not in text and "900000" not in text
 
 
 def given_instructions_when_rendered_then_no_placeholder_left_unresolved(

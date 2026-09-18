@@ -52,8 +52,7 @@ class InMemoryConversationStore(ConversationStore):
         self._audit: dict[str, list[AuditEvent]] = {}
         self._insertion_counter = 0
         self._order: dict[str, int] = {}  # insertion order of keyed records (stable listing)
-        self._tx_depth = 0
-        self._snapshot: dict[str, Any] | None = None
+        self._snapshots: list[dict[str, Any]] = []
         self.fail_next_write: bool = False  # test hook: next write raises PersistenceError
         self.closed = False
 
@@ -97,21 +96,19 @@ class InMemoryConversationStore(ConversationStore):
     # ---- transactions ---------------------------------------------------------------------
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        if self._tx_depth == 0:
-            self._snapshot = self._state()
-        self._tx_depth += 1
+        """Savepoint semantics (ADR-019): every level snapshots on entry; an exception escaping
+        a level restores that level's snapshot only, so an inner failure caught by the outer
+        block loses the inner writes and keeps the outer ones - exactly like SQLite SAVEPOINTs."""
+        if self.closed:
+            raise PersistenceError("STORE_CLOSED")
+        self._snapshots.append(self._state())
         try:
             yield
         except BaseException:
-            self._tx_depth -= 1
-            if self._tx_depth == 0 and self._snapshot is not None:
-                self._restore(self._snapshot)
-                self._snapshot = None
+            self._restore(self._snapshots.pop())
             raise
         else:
-            self._tx_depth -= 1
-            if self._tx_depth == 0:
-                self._snapshot = None
+            self._snapshots.pop()
 
     def transaction(self) -> AbstractContextManager[None]:
         return self._transaction()
@@ -338,7 +335,9 @@ class InMemoryConversationStore(ConversationStore):
     def append_audit_event(self, event: AuditEvent) -> None:
         self._write_guard()
         chain = self._audit.setdefault(event.session_id, [])
-        if any(e.event_id == event.event_id or e.sequence == event.sequence for e in chain):
+        if any(e.sequence == event.sequence for e in chain) or any(
+            e.event_id == event.event_id for events in self._audit.values() for e in events
+        ):
             raise PersistenceError(
                 "AUDIT_APPEND_ONLY_VIOLATION", event_id=event.event_id, sequence=event.sequence
             )

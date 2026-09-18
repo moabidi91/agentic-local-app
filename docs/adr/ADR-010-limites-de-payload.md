@@ -1,6 +1,6 @@
 # ADR-010 — Limites de payload : par tâche, par plan, plafond application, plafond message
 
-**Statut** : accepté (2026-09-18)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
 
 ## Contexte
 

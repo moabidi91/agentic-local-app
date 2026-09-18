@@ -30,6 +30,7 @@ S = TypeVar("S", bound=Enum)
 # Conversation (§5.1 + ADR-007)
 #   - WAITING_MODEL_RESPONSE -> ROTATING added (rotation on GET context error, §14)
 #   - ROTATING -> CLOSED added (parent ends terminal once the child acknowledged, reason "rotated")
+#   - WAITING_USER -> ROTATING added (ADR-019: a follow-up user_request projected over the budget)
 #   - INTERRUPTED -> READY and READY -> ACTIVE moved to the session machine (ADR-006)
 #   - ANY (non terminal) -> FAILED
 # --------------------------------------------------------------------------------------------
@@ -63,7 +64,11 @@ CONVERSATION_TRANSITIONS: Mapping[ConversationState, frozenset[ConversationState
         {ConversationState.CLOSED, ConversationState.INTERRUPTED, ConversationState.FAILED}
     ),
     ConversationState.WAITING_USER: frozenset(
-        {ConversationState.WAITING_MODEL_RESPONSE, ConversationState.FAILED}
+        {
+            ConversationState.WAITING_MODEL_RESPONSE,
+            ConversationState.ROTATING,  # ADR-019: follow-up request projected over the budget
+            ConversationState.FAILED,
+        }
     ),
     ConversationState.COMPLETED: frozenset(
         {ConversationState.WAITING_USER, ConversationState.CLOSED, ConversationState.FAILED}

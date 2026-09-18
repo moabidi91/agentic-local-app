@@ -42,16 +42,16 @@ Vagues d'exécution :
 | Phase | Guide | Composants | Gate | État |
 |---|---|---|---|---|
 | 0 — Socle | *(ce document)* | `domain`, `config`, `EventBus`, `InMemoryConversationStore` | `tests/unit/test_phase0_foundation.py` | ✅ vert |
-| 1 — Machines à états | [phase-01](phase-01-state-machines.md) | `ConversationLifecycleManager`, tables de transitions | `pytest -m phase1` | ⏳ en cours |
-| 2 — Protocole | [phase-02](phase-02-protocol.md) | `ProtocolAdapter`, schémas, instructions du protocole | `pytest -m phase2` | ⏳ en cours |
-| 3 — Persistance | [phase-03](phase-03-persistence.md) | `SqliteConversationStore`, blobs, audit append-only | `pytest -m phase3` | ⏳ en cours |
-| 4 — Exécution de tâche | [phase-04](phase-04-task-execution.md) | `CommandExecutor`, `PayloadGuard`, `ResultCollector` | `pytest -m phase4` | ⏳ en cours |
+| 1 — Machines à états | [phase-01](phase-01-state-machines.md) | `ConversationLifecycleManager`, tables de transitions | `pytest -m phase1` | ✅ vert — 521 tests |
+| 2 — Protocole | [phase-02](phase-02-protocol.md) | `ProtocolAdapter`, schémas, instructions du protocole | `pytest -m phase2` | ✅ vert — 243 tests |
+| 3 — Persistance | [phase-03](phase-03-persistence.md) | `SqliteConversationStore`, blobs, audit append-only | `pytest -m phase3` | ✅ vert — 405 tests |
+| 4 — Exécution de tâche | [phase-04](phase-04-task-execution.md) | `CommandExecutor`, `PayloadGuard`, `ResultCollector` | `pytest -m phase4` | ✅ vert — 151 tests |
 | 5 — Exécution de plan | [phase-05](phase-05-plan-execution.md) | `PlanRunner` | `pytest -m phase5` | ⬜ à venir |
 | 6 — Interruption | [phase-06](phase-06-interruption.md) | `InterruptionHandler` | `pytest -m phase6` | ⬜ à venir |
-| 7 — Transport & échecs | [phase-07](phase-07-transport-failures.md) | `TransportGateway`, `FailureManager`, `RetryController`, `CircuitBreaker`, serveur mock | `pytest -m phase7` | ⏳ en cours |
+| 7 — Transport & échecs | [phase-07](phase-07-transport-failures.md) | `TransportGateway`, `FailureManager`, `RetryController`, `CircuitBreaker`, serveur mock | `pytest -m phase7` | ✅ vert — 325 tests |
 | 8 — Rotation de contexte | [phase-08](phase-08-context-rotation.md) | `ContextWindowMonitor`, `ContextReducer` | `pytest -m phase8` | ⬜ à venir |
 | 9 — Orchestration | [phase-09](phase-09-orchestration.md) | `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, API, CLI | `pytest -m phase9` | ⬜ à venir |
-| 10 — Audit & observabilité | [phase-10](phase-10-observability.md) | `AuditLog`, `ExecutionTracker`, `TelemetryService` | `pytest -m phase10` | ⏳ en cours |
+| 10 — Audit & observabilité | [phase-10](phase-10-observability.md) | `AuditLog`, `ExecutionTracker`, `TelemetryService` | `pytest -m phase10` | ✅ vert — 73 tests |
 
 ## Discipline TDD appliquée à chaque phase
 

@@ -1,6 +1,6 @@
 # ADR-005 — Résumé de contexte : `state_summary` porté par le modèle
 
-**Statut** : accepté (2026-09-18)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
 
 ## Contexte
 

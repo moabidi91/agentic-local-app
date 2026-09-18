@@ -49,8 +49,8 @@ live_output_interval_ms = 250           # cadence max des événements task.outp
 # --------------------------------------------------------------------------------------------
 [payload]
 default_max_output_bytes = 8192         # si ni la tâche ni le plan ne déclarent max_output_bytes
-hard_max_output_bytes = 262144          # plafond absolu par tâche
-max_message_bytes = 1048576             # taille max d'un message sortant sérialisé
+hard_max_output_bytes = 131072          # plafond absolu par tâche (<= max_message_bytes)
+max_message_bytes = 196608              # taille max d'un message sortant (<= budget_bytes / 2, ADR-019)
 max_state_summary_bytes = 4096          # taille max du state_summary porté par le modèle
 
 # --------------------------------------------------------------------------------------------
@@ -60,7 +60,7 @@ max_state_summary_bytes = 4096          # taille max du state_summary porté par
 budget_bytes = 400000                   # octets cumulés échangés par conversation
 warning_ratio = 0.70                    # HEALTHY -> WARNING
 saturation_ratio = 0.90                 # WARNING -> SATURATED
-protocol_errors_before_rotation = 2     # erreurs de protocole répétées => SATURATED
+rotate_on_unusable_reply_in_warning = true  # en WARNING, réponse inutilisable => rotation (ADR-019)
 max_rotations_per_session = 5           # au-delà : ROTATION_FAILED
 summary_budget_bytes = 32768            # budget dur du résumé de contexte
 

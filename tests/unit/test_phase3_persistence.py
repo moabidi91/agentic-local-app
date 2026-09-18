@@ -1438,7 +1438,7 @@ def given_file_store_when_opened_then_wal_journal_and_pragmas_applied(db_path: P
     try:
         assert store.journal_mode == "wal"
         assert store.pragma("foreign_keys") == 1
-        assert store.pragma("synchronous") == 1  # NORMAL
+        assert store.pragma("synchronous") == 2  # FULL (ADR-019)
         assert store.path == str(db_path) and store.in_memory is False
     finally:
         store.close()
