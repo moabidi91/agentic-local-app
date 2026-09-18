@@ -22,6 +22,7 @@ uv.lock
 
 # Runtime data of the application (SQLite store, blobs, audit log)
 data/
+data-*/
 *.db
 *.db-journal
 *.db-wal

@@ -57,6 +57,8 @@ packages = ["src/agentic_local_app"]
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# examples/ holds the out-of-tree plugin quoted by the guides (acme_model_plugin); its tests import it
+pythonpath = ["examples"]
 python_files = ["test_*.py"]
 python_functions = ["given_*", "test_*"]
 python_classes = ["Test*", "Given*"]
@@ -81,7 +83,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["src", "tests", "examples"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N", "ASYNC"]
@@ -91,5 +93,6 @@ ignore = ["N802", "E501"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-packages = ["agentic_local_app"]
-mypy_path = "src"
+# the example plugin of the guides is type-checked like the application itself
+packages = ["agentic_local_app", "acme_model_plugin"]
+mypy_path = "src:examples"

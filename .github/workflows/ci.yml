@@ -30,7 +30,7 @@ jobs:
         run: uv sync --extra dev --python ${{ matrix.python }}
 
       - name: Lint (ruff)
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests examples
 
       - name: Type-check (mypy)
         run: uv run mypy

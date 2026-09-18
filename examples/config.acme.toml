@@ -1,0 +1,36 @@
+# ============================================================================================
+# Exemple de configuration branchant un modèle par un provider ET un codec écrits hors du dépôt
+# (examples/acme_model_plugin, guides 02 à 04). Rien n'est enregistré dans l'application : les deux
+# classes sont désignées par leur chemin d'import. Lancer depuis la racine du dépôt :
+#
+#   export ACME_API_KEY=...                                   # PowerShell : $env:ACME_API_KEY = "..."
+#   PYTHONPATH=examples uv run agentic-app --config examples/config.acme.toml transport show
+#   PYTHONPATH=examples uv run agentic-app --config examples/config.acme.toml codec show
+#
+# Tout ce qui n'est pas listé ici garde la valeur par défaut (voir config.toml à la racine).
+# ============================================================================================
+
+[app]
+data_dir = "./data-acme"
+
+[transport]
+provider = "acme_model_plugin.provider:AcmeHttpProvider"     # ADR-020 : chemin d'import
+codec    = "acme_model_plugin.codec:StreamedTextCodec"       # ADR-021 : chemin d'import
+user_id  = "local-user"                                      # envoyé par le provider dans l'init (owner)
+request_timeout_ms = 15000
+poll_interval_ms   = 1000
+reply_timeout_ms   = 120000
+gzip = false                                                 # l'API ACME n'accepte pas les corps gzip
+
+# Les options sont validées par AcmeOptions (extra = forbid) : une clé inconnue est refusée au démarrage.
+[transport.options]
+base_url    = "https://acme.example/api/v2"
+workspace   = "demo"
+api_key_env = "ACME_API_KEY"                                 # la clé est lue dans cette variable à chaque appel
+page_size   = 50
+
+# Les options sont validées par StreamedTextOptions.
+[transport.codec_options]
+chunks_path = "chunks"                                       # liste des fragments dans chaque élément brut
+delta_path  = "delta"                                        # texte de chaque fragment
+outbound    = "text"                                         # nos messages partent en JSON canonique (texte)

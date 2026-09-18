@@ -142,6 +142,9 @@ Le détail de chaque couche et le mapping vers les modules Python est dans [`doc
 | [`docs/architecture/`](docs/architecture/00-overview.md) | Conception détaillée : composants, machines à états, protocole, exécution, persistance, transport, rotation, interruption, observabilité, module map |
 | [`docs/adr/`](docs/adr/README.md) | Architecture Decision Records : chaque arbitrage pris là où la spec était ambiguë ou muette |
 | [`docs/phases/`](docs/phases/README.md) | Guides d'implémentation par phase TDD (objectif, conception, plan de tests, gate) |
+| [`docs/guides/`](docs/guides/README.md) | **Guides pratiques** : [prendre en main l'application](docs/guides/01-prise-en-main.md), [brancher un modèle par configuration](docs/guides/02-brancher-un-modele.md), [écrire un provider de transport](docs/guides/03-ecrire-un-provider.md), [écrire un codec de messages](docs/guides/04-ecrire-un-codec.md) |
+| [`examples/`](examples/README.md) | Un provider et un codec écrits **hors de l'application** (`acme_model_plugin`), sélectionnés par chemin d'import dans [`examples/config.acme.toml`](examples/config.acme.toml), couverts par les tests |
+| [`src/agentic_local_app/transport/README.md`](src/agentic_local_app/transport/README.md) | Carte du paquet transport : contrat, base HTTP, registres, codecs, invariants |
 
 ## 6. Démarrage rapide
 
@@ -187,7 +190,7 @@ uv run agentic-app codec list
 uv run agentic-app codec show
 ```
 
-Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence.
+Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
 
 **Choisir un provider de transport.** Le contrat `TransportGateway` est unique, mais son implémentation se choisit **par configuration** avec `transport.provider` ([ADR-020](docs/adr/ADR-020-transport-enfichable.md)) :
 
