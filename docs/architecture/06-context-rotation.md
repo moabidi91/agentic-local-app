@@ -24,7 +24,7 @@ Taille = octets de la sérialisation canonique JSON **avant** gzip ([`domain/can
 | saturation | `context_bytes ≥ saturation_ratio × budget_bytes` | 0,90 × 400 000 = **360 000** | `WARNING → SATURATED` |
 | projection (avant chaque POST) | `context_bytes + size_bytes(M) > budget_bytes` | 400 000 | `→ SATURATED`, **M n'est pas envoyé**, rotation d'abord (§10 « payload exchange becomes unsafe ») |
 | erreur de contexte | `MODEL_CONTEXT_WINDOW_ERROR` du transport (413, `context_window_exceeded`) | — | saut direct `HEALTHY ou WARNING → SATURATED` |
-| réponses inutilisables | `protocol_error_count ≥ protocol_errors_before_rotation` | 2 | saut direct `→ SATURATED` (§10 « replies missing or unusable ») |
+| réponses inutilisables | `MODEL_PROTOCOL_ERROR` ou `MODEL_GET_TIMEOUT` épuisé **alors que l'état est `WARNING`** (ADR-019 §2) | `rotate_on_unusable_reply_in_warning = true` | saut direct `→ SATURATED` (§10 « replies missing or unusable ») |
 | retour | `context_resume_ack` reçu par l'**enfant** | — | `SATURATED → HEALTHY` sur l'enfant |
 
 Exemples : contexte 300 000 et `M` de 50 000 → 350 000 ≤ 400 000, `M` est envoyé (puis l'état passe `SATURATED` au-delà de 360 000, et la rotation aura lieu au **prochain** POST) ; contexte 300 000 et `M` de 120 000 → 420 000 > 400 000, rotation **avant** d'envoyer, `M` devient le message en attente.
@@ -37,7 +37,7 @@ Exemples : contexte 300 000 et `M` de 50 000 → 350 000 ≤ 400 000, `M` est en
 flowchart TD
     IN["evaluate(conversation, projected_outbound_bytes, error)"] --> E1{"error = MODEL_CONTEXT_WINDOW_ERROR ?"}
     E1 -- oui --> SAT["SATURATED"]
-    E1 -- non --> E2{"protocol_error_count >= protocol_errors_before_rotation ?"}
+    E1 -- non --> E2{"Réponse inutilisable et état WARNING ?"}
     E2 -- oui --> SAT
     E2 -- non --> E3{"context_bytes + projected au-dela de budget_bytes ?"}
     E3 -- oui --> SAT
@@ -202,7 +202,7 @@ flowchart TD
     O -- non --> W["ProtocolAdapter : parse + validation, context_bytes mis a jour"]
     W --> X{"Message valide et attendu ?"}
     X -- non --> Y["MODEL_PROTOCOL_ERROR : message.rejected, protocol_error_count + 1"]
-    Y --> Y2{"Seuil protocol_errors_before_rotation atteint ?"}
+    Y --> Y2{"État WARNING et rotate_on_unusable_reply_in_warning ?"}
     Y2 -- oui --> R
     Y2 -- non --> Y3["Politique de 05 : fail (non rejouable), sauf re-sollicitation<br/>decidee par ADR - voir 05 Points ouverts n.1"]
     Y3 --> L
@@ -261,7 +261,7 @@ Le résumé transmis au modèle contient la section `budget` : le modèle sait c
 | `budget_bytes` | 400 000 | budget d'octets cumulés par conversation | ADR-013 |
 | `warning_ratio` | 0.70 | `HEALTHY → WARNING` | ADR-013 |
 | `saturation_ratio` | 0.90 | `WARNING → SATURATED` | ADR-013 |
-| `protocol_errors_before_rotation` | 2 | erreurs de protocole répétées ⇒ `SATURATED` | ADR-013 |
+| `rotate_on_unusable_reply_in_warning` | true | réponse inutilisable en `WARNING` ⇒ rotation unique au lieu d'échec | ADR-019 §2 |
 | `max_rotations_per_session` | 5 | au-delà : `ROTATION_FAILED` | ADR-013 |
 | `summary_budget_bytes` | 32 768 | budget dur du résumé (le `context_summary_budget_bytes` d'ADR-005/010) | ADR-005 |
 | `[payload] max_state_summary_bytes` | 4 096 | borne du `state_summary` porté par chaque plan | ADR-005 |

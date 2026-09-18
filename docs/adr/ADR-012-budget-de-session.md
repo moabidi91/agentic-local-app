@@ -1,6 +1,6 @@
 # ADR-012 — Budget de session porté par un `SessionRecord`, au-delà des rotations
 
-**Statut** : accepté (2026-09-18)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
 
 ## Contexte
 

@@ -86,7 +86,7 @@ def given_sequential_ids_when_generated_then_reproducible_and_prefixed() -> None
 # ---------------------------------------------------------------- config --------------------
 def given_no_file_when_config_loaded_then_defaults_apply(tmp_path: Path) -> None:
     cfg = load_config(None, environ={}, load_env_file=False)
-    assert cfg.api.port == 8765 and cfg.payload.hard_max_output_bytes == 262_144
+    assert cfg.api.port == 8765 and cfg.payload.hard_max_output_bytes == 131_072
 
 
 def given_repo_config_toml_when_loaded_then_valid() -> None:

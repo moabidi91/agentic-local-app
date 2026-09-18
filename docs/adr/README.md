@@ -24,6 +24,7 @@ Format : **Contexte** (ce que dit la spec, où ça coince) · **Décision** · *
 | [ADR-016](ADR-016-politique-de-reprise.md) | Politique de reprise après crash : pid persistés, interruption de cause restart | §3.18, §7.5 | accepté |
 | [ADR-017](ADR-017-determinisme-des-resultats-et-identifiants.md) | Ordre déterministe des résultats, horloge et identifiants injectables | §8, §12.5, §18.3 | accepté |
 | [ADR-018](ADR-018-api-pour-un-front-et-flux-live.md) | API pour un front à venir : flux live SSE, lecture rapide de l'état, `config.toml` global | §3.1, §4, §3.19 | accepté |
+| [ADR-019](ADR-019-consolidation-vague-1.md) | Arbitrages de consolidation après la vague 1 (chunk ref, rotation en WARNING, transitions, bornes, coût de rotation, disjoncteur, noms, lancement, SQLite FULL, savepoints) | ADR-003/004/005/007/008/010/011/012/013/014 | accepté |
 
 ## Comment contester un ADR
 

@@ -17,7 +17,7 @@ from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from agentic_local_app.domain.errors import ConfigError
 
@@ -90,8 +90,8 @@ class PayloadSection(_Section):
     """ADR-010 / ADR-005."""
 
     default_max_output_bytes: int = Field(default=8_192, gt=0)
-    hard_max_output_bytes: int = Field(default=262_144, gt=0)
-    max_message_bytes: int = Field(default=1_048_576, gt=0)
+    hard_max_output_bytes: int = Field(default=131_072, gt=0)
+    max_message_bytes: int = Field(default=196_608, gt=0)
     max_state_summary_bytes: int = Field(default=4_096, gt=0)
 
 
@@ -101,7 +101,8 @@ class ContextSection(_Section):
     budget_bytes: int = Field(default=400_000, gt=0)
     warning_ratio: float = Field(default=0.70, gt=0, lt=1)
     saturation_ratio: float = Field(default=0.90, gt=0, le=1)
-    protocol_errors_before_rotation: int = Field(default=2, ge=1)
+    # ADR-019: in WARNING, an unusable reply (protocol error, exhausted GET timeout) rotates once
+    rotate_on_unusable_reply_in_warning: bool = True
     max_rotations_per_session: int = Field(default=5, ge=0)
     summary_budget_bytes: int = Field(default=32_768, gt=0)
 
@@ -164,6 +165,18 @@ class AppConfig(BaseModel):
     api: ApiSection = Field(default_factory=ApiSection)
     cli: CliSection = Field(default_factory=CliSection)
     telemetry: TelemetrySection = Field(default_factory=TelemetrySection)
+
+    @model_validator(mode="after")
+    def _cross_section_bounds(self) -> AppConfig:
+        """ADR-019: a maximal message must always fit in a fresh conversation, and a single task
+        output must fit in a message."""
+        if self.payload.hard_max_output_bytes > self.payload.max_message_bytes:
+            raise ValueError("payload.hard_max_output_bytes must be <= payload.max_message_bytes")
+        if self.payload.max_message_bytes * 2 > self.context.budget_bytes:
+            raise ValueError("payload.max_message_bytes must be <= context.budget_bytes / 2")
+        if self.context.summary_budget_bytes > self.payload.max_message_bytes:
+            raise ValueError("context.summary_budget_bytes must be <= payload.max_message_bytes")
+        return self
 
     def masked(self) -> dict[str, Any]:
         """Effective configuration as a dict with the token masked (for ``config show`` / ``/config``)."""

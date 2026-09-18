@@ -20,7 +20,7 @@ Design:
   is chronological order), bytes as ``BLOB``;
 - records are written from ``record.model_dump()`` and read back with ``Model.model_validate``,
   so **no field can be lost silently**: a new field in a model is a new column in the schema;
-- ``PRAGMA journal_mode=WAL`` (files only), ``synchronous=NORMAL``, ``foreign_keys=ON``; the schema
+- ``PRAGMA journal_mode=WAL`` (files only), ``synchronous=FULL``, ``foreign_keys=ON``; the schema
   is created idempotently (``IF NOT EXISTS``) and stamped in ``schema_version``;
 - every ``sqlite3.Error`` surfaces as :class:`~agentic_local_app.domain.errors.PersistenceError`
   (``SQLITE_ERROR``, ``details.sqlite``), transient when the database is locked or busy; any
@@ -490,7 +490,7 @@ class SqliteConversationStore(ConversationStore):
     def _configure(self) -> None:
         if not self.in_memory:
             self._execute("PRAGMA journal_mode=WAL")
-        self._execute("PRAGMA synchronous=NORMAL")
+        self._execute("PRAGMA synchronous=FULL")  # ADR-019: durable checkpoints
         self._execute("PRAGMA foreign_keys=ON")
 
     def _create_schema(self) -> None:

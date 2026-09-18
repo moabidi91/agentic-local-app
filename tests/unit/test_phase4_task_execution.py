@@ -785,8 +785,8 @@ def given_valid_utf8_when_decoded_then_text_preserved() -> None:
         pytest.param(512, 2048, 512, id="task-declared"),
         pytest.param(None, 2048, 2048, id="plan-default"),
         pytest.param(None, None, 8_192, id="app-default"),
-        pytest.param(10_000_000, None, 262_144, id="capped-by-hard-max"),
-        pytest.param(None, 10_000_000, 262_144, id="plan-default-capped"),
+        pytest.param(10_000_000, None, 131_072, id="capped-by-hard-max"),
+        pytest.param(None, 10_000_000, 131_072, id="plan-default-capped"),
     ],
 )
 def given_declared_budgets_when_effective_budget_computed_then_min_rule_applied(
