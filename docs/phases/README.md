@@ -50,7 +50,7 @@ Vagues d'exécution :
 | 6 — Interruption | [phase-06](phase-06-interruption.md) | `InterruptionHandler` | `pytest -m phase6` | ✅ vert — 48 tests |
 | 7 — Transport & échecs | [phase-07](phase-07-transport-failures.md) | `TransportGateway`, `FailureManager`, `RetryController`, `CircuitBreaker`, serveur mock | `pytest -m phase7` | ✅ vert — 325 tests |
 | 8 — Rotation de contexte | [phase-08](phase-08-context-rotation.md) | `ContextWindowMonitor`, `ContextReducer`, `RotationCoordinator` | `pytest -m phase8` | ✅ vert — 78 tests |
-| 9 — Orchestration | [phase-09](phase-09-orchestration.md) | `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, API, CLI | `pytest -m phase9` | ⏳ en cours |
+| 9 — Orchestration | [phase-09-orchestration](phase-09-orchestration.md) · [phase-09-interfaces](phase-09-interfaces.md) | `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, API, CLI | `pytest -m phase9` | ✅ vert — 185 tests (68 orchestration + 117 API/CLI) |
 | 10 — Audit & observabilité | [phase-10](phase-10-observability.md) | `AuditLog`, `ExecutionTracker`, `TelemetryService` | `pytest -m phase10` | ✅ vert — 73 tests |
 
 ## Discipline TDD appliquée à chaque phase

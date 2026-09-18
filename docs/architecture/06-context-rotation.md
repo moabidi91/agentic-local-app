@@ -234,12 +234,12 @@ flowchart TD
 |---|---|
 | Le budget survit à la rotation | compteurs sur le `SessionRecord`, pas sur la conversation ; l'enfant reçoit une **copie de lecture** (`session_budget_json`) |
 | Une rotation coûte un cycle | le cycle `resume` incrémente `consumed_cycles` à son ouverture (persistance du `context_resume_request`) |
-| La retransmission ouvre un cycle | le cycle de `M'` incrémente aussi `consumed_cycles` (ADR-012 §2 appliqué à la lettre) : voir *Points ouverts* n°3 |
+| La retransmission n'ouvre pas de cycle | `M'` poursuit le cycle de `M` (`PendingOutbound.cycle_id`) ; seule la rotation (cycle `resume`) incrémente `consumed_cycles` (ADR-019 §5) |
 | Nombre de rotations borné | `SessionRecord.rotations_count` incrémenté à la création de l'enfant ; `rotations_count ≥ context.max_rotations_per_session` (5) avant une nouvelle rotation ⇒ `ROTATION_FAILED / MAX_ROTATIONS_REACHED` |
 | Contrôle `max_cycles` | avant d'ouvrir un cycle (donc avant le POST du `context_resume_request` et avant celui de `M'`) : une rotation qui ferait dépasser `max_cycles` échoue en `BUDGET_EXCEEDED`, pas en boucle |
 | Durée | `max_total_duration_ms` continue de courir pendant la rotation (`now − session.started_at`) |
 
-Exemple : `max_cycles = 20`, trois rotations dans la session → 3 cycles `resume` + 3 cycles de retransmission = 6 cycles consommés par les rotations, 14 tours utiles restants ; avec `max_rotations_per_session = 5`, au plus 10 cycles peuvent être absorbés par des rotations. Combiné à `max_rotations_per_session`, « aucune boucle de rotation silencieuse » (§2.6) est garanti par deux bornes indépendantes.
+Exemple : `max_cycles = 20`, trois rotations dans la session → 3 cycles `resume` consommés par les rotations, 17 tours utiles restants ; avec `max_rotations_per_session = 5`, au plus 5 cycles peuvent être absorbés par des rotations. Combiné à `max_rotations_per_session`, « aucune boucle de rotation silencieuse » (§2.6) est garanti par deux bornes indépendantes.
 
 Le résumé transmis au modèle contient la section `budget` : le modèle sait combien de tours il lui reste.
 
