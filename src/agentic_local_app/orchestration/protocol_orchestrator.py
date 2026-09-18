@@ -1,5 +1,6 @@
 """``ProtocolOrchestrator`` — the protocol loop (spec §2.2, §3.2, §7, §8.4, §10, §11, §14, §15 ;
-ADR-004, ADR-006, ADR-007, ADR-010, ADR-012, ADR-013, ADR-014, ADR-015, ADR-017, ADR-019).
+ADR-004, ADR-006, ADR-007, ADR-010, ADR-012, ADR-013, ADR-014, ADR-015, ADR-017, ADR-019,
+ADR-022).
 
 One ``run`` drives one session from an entry point to a terminal state of the loop, with every
 state change owned by its component (``ConversationLifecycleManager`` for sessions and
@@ -30,7 +31,10 @@ The loop itself (§14 amended by the ADRs — see ``docs/phases/phase-09-orchest
 3. **process**: a plan is persisted with its tasks (``plan.received``), ``max_plans`` and the
    duration are checked before it starts (plan ``PENDING → FAILED`` on excess), the ``PlanRunner``
    executes it, the ``execution_result`` is fitted under ``max_message_bytes`` (ADR-010) and becomes
-   the next ``M``; a ``final_answer`` completes the conversation and the session (§11).
+   the next ``M``; a ``final_answer`` completes the conversation and the session (§11), and so
+   does a ``user_response`` (ADR-022) — the model's direct answer to the user — except that it is
+   never written to ``SessionRecord.final_answer`` and that a question (``expects_reply``) keeps
+   the conversation ``WAITING_USER`` even under ``auto_close_on_final_answer``.
 
 Interruption (§2.9, ADR-006): the token is checked before every step and every transport call is
 abandoned by the ``InterruptionHandler``; the loop then stops **silently** — nothing is sent, no
@@ -77,6 +81,7 @@ from agentic_local_app.domain.models import (
     TaskRecord,
 )
 from agentic_local_app.domain.states import (
+    CONCLUDING_MESSAGE_TYPES,
     ContextWindowState,
     ConversationState,
     CycleState,
@@ -109,7 +114,11 @@ from agentic_local_app.lifecycle.conversation_lifecycle import ConversationLifec
 from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.persistence.interface import ConversationStore
 from agentic_local_app.protocol.adapter import InboundMessage, OutboundMessage, ProtocolAdapter
-from agentic_local_app.protocol.messages import ExecutionResultContent, UserRequestContent
+from agentic_local_app.protocol.messages import (
+    ExecutionResultContent,
+    UserRequestContent,
+    UserResponseContent,
+)
 from agentic_local_app.resilience.circuit_breaker import CircuitBreaker
 from agentic_local_app.resilience.failure_manager import FailureManager
 from agentic_local_app.transport.gateway import (
@@ -130,6 +139,7 @@ __all__ = [
     "REASON_REUSABLE",
     "REASON_ROTATION_FAILED",
     "REASON_USER_REQUEST",
+    "REASON_USER_RESPONSE",
     "ROTATION_NOT_ALLOWED_CODE",
     "STAGE_BEFORE_CYCLE",
     "STAGE_BEFORE_PLAN",
@@ -153,6 +163,7 @@ T = TypeVar("T")
 REASON_USER_REQUEST = "user_request"
 REASON_PLAN_RECEIVED = "plan_received"
 REASON_FINAL_ANSWER = "final_answer"
+REASON_USER_RESPONSE = "user_response"
 REASON_REUSABLE = "reusable"
 REASON_AUTO_CLOSE = "auto_close"
 REASON_FAILURE = "failure"
@@ -388,7 +399,7 @@ class _SessionRun:
             await self._resume()
         while True:
             inbound = await self._receive()
-            if inbound.message_type is MessageType.FINAL_ANSWER:
+            if inbound.message_type in CONCLUDING_MESSAGE_TYPES:
                 await self._finish(inbound)
                 return
             content = await self._execute_plan(inbound)
@@ -940,30 +951,55 @@ class _SessionRun:
         )
 
     async def _finish(self, inbound: InboundMessage) -> None:
-        """§11: ``final_answer`` → conversation ``COMPLETED`` then ``CLOSED`` or ``WAITING_USER``,
-        session ``COMPLETED``."""
+        """§11 / ADR-022: a ``final_answer`` or a ``user_response`` → conversation ``COMPLETED``
+        then ``CLOSED`` or ``WAITING_USER``, session ``COMPLETED``.
+
+        Only a ``final_answer`` is written to ``SessionRecord.final_answer``; a ``user_response``
+        is read back from the messages table. Under ``auto_close_on_final_answer`` the conversation
+        is closed, unless the ``user_response`` is a question (``expects_reply``): the user must be
+        able to answer it, so the conversation stays ``WAITING_USER`` (``auto_close_skipped``).
+        """
         o = self._o
-        content = dict(inbound.envelope.content)
-        session = o.lifecycle.update_session(self._sid, final_answer=content)
-        conv = self._transition(
-            ConversationState.COMPLETED, reason=REASON_FINAL_ANSWER, final_answer_received=True
-        )
-        now = o.clock.now()
-        self._publish(
-            EventType.FINAL_ANSWER_RECEIVED,
-            now,
-            cycle_id=self._cycle_id(),
-            payload={
-                "message_id": inbound.envelope.message_id,
+        message_id = inbound.envelope.message_id
+        if isinstance(inbound.content, UserResponseContent):
+            reason = REASON_USER_RESPONSE
+            session = self._session()
+            auto_close_skipped = (
+                session.auto_close_on_final_answer and inbound.content.expects_reply
+            )
+            close = session.auto_close_on_final_answer and not auto_close_skipped
+            event_type = EventType.USER_RESPONSE_RECEIVED
+            payload: dict[str, Any] = {
+                "message_id": message_id,
+                "format": inbound.content.format,
+                "status": inbound.content.status,
+                "expects_reply": inbound.content.expects_reply,
+                "body_bytes": len(inbound.content.body.encode("utf-8")),
+                "auto_close_on_final_answer": session.auto_close_on_final_answer,
+                "auto_close_skipped": auto_close_skipped,
+            }
+        else:
+            reason = REASON_FINAL_ANSWER
+            content = dict(inbound.envelope.content)
+            session = o.lifecycle.update_session(self._sid, final_answer=content)
+            close = session.auto_close_on_final_answer
+            event_type = EventType.FINAL_ANSWER_RECEIVED
+            payload = {
+                "message_id": message_id,
                 "status": str(content.get("status")),
                 "auto_close_on_final_answer": session.auto_close_on_final_answer,
-                "consumed_cycles": session.consumed_cycles,
-                "consumed_plans": session.consumed_plans,
-                "session_duration_ms": self._consumed_duration_ms(session),
-            },
+            }
+        payload.update(
+            consumed_cycles=session.consumed_cycles,
+            consumed_plans=session.consumed_plans,
+            session_duration_ms=self._consumed_duration_ms(session),
         )
-        self._complete_cycle(inbound.envelope.message_id, inbound.message_type)
-        if session.auto_close_on_final_answer:
+        conv = self._transition(
+            ConversationState.COMPLETED, reason=reason, final_answer_received=True
+        )
+        self._publish(event_type, o.clock.now(), cycle_id=self._cycle_id(), payload=payload)
+        self._complete_cycle(message_id, inbound.message_type)
+        if close:
             conv = self._transition(
                 ConversationState.CLOSED, reason=REASON_AUTO_CLOSE, closure_reason=REASON_AUTO_CLOSE
             )
@@ -971,9 +1007,7 @@ class _SessionRun:
             conv = self._transition(ConversationState.WAITING_USER, reason=REASON_REUSABLE)
         current = self._session()
         if current.status is SessionState.RUNNING:
-            o.lifecycle.transition_session(
-                self._sid, SessionState.COMPLETED, reason=REASON_FINAL_ANSWER
-            )
+            o.lifecycle.transition_session(self._sid, SessionState.COMPLETED, reason=reason)
         if conv.status is ConversationState.CLOSED:
             await self._close_remote([conv])
 

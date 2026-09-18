@@ -26,6 +26,7 @@ from agentic_local_app.config import (
     ContextSection,
     ExecutionSection,
     PayloadSection,
+    ProtocolSection,
     RetrySection,
 )
 from agentic_local_app.domain.clock import FakeClock
@@ -234,6 +235,37 @@ def final_answer(
     }
 
 
+ANALYSIS_BODY = (
+    "## Why the build fails\n\n"
+    "`invalid target release: 21` means the project targets Java 21 while the compiler is "
+    "older. Align `maven.compiler.release` with the installed JDK, or install JDK 21."
+)
+QUESTION_BODY = "Which module fails to build: the whole project or only `service-api`?"
+
+
+def user_response(
+    remote: str = REMOTE_1,
+    *,
+    message_id: str = "model-msg-0001",
+    body: str = ANALYSIS_BODY,
+    format: str = "markdown",
+    status: str = "completed",
+    expects_reply: bool = False,
+) -> dict[str, Any]:
+    """ADR-022: the model answers the user directly, without a plan."""
+    return {
+        "type": "user_response",
+        "conversation_id": remote,
+        "message_id": message_id,
+        "content": {
+            "format": format,
+            "body": body,
+            "status": status,
+            "expects_reply": expects_reply,
+        },
+    }
+
+
 def resume_ack(
     remote: str = REMOTE_2,
     original: str = REMOTE_1,
@@ -278,6 +310,7 @@ def make_config(
     retry: dict[str, Any] | None = None,
     breaker: dict[str, Any] | None = None,
     execution: dict[str, Any] | None = None,
+    protocol: dict[str, Any] | None = None,
 ) -> AppConfig:
     """The default configuration with short drains and optional section overrides."""
     exec_values: dict[str, Any] = {
@@ -291,6 +324,7 @@ def make_config(
         budget=BudgetSection(**(budget or {})),
         context=ContextSection(**(context or {})),
         payload=PayloadSection(**(payload or {})),
+        protocol=ProtocolSection(**(protocol or {})),
         retry=RetrySection(**(retry or {})),
         circuit_breaker=CircuitBreakerSection(**(breaker or {})),
     )

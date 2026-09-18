@@ -137,6 +137,17 @@ max_message_bytes = 196608              # taille max d'un message sortant (<= bu
 max_state_summary_bytes = 4096          # taille max du state_summary porté par le modèle
 
 # --------------------------------------------------------------------------------------------
+# Protocole côté modèle (ADR-022) — accueillera aussi la politique de correction (ADR-023)
+# --------------------------------------------------------------------------------------------
+[protocol]
+allow_direct_response = true            # le modèle peut répondre au premier user_request d'une
+                                        # conversation par un user_response (analyse, explication,
+                                        # question à l'utilisateur) au lieu du discovery_plan
+                                        # obligatoire de la spec §14 ; false = grammaire stricte.
+                                        # Après un execution_result ou un user_request de suivi,
+                                        # user_response est toujours accepté.
+
+# --------------------------------------------------------------------------------------------
 # Fenêtre de contexte et rotation (ADR-013, ADR-005)
 # --------------------------------------------------------------------------------------------
 [context]

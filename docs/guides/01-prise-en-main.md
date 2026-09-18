@@ -116,10 +116,11 @@ Les mêmes informations en lecture ponctuelle :
 | `GET /sessions/{sid}/tasks/{tid}/output?stream=stdout&offset=0&max_bytes=8192` | une plage de la sortie stockée (le moteur de `chunk_request`) |
 | `GET /sessions/{sid}/messages`, `/failures`, `/audit`, `/audit/verify` | les messages échangés, les échecs enregistrés, la chaîne d'audit et sa vérification |
 | `GET /sessions/{sid}/final-answer` | la réponse finale |
-| `POST /sessions/{sid}/interrupt`, `POST /sessions/{sid}/messages` | interrompre ; envoyer un message de suivi (§11) |
+| `GET /sessions/{sid}/responses`, `GET /sessions/{sid}/reply` | les réponses directes du modèle (`user_response`, ADR-022) ; la dernière réponse, finale ou directe |
+| `POST /sessions/{sid}/interrupt`, `POST /sessions/{sid}/messages` | interrompre ; envoyer un message de suivi (§11) ou répondre à une question du modèle |
 | `GET /metrics`, `GET /health`, `GET /config` | métriques texte, santé, configuration effective masquée |
 
-La CLI a des clients de ces routes : `agentic-app sessions [--status running]`, `agentic-app status <sid>`, `agentic-app interrupt <sid>`, `agentic-app audit verify <sid>` (option `--api-url` si l'API n'est pas à l'adresse de la configuration).
+La CLI a des clients de ces routes : `agentic-app sessions [--status running]`, `agentic-app status <sid>`, `agentic-app interrupt <sid>`, `agentic-app reply <sid> "…"` (répondre à une question du modèle, ou envoyer un suivi), `agentic-app audit verify <sid>` (option `--api-url` si l'API n'est pas à l'adresse de la configuration).
 
 ## 6. Lire ce qui s'est passé
 

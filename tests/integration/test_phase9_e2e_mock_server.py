@@ -33,6 +33,7 @@ from agentic_local_app.testing.mock_model_server import (
     Scenario,
     Step,
     create_mock_app,
+    default_analysis_scenario,
     default_java_debug_scenario,
 )
 from agentic_local_app.transport.gateway import HttpTransportGateway
@@ -161,6 +162,40 @@ async def given_mock_model_server_when_java_scenario_runs_then_final_answer_rece
         assert snapshot.session.status is SessionState.COMPLETED
         assert app.telemetry.metrics()["counters"]["messages_total"]  # something was counted
         assert app.manager.recovery_report is not None
+    finally:
+        await app.aclose()
+
+
+async def given_mock_model_server_when_analysis_scenario_runs_then_user_response_ends_the_session(
+    tmp_path: Any,
+) -> None:
+    app, engine, executor, recorder = await _application(default_analysis_scenario(), str(tmp_path))
+    try:
+        session = await app.manager.start_session(
+            goal="Explain a Java build error",
+            user_message="What does 'invalid target release: 21' mean? Do not run anything.",
+        )
+        ended = await app.manager.wait(session.session_id, timeout_ms=int(BOUND_S * 1000))
+        sid = session.session_id
+
+        assert ended.status is SessionState.COMPLETED
+        assert ended.final_answer is None
+        assert ended.consumed_cycles == 1 and ended.consumed_plans == 0
+        assert [body["type"] for _, body in engine.received] == ["user_request"]
+        assert executor.calls == []
+        reply = app.manager.last_reply(sid)
+        assert reply is not None and reply["type"] == "user_response"
+        assert reply["message_id"] == "mock-msg-0001"
+        assert reply["content"]["format"] == "markdown"
+        assert "invalid target release" in reply["content"]["body"]
+        assert [r["message_id"] for r in app.manager.user_responses(sid)] == ["mock-msg-0001"]
+        conversation = app.store.get_conversation("conv-0001")
+        assert conversation is not None
+        assert conversation.status is ConversationState.WAITING_USER
+        assert conversation.get_cursor == "mock-msg-0001"
+        assert engine.closed == []
+        assert [e.event_type.value for e in recorder.events].count("user_response.received") == 1
+        assert app.audit.verify(sid).valid is True
     finally:
         await app.aclose()
 

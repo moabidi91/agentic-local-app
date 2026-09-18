@@ -7,13 +7,14 @@ Every extension is **optional** so that the examples of the specification valida
 - ``TaskResult.*_total``, ``*_range``, ``max_output_bytes_applied``, ``timed_out``, chunk fields (ADR-011)
 - ``ExecutionResultContent.skipped_tasks`` etc. carry ``{task_id, reason}`` objects (ADR-009)
 - ``ContextResumeRequestContent.pending_message_type`` (ADR-014)
+- ``UserResponseContent``, a new inbound type: the model's direct answer to the user (ADR-022)
 
 The envelope (``type``, ``conversation_id``, ``message_id``, ``content``) is common to every message.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -170,6 +171,24 @@ class FinalAnswerContent(BaseModel):
 
 
 # ------------------------------------------------------------------------------------------------
+# user_response — the model answers the user directly (ADR-022, not in §12)
+# ------------------------------------------------------------------------------------------------
+class UserResponseContent(ProtocolModel):
+    """A text answer, an analysis or a question for the user, without any command.
+
+    ``body`` is **opaque**: the application never parses it, whatever ``format`` says (``json``
+    only tells the user's interface how to render it). Its only bounds are "non-empty" here and
+    ``payload.max_message_bytes`` in the adapter (``USER_RESPONSE_TOO_LARGE``). ``expects_reply``
+    marks a question: the conversation then stays reusable even under auto-close (§11, ADR-022).
+    """
+
+    format: Literal["text", "markdown", "json"] = "text"
+    body: str = Field(min_length=1)
+    status: Literal["completed", "partial", "failed"] = "completed"
+    expects_reply: bool = False
+
+
+# ------------------------------------------------------------------------------------------------
 # 12.8 / 12.9 context resume (+ ADR-014 pending_message_type)
 # ------------------------------------------------------------------------------------------------
 class ContextResumeRequestContent(ProtocolModel):
@@ -219,6 +238,7 @@ CONTENT_MODELS: dict[MessageType, type[BaseModel]] = {
     MessageType.PRIORITY_CLARIFICATION: PlanContent,
     MessageType.EXECUTION_RESULT: ExecutionResultContent,
     MessageType.FINAL_ANSWER: FinalAnswerContent,
+    MessageType.USER_RESPONSE: UserResponseContent,
     MessageType.CONTEXT_RESUME_REQUEST: ContextResumeRequestContent,
     MessageType.CONTEXT_RESUME_ACK: ContextResumeAckContent,
     MessageType.SYSTEM_ERROR: SystemErrorContent,

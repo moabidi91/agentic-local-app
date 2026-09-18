@@ -12,7 +12,7 @@ En v1 l'application n'est utilisable qu'en console, mais une application front v
 
 Un seul fichier, chargé au démarrage par `agentic_local_app.config.load_config()`, validé par un modèle pydantic `AppConfig` (valeurs par défaut sûres, erreurs de configuration explicites au démarrage). Recherche : `--config <chemin>` de la CLI, sinon variable `AGENTIC_APP_CONFIG`, sinon `./config.toml`, sinon les défauts. Les **secrets ne sont pas dans le fichier** : `transport.token_env` nomme la variable d'environnement qui porte le jeton (défaut `AGENTIC_TRANSPORT_TOKEN`), et un fichier `.env` local (ignoré par git) peut la fournir. Toute valeur est surchargeable par variable d'environnement `AGENTIC__<section>__<clé>` (double underscore), utile pour la CI et les conteneurs.
 
-Sections : `app` (nom, `data_dir`, niveau de log), `transport` (ADR-004), `execution` (shell, cwd, timeouts, drains, ADR-003/008), `payload` (ADR-010), `context` (ADR-013), `budget` (défauts de session, ADR-012), `retry` et `circuit_breaker` (§7), `api` (hôte, port, CORS pour le front, taille des pages), `cli`, `telemetry`. Le fichier `config.toml` du dépôt est **le** modèle commenté ; la CLI `agentic-app config show` affiche la configuration effective (jeton masqué) et `agentic-app config validate` la vérifie.
+Sections : `app` (nom, `data_dir`, niveau de log), `transport` (ADR-004), `execution` (shell, cwd, timeouts, drains, ADR-003/008), `payload` (ADR-010), `protocol` (réponse directe du modèle, ADR-022), `context` (ADR-013), `budget` (défauts de session, ADR-012), `retry` et `circuit_breaker` (§7), `api` (hôte, port, CORS pour le front, taille des pages), `cli`, `telemetry`. Le fichier `config.toml` du dépôt est **le** modèle commenté ; la CLI `agentic-app config show` affiche la configuration effective (jeton masqué) et `agentic-app config validate` la vérifie.
 
 ### API HTTP locale conçue pour le front
 
@@ -24,8 +24,9 @@ Principes : ressources REST pour l'état, **un flux SSE pour le direct**, pagina
 | GET | `/sessions?status=running,ready&limit=…&cursor=…` | liste paginée, filtrable |
 | GET | `/sessions/{sid}` | `SessionRecord` + conversation courante |
 | POST | `/sessions/{sid}/interrupt` | interruption ; répond quand READY |
-| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11) |
+| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11), ou réponse à une question du modèle (ADR-022) |
 | GET | `/sessions/{sid}/snapshot` | snapshot complet `ExecutionTracker` (§4.1) — **une seule requête pour tout afficher** |
+| GET | `/sessions/{sid}/responses` · `/sessions/{sid}/reply` | les réponses directes du modèle (`user_response`, ADR-022) ; la dernière réponse concluante, `final_answer` ou `user_response` |
 | GET | `/sessions/{sid}/conversations` · `/conversations/{cid}` | chaîne de conversations (rotations) |
 | GET | `/sessions/{sid}/plans` · `/plans/{pid}` | plans avec compteurs, tâches incluses à la demande (`?include=tasks`) |
 | GET | `/sessions/{sid}/tasks?status=running` | tâches, filtrables par statut/plan — **la vue « en cours » du front** |

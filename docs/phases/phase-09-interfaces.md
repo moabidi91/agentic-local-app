@@ -11,7 +11,7 @@ La spec fait du `ConversationManager` le « point d'entrée des demandes et des 
 
 1. **`interfaces/http_api.py`** — `create_app(manager) -> FastAPI` sous `/api/v1` : sessions (création, liste filtrée et paginée, détail, interruption, message de suivi §11, snapshot §4.1, réponse finale), conversations, plans (`?include=tasks`), tâches (filtres `status` / `plan_id`, la vue « en cours » du front), sortie par plage (même moteur que `chunk_request`), messages, échecs, audit paginé et vérifié, trois flux SSE, `/metrics`, `/health`, `/config` ; erreurs uniformes `{"error": NormalizedError}` ; CORS restreint ; pagination `api.page_size`.
 2. **`interfaces/sse.py`** — `SseBroker` : abonné **non critique** du bus (ADR-015) qui ne fait qu'empiler des `SseFrame` dans des files **bornées** par client ; client trop lent débranché (`event: dropped`) sans jamais bloquer le bus ; identifiants alignés sur la chaîne d'audit ; reprise depuis `store.list_audit_events` puis bascule sur le direct ; heartbeat `: keep-alive`.
-3. **`interfaces/cli.py`** — `agentic-app` : `run` (session en process, affichage rich en direct, **Ctrl-C = interruption**, second Ctrl-C = sortie forcée), `serve`, `status`, `sessions`, `interrupt`, `audit verify` (clients de l'API), `config show` / `config validate`, `mock-server`, `version`.
+3. **`interfaces/cli.py`** — `agentic-app` : `run` (session en process, affichage rich en direct, **Ctrl-C = interruption**, second Ctrl-C = sortie forcée), `serve`, `status`, `sessions`, `interrupt`, `reply` (ADR-022), `audit verify` (clients de l'API), `config show` / `config validate`, `mock-server`, `version`.
 
 La phase 9a (autre agent, en parallèle) livre `orchestration/` : `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, `wiring.build_application`. Les interfaces sont codées **contre le contrat de la façade** (protocole `ConversationManagerLike`, §3.1 de ce guide) et testées avec un double qui l'implémente fidèlement au-dessus des composants réels ; l'intégration réelle (`serve` / `run` sur `build_application`) se fera à la livraison de 9a sans changer une ligne ici.
 
@@ -43,6 +43,8 @@ class ConversationManagerLike(Protocol):
     def list_sessions(*, statuses=None, limit=100, offset=0) -> list[SessionRecord]
     def snapshot(session_id) -> RuntimeSnapshot                              # KeyError
     def final_answer(session_id) -> dict | None
+    def user_responses(session_id) -> list[dict]                            # ADR-022
+    def last_reply(session_id) -> dict | None                               # ADR-022
     def running_task_ids(session_id) -> list[str]
     async def shutdown() -> None
 ```
@@ -71,6 +73,8 @@ classDiagram
         +list_sessions(statuses, limit, offset) List~SessionRecord~
         +snapshot(session_id) RuntimeSnapshot
         +final_answer(session_id) dict
+        +user_responses(session_id) List~dict~
+        +last_reply(session_id) dict
         +running_task_ids(session_id) List~str~
         +shutdown()
     }
@@ -254,9 +258,11 @@ Sur POSIX comme sur Windows, `asyncio.run` installe son gestionnaire SIGINT : le
 | GET | `/sessions` | `status=running,ready` (valeurs `SessionState`, insensible à la casse), `limit≥1` (défaut `api.page_size`), `offset≥0` | `{items: [SessionRecord], limit, offset, next_offset}` (plus récentes d'abord) | 422 filtre ou pagination invalide |
 | GET | `/sessions/{sid}` | — | `SessionRecord` + `conversation: ConversationRecord \| null` (courante) | 404 |
 | POST | `/sessions/{sid}/interrupt` | — | `200 InterruptionReport` (`nothing_to_interrupt` si rien à interrompre) ; répond quand `READY` | 404 ; 500 persistance |
-| POST | `/sessions/{sid}/messages` | corps `{user_message}` | `202 SessionRecord` (session relancée, §11) | 404 ; 409 `CONFLICT` si non réutilisable ; 422 |
+| POST | `/sessions/{sid}/messages` | corps `{user_message}` | `202 SessionRecord` (session relancée, §11 — aussi la réponse à une question du modèle, ADR-022) | 404 ; 409 `CONFLICT` si non réutilisable ; 422 |
 | GET | `/sessions/{sid}/snapshot` | — | `RuntimeSnapshot` complet (§4.1, deux niveaux) | 404 |
 | GET | `/sessions/{sid}/final-answer` | — | `{session_id, final_answer: dict \| null}` | 404 |
+| GET | `/sessions/{sid}/responses` | — | `[{message_id, conversation_id, cycle_id, received_at, format, body, status, expects_reply}]` — les `user_response` valides de la session, du plus ancien au plus récent (ADR-022) | 404 |
+| GET | `/sessions/{sid}/reply` | — | `{type: "final_answer" \| "user_response", message_id, conversation_id, cycle_id, received_at, content}` — la dernière réponse concluante du modèle (ADR-022) | 404 session inconnue ; 404 `REPLY_NOT_FOUND` tant que le modèle n'a rien conclu |
 | GET | `/sessions/{sid}/conversations` | — | `[ConversationRecord]` (chaîne, du plus ancien au plus récent) | 404 |
 | GET | `/sessions/{sid}/conversations/{cid}` | — | `ConversationRecord` | 404 (inconnue ou d'une autre session) |
 | GET | `/sessions/{sid}/plans` | `include=tasks` | `[PlanRecord]` (+ `tasks: [TaskRecord]` par plan si demandé) | 404 ; 422 `include` inconnu |
@@ -302,15 +308,16 @@ data: {"queue_size":1000,"reason":"queue_full","session_id":"sess-0001","task_id
 
 | Commande | Options | Rôle | Code retour |
 |---|---|---|---|
-| `run GOAL` | `--message/-m` (défaut : le goal), `--config`, `--budget-cycles`, `--budget-plans`, `--budget-duration-ms` (les valeurs absentes viennent de `[budget]`), `--auto-close`, `--json` | construit l'application (`build_application`), démarre la session, affiche en direct (session, conversation, cycle, plan, tâches, derniers événements, sortie live), Ctrl-C = interruption, second Ctrl-C = sortie forcée, puis réponse finale / rapport / erreur | 0 réponse finale · 1 échec, erreur, configuration invalide · 2 interruption |
+| `run GOAL` | `--message/-m` (défaut : le goal), `--config`, `--budget-cycles`, `--budget-plans`, `--budget-duration-ms` (les valeurs absentes viennent de `[budget]`), `--auto-close`, `--json` | construit l'application (`build_application`), démarre la session, affiche en direct (session, conversation, cycle, plan, tâches, derniers événements, sortie live), Ctrl-C = interruption, second Ctrl-C = sortie forcée, puis réponse finale / réponse directe du modèle (panneau `Model response (<format>, <status>)`, et la commande `reply` à taper si le modèle attend une réponse, ADR-022) / rapport / erreur ; `--json` porte aussi `last_reply` | 0 réponse finale ou réponse directe · 1 échec, erreur, configuration invalide · 2 interruption |
 | `serve` | `--config`, `--host`, `--port` (défauts `[api]`) | `uvicorn` sur `create_app(build_application(config).manager)` | — (Ctrl-C arrête uvicorn ; lifespan → `manager.shutdown()`) |
 | `status SESSION_ID` | `--api-url` (défaut `http://{api.host}:{api.port}`), `--json` | `GET /sessions/{sid}/snapshot`, rendu identique à `run` | 0 · 1 (erreur API ou injoignable) |
 | `sessions` | `--api-url`, `--status`, `--limit`, `--json` | `GET /sessions` en table | 0 · 1 |
 | `interrupt SESSION_ID` | `--api-url`, `--json` | `POST /sessions/{sid}/interrupt`, rapport affiché | 0 · 1 |
+| `reply SESSION_ID MESSAGE` | `--api-url`, `--json` | `POST /sessions/{sid}/messages` : répondre à une question du modèle (`user_response` avec `expects_reply`, ADR-022) ou envoyer un suivi ; affiche la session relancée et la conversation | 0 · 1 (409 si la session n'est pas réutilisable) |
 | `audit verify SESSION_ID` | `--api-url`, `--json` | `GET /sessions/{sid}/audit/verify` | 0 chaîne valide · 1 chaîne rompue ou erreur |
 | `config show` | `--config` | configuration effective en JSON, jeton masqué | 0 · 1 |
 | `config validate` | `--config` | charge et valide ; erreurs lisibles (`section.clé: message`) | 0 · 1 |
-| `mock-server` | `--scenario` (défaut : scénario Java §12), `--host` (127.0.0.1), `--port` (9000) | `run_mock_server` (uvicorn, injectable) | — |
+| `mock-server` | `--scenario` (un fichier JSON) ou `--scenario-name` (`java`, défaut : le scénario §12 ; `analysis` : une `user_response` sans commande, ADR-022 — les deux options s'excluent), `--host` (127.0.0.1), `--port` (9000) | `run_mock_server` (uvicorn, injectable) | — · 1 nom inconnu ou options incompatibles |
 | `version` | — | `agentic-app <version>` | 0 |
 | option globale `--config` | — | chemin du `config.toml` pour toutes les commandes (sinon `AGENTIC_APP_CONFIG`, sinon `./config.toml`, sinon défauts) | — |
 

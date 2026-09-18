@@ -56,10 +56,15 @@ from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.observability.execution_tracker import ExecutionTracker, RuntimeSnapshot
 from agentic_local_app.observability.telemetry import TelemetryService
 from agentic_local_app.persistence.memory import InMemoryConversationStore
+from agentic_local_app.protocol.messages import UserResponseContent
 
 __all__ = ["FakeConversationManager"]
 
 _TERMINAL_SESSION_STATES = frozenset({SessionState.COMPLETED, SessionState.FAILED})
+_REUSABLE_CONVERSATION_STATES = frozenset(
+    {ConversationState.WAITING_USER, ConversationState.COMPLETED}
+)
+_CONCLUDING_MESSAGE_TYPES = frozenset({MessageType.FINAL_ANSWER, MessageType.USER_RESPONSE})
 
 
 class FakeConversationManager:
@@ -155,18 +160,24 @@ class FakeConversationManager:
         self.calls.append(("continue_session", session_id, user_message))
         session = self.require_session(session_id)
         conversation = self.current_conversation(session_id)
+        # the same rule as the façade: a COMPLETED session whose conversation is reusable — under
+        # auto-close only when the model asked a question and left it WAITING_USER (ADR-022)
         if (
             session.status is not SessionState.COMPLETED
-            or session.auto_close_on_final_answer
             or conversation is None
-            or conversation.status is not ConversationState.COMPLETED
+            or conversation.status not in _REUSABLE_CONVERSATION_STATES
+            or (
+                session.auto_close_on_final_answer
+                and conversation.status is not ConversationState.WAITING_USER
+            )
         ):
             raise ValueError(f"session {session_id} is not reusable ({session.status.value})")
         self.lifecycle.transition_session(session_id, SessionState.RUNNING, reason="user_request")
         self.lifecycle.update_session(session_id, user_message=user_message, final_answer=None)
-        self.lifecycle.transition_conversation(
-            conversation.conversation_id, ConversationState.WAITING_USER, reason="user_request"
-        )
+        if conversation.status is ConversationState.COMPLETED:
+            self.lifecycle.transition_conversation(
+                conversation.conversation_id, ConversationState.WAITING_USER, reason="user_request"
+            )
         self.lifecycle.transition_conversation(
             conversation.conversation_id, ConversationState.WAITING_MODEL_RESPONSE
         )
@@ -213,6 +224,46 @@ class FakeConversationManager:
     def final_answer(self, session_id: str) -> dict[str, Any] | None:
         session = self.store.get_session(session_id)
         return None if session is None else session.final_answer
+
+    def user_responses(self, session_id: str) -> list[dict[str, Any]]:
+        """ADR-022, same contract as the façade: the valid ``user_response`` messages, oldest
+        first, identifiers and timestamp plus the content fields (defaults filled)."""
+        return [
+            {
+                **self._reply_head(m),
+                **UserResponseContent.model_validate(m.payload["content"]).model_dump(),
+            }
+            for m in self._concluding_messages(session_id)
+            if m.message_type is MessageType.USER_RESPONSE
+        ]
+
+    def last_reply(self, session_id: str) -> dict[str, Any] | None:
+        messages = self._concluding_messages(session_id)
+        if not messages:
+            return None
+        last = messages[-1]
+        return {
+            "type": last.message_type.value,
+            **self._reply_head(last),
+            "content": dict(last.payload.get("content", {})),
+        }
+
+    def _concluding_messages(self, session_id: str) -> list[MessageRecord]:
+        return [
+            m
+            for c in self.store.list_conversations(session_id)
+            for m in self.store.list_messages(c.conversation_id, direction=MessageDirection.INBOUND)
+            if m.message_type in _CONCLUDING_MESSAGE_TYPES and m.validation_status == "valid"
+        ]
+
+    @staticmethod
+    def _reply_head(message: MessageRecord) -> dict[str, Any]:
+        return {
+            "message_id": message.message_id,
+            "conversation_id": message.conversation_id,
+            "cycle_id": message.cycle_id,
+            "received_at": message.model_dump(mode="json")["received_at"],
+        }
 
     def running_task_ids(self, session_id: str) -> list[str]:
         return [
@@ -476,17 +527,20 @@ class FakeConversationManager:
         message_type: MessageType,
         payload: dict[str, Any] | None = None,
         conversation_id: str | None = None,
+        message_id: str | None = None,
+        cycle_id: str | None = None,
     ) -> MessageRecord:
         conversation_id = conversation_id or self.require_conversation(session_id).conversation_id
         now = self.clock.now()
         record = MessageRecord(
-            message_id=self.ids.message_id(),
+            message_id=message_id or self.ids.message_id(),
             session_id=session_id,
             conversation_id=conversation_id,
             direction=direction,
             message_type=message_type,
             payload=payload or {"type": message_type.value},
             size_bytes=64,
+            cycle_id=cycle_id,
             posted_at=now if direction is MessageDirection.OUTBOUND else None,
             received_at=now if direction is MessageDirection.INBOUND else None,
             validation_status="valid" if direction is MessageDirection.INBOUND else None,
@@ -561,6 +615,84 @@ class FakeConversationManager:
         if session.status not in _TERMINAL_SESSION_STATES:
             self.lifecycle.transition_session(
                 session_id, SessionState.COMPLETED, reason="final_answer", final_answer=answer
+            )
+        return self.require_session(session_id)
+
+    def respond(
+        self,
+        session_id: str,
+        body: str = "Here is my analysis.",
+        *,
+        format: str = "text",
+        status: str = "completed",
+        expects_reply: bool = False,
+    ) -> SessionRecord:
+        """A ``user_response`` arrives (ADR-022): the message is persisted like the orchestrator
+        does, ``user_response.received`` is published, the conversation ends ``WAITING_USER`` (or
+        ``CLOSED`` under auto-close when no reply is expected) and the session ``COMPLETED``."""
+        conversation = self.require_conversation(session_id)
+        session = self.require_session(session_id)
+        content = {
+            "format": format,
+            "body": body,
+            "status": status,
+            "expects_reply": expects_reply,
+        }
+        message_id = f"model-{self.ids.message_id()}"
+        record = self.add_message(
+            session_id,
+            direction=MessageDirection.INBOUND,
+            message_type=MessageType.USER_RESPONSE,
+            message_id=message_id,
+            cycle_id=conversation.current_cycle_id,
+            payload={
+                "type": "user_response",
+                "conversation_id": conversation.remote_conversation_id
+                or conversation.conversation_id,
+                "message_id": message_id,
+                "content": content,
+            },
+        )
+        if conversation.status is not ConversationState.COMPLETED:
+            self.lifecycle.transition_conversation(
+                conversation.conversation_id,
+                ConversationState.COMPLETED,
+                reason="user_response",
+                final_answer_received=True,
+            )
+        auto_close_skipped = session.auto_close_on_final_answer and expects_reply
+        self.publish(
+            EventType.USER_RESPONSE_RECEIVED,
+            session_id,
+            conversation_id=conversation.conversation_id,
+            cycle_id=conversation.current_cycle_id,
+            payload={
+                "message_id": record.message_id,
+                "format": format,
+                "status": status,
+                "expects_reply": expects_reply,
+                "body_bytes": len(body.encode("utf-8")),
+                "auto_close_on_final_answer": session.auto_close_on_final_answer,
+                "auto_close_skipped": auto_close_skipped,
+                "consumed_cycles": session.consumed_cycles,
+                "consumed_plans": session.consumed_plans,
+                "session_duration_ms": 0,
+            },
+        )
+        if session.auto_close_on_final_answer and not auto_close_skipped:
+            self.lifecycle.transition_conversation(
+                conversation.conversation_id,
+                ConversationState.CLOSED,
+                reason="auto_close",
+                closure_reason="auto_close",
+            )
+        else:
+            self.lifecycle.transition_conversation(
+                conversation.conversation_id, ConversationState.WAITING_USER, reason="reusable"
+            )
+        if session.status not in _TERMINAL_SESSION_STATES:
+            self.lifecycle.transition_session(
+                session_id, SessionState.COMPLETED, reason="user_response"
             )
         return self.require_session(session_id)
 

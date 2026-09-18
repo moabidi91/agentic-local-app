@@ -2,8 +2,8 @@
 
 No process is spawned and no port is opened: ``serve`` and ``mock-server`` receive an injected
 runner, ``run`` receives an injected application factory returning the ``FakeConversationManager``
-double, and the API-client commands (``status``, ``sessions``, ``interrupt``, ``audit verify``)
-talk to an ``httpx.MockTransport``. Ctrl-C is simulated by a ``KeyboardInterrupt`` injected in the
+double, and the API-client commands (``status``, ``sessions``, ``interrupt``, ``reply``,
+``audit verify``) talk to an ``httpx.MockTransport``. Ctrl-C is simulated by a ``KeyboardInterrupt`` injected in the
 façade double (ADR-002: Ctrl-C = interruption, not process exit).
 """
 
@@ -29,6 +29,10 @@ from agentic_local_app.interfaces.cli import (
     CliDependencies,
     app,
     main,
+)
+from agentic_local_app.testing.mock_model_server import (
+    default_analysis_scenario,
+    default_java_debug_scenario,
 )
 from integration.fake_manager import FakeConversationManager
 
@@ -204,7 +208,16 @@ def given_cli_when_version_then_prints_package_version(runner: CliRunner) -> Non
 def given_cli_when_help_then_every_command_listed(runner: CliRunner) -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    for command in ("run", "serve", "status", "sessions", "interrupt", "config", "mock-server"):
+    for command in (
+        "run",
+        "serve",
+        "status",
+        "sessions",
+        "interrupt",
+        "reply",
+        "config",
+        "mock-server",
+    ):
         assert command in result.output
     assert "audit" in result.output
     assert callable(main)
@@ -292,11 +305,61 @@ def given_no_scenario_when_mock_server_then_default_java_scenario_served(
         app,
         ["mock-server"],
         obj=CliDependencies(
-            mock_server_runner=lambda a, *, host, port, **k: calls.append({"h": host, "p": port})
+            mock_server_runner=lambda a, *, host, port, **k: calls.append(
+                {"h": host, "p": port, "app": a}
+            )
         ),
     )
     assert result.exit_code == 0, result.output
-    assert calls == [{"h": "127.0.0.1", "p": 9000}]
+    assert [(c["h"], c["p"]) for c in calls] == [("127.0.0.1", 9000)]
+    assert calls[0]["app"].state.engine.scenario == default_java_debug_scenario()
+    assert "built-in java" in result.output
+
+
+def given_scenario_name_analysis_when_mock_server_then_analysis_scenario_served(
+    runner: CliRunner,
+) -> None:
+    calls: list[Any] = []
+    result = runner.invoke(
+        app,
+        ["mock-server", "--scenario-name", "analysis", "--port", "9001"],
+        obj=CliDependencies(mock_server_runner=lambda a, *, host, port, **k: calls.append(a)),
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    scenario = calls[0].state.engine.scenario
+    assert scenario == default_analysis_scenario()
+    assert [m["type"] for s in scenario.steps for m in s.respond] == ["user_response"]
+    assert "built-in analysis" in result.output and "9001" in result.output
+
+
+def given_unknown_scenario_name_when_mock_server_then_exit_1_without_serving(
+    runner: CliRunner,
+) -> None:
+    calls: list[Any] = []
+    result = runner.invoke(
+        app,
+        ["mock-server", "--scenario-name", "nope"],
+        obj=CliDependencies(mock_server_runner=lambda a, **k: calls.append(a)),
+    )
+    assert result.exit_code == 1
+    assert calls == []
+    assert "nope" in result.output and "analysis" in result.output and "java" in result.output
+
+
+def given_scenario_path_and_name_when_mock_server_then_exit_1_mutually_exclusive(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"steps": []}))
+    calls: list[Any] = []
+    result = runner.invoke(
+        app,
+        ["mock-server", "--scenario", str(scenario), "--scenario-name", "analysis"],
+        obj=CliDependencies(mock_server_runner=lambda a, **k: calls.append(a)),
+    )
+    assert result.exit_code == 1
+    assert calls == [] and "mutually exclusive" in result.output
 
 
 # ================================================================================================
@@ -414,6 +477,72 @@ def given_mock_api_when_interrupt_then_report_printed(runner: CliRunner) -> None
     assert result.exit_code == 0, result.output
     assert seen[0].method == "POST"
     assert "READY" in result.output and "t2" in result.output and "12" in result.output
+
+
+def _session_payload(sid: str = "sess-0001", status: str = "RUNNING") -> dict[str, Any]:
+    fake = FakeConversationManager()
+    import asyncio
+
+    asyncio.run(fake.start_session(goal="explain the error", user_message="m"))
+    body = fake.require_session(sid).model_dump(mode="json")
+    body["status"] = status
+    return body
+
+
+def given_mock_api_when_reply_then_follow_up_posted_and_session_printed(runner: CliRunner) -> None:
+    transport, seen = _mock_api(
+        {("POST", "/api/v1/sessions/sess-0001/messages"): (202, _session_payload())}
+    )
+    result = runner.invoke(
+        app,
+        ["reply", "sess-0001", "Only service-api fails.", "--api-url", "http://api.test:1"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 0, result.output
+    assert seen[0].method == "POST"
+    assert str(seen[0].url) == "http://api.test:1/api/v1/sessions/sess-0001/messages"
+    assert json.loads(seen[0].content) == {"user_message": "Only service-api fails."}
+    assert "sess-0001" in result.output and "RUNNING" in result.output
+    assert "conv-0001" in result.output
+    assert "agentic-app status sess-0001" in result.output
+
+
+def given_mock_api_when_reply_with_json_then_session_record_printed(runner: CliRunner) -> None:
+    payload = _session_payload()
+    transport, _ = _mock_api({("POST", "/api/v1/sessions/sess-0001/messages"): (202, payload)})
+    result = runner.invoke(
+        app,
+        ["reply", "sess-0001", "all of it", "--json", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == payload
+
+
+def given_non_reusable_session_on_api_when_reply_then_exit_1_with_conflict(
+    runner: CliRunner,
+) -> None:
+    error = {
+        "error": {
+            "error_type": "SYSTEM_ERROR",
+            "error_code": "CONFLICT",
+            "severity": "low",
+            "origin": "http_api",
+            "retryable": False,
+            "recoverable": True,
+            "attempt": 1,
+            "max_attempts": 1,
+            "details": {"message": "session sess-0001 was closed after its final answer"},
+        }
+    }
+    transport, _ = _mock_api({("POST", "/api/v1/sessions/sess-0001/messages"): (409, error)})
+    result = runner.invoke(
+        app,
+        ["reply", "sess-0001", "again", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 1
+    assert "CONFLICT" in result.output and "closed after its final answer" in result.output
 
 
 def given_mock_api_when_audit_verify_then_valid_chain_reported(runner: CliRunner) -> None:
@@ -613,6 +742,75 @@ def given_run_with_json_when_completed_then_machine_readable_result(
     assert document["exit_code"] == 0
     assert document["interruption"] is None
     assert document["snapshot"] == fake.snapshot("sess-0001").model_dump(mode="json")
+
+
+def given_session_answered_by_user_response_when_run_then_body_shown_and_exit_0(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.respond(
+        sid, "## Analysis\n\nThe target release is wrong.", format="markdown"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "explain the error",
+            "--message",
+            "what does it mean?",
+            "--config",
+            str(config_file),
+        ],
+        obj=_deps(fake),
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert "The target release is wrong." in result.output
+    assert "Model response" in result.output
+    assert "markdown" in result.output and "completed" in result.output
+    assert "COMPLETED" in result.output and "sess-0001" in result.output
+    assert "waiting for your answer" not in result.output
+    assert "without a final answer" not in result.output
+    assert fake.shutdown_called
+
+
+def given_session_answered_by_question_when_run_then_reply_hint_shown(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.respond(sid, "Which module fails?", expects_reply=True)
+    result = runner.invoke(app, ["run", "goal", "--config", str(config_file)], obj=_deps(fake))
+    assert result.exit_code == EXIT_OK, result.output
+    assert "Which module fails?" in result.output
+    assert "waiting for your answer" in result.output
+    assert 'agentic-app reply sess-0001 "..."' in result.output
+
+
+def given_run_with_json_when_answered_by_user_response_then_last_reply_in_document(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.respond(sid, "Which module fails?", expects_reply=True)
+    result = runner.invoke(
+        app, ["run", "goal", "--json", "--config", str(config_file)], obj=_deps(fake)
+    )
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["status"] == "COMPLETED" and document["final_answer"] is None
+    assert document["last_reply"] == fake.last_reply("sess-0001")
+    assert document["last_reply"]["type"] == "user_response"
+    assert document["last_reply"]["content"]["expects_reply"] is True
+    assert document["last_reply"]["content"]["body"] == "Which module fails?"
+
+
+def given_run_with_json_when_completed_by_final_answer_then_last_reply_reflects_it(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.complete(sid, {"status": "success", "summary": "done"})
+    result = runner.invoke(
+        app, ["run", "goal", "--json", "--config", str(config_file)], obj=_deps(fake)
+    )
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["final_answer"] == {"status": "success", "summary": "done"}
+    # the double's ``complete`` writes no message record: nothing to read back from the table
+    assert document["last_reply"] is None
 
 
 def given_manager_raising_app_error_at_start_when_run_then_normalized_error_and_exit_1(

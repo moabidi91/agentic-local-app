@@ -1,11 +1,13 @@
 """``ConversationManager`` — the façade of the interfaces (spec §3.1 ; ADR-002, ADR-006, ADR-016,
-ADR-018).
+ADR-018, ADR-022).
 
 No protocol or execution logic lives here (§3.1): the manager creates the session and its first
 conversation through the ``ConversationLifecycleManager``, hands the loop to the
 ``ProtocolOrchestrator`` as a background ``asyncio.Task``, forwards interruptions to the
 ``InterruptionHandler`` at once, and exposes the reads the API and the CLI need (records, the
-``ExecutionTracker`` snapshot, the final answer, the running tasks, the recovery report).
+``ExecutionTracker`` snapshot, the final answer, the model's direct responses and the last reply
+of either kind (ADR-022, read back from the messages table), the running tasks, the recovery
+report).
 
 Loops are tracked per session (``loop_task``); their exceptions are never lost: the orchestrator
 reflects them in the persisted state (session ``FAILED``), the manager logs them, and ``wait``
@@ -16,7 +18,7 @@ Entry points and the session states they accept (ADR-006 / ADR-007 session machi
 | call | accepted state | effect |
 |---|---|---|
 | ``start_session`` | — | session ``READY → RUNNING``, conversation ``NEW → ACTIVE``, loop started |
-| ``continue_session`` | ``COMPLETED`` (reusable, §11) | ``COMPLETED → RUNNING``, follow-up in the same conversation |
+| ``continue_session`` | ``COMPLETED`` (reusable, §11 — also under auto-close when the model asked a question, ADR-022) | ``COMPLETED → RUNNING``, follow-up in the same conversation |
 | ``continue_session`` | ``READY`` (after an interruption or a restart) | ``READY → RUNNING``, **new** child conversation (ADR-006 §3) |
 | ``resume_session`` | ``RUNNING`` left resumable by the recovery (ADR-016) | the loop resumes with a GET first |
 | ``interrupt`` | any | delegated to the ``InterruptionHandler`` (idle sessions: nothing to do) |
@@ -33,8 +35,15 @@ from typing import Any
 from agentic_local_app.config import AppConfig
 from agentic_local_app.domain.clock import Clock
 from agentic_local_app.domain.ids import IdGenerator
-from agentic_local_app.domain.models import SessionBudget, SessionRecord
-from agentic_local_app.domain.states import ConversationState, SessionState, TaskState
+from agentic_local_app.domain.models import MessageRecord, SessionBudget, SessionRecord
+from agentic_local_app.domain.states import (
+    CONCLUDING_MESSAGE_TYPES,
+    ConversationState,
+    MessageDirection,
+    MessageType,
+    SessionState,
+    TaskState,
+)
 from agentic_local_app.interruption.handler import InterruptionHandler, InterruptionReport
 from agentic_local_app.lifecycle.conversation_lifecycle import ConversationLifecycleManager
 from agentic_local_app.observability.audit_log import AuditLog
@@ -48,6 +57,7 @@ from agentic_local_app.orchestration.protocol_orchestrator import (
 )
 from agentic_local_app.orchestration.recovery import RecoveryReport
 from agentic_local_app.persistence.interface import ConversationStore
+from agentic_local_app.protocol.messages import UserResponseContent
 
 __all__ = ["SHUTDOWN_REASON", "ConversationManager"]
 
@@ -173,14 +183,15 @@ class ConversationManager:
         if self._loop_running(session_id):
             raise ValueError(f"session {session_id} is still running")
         if session.status is SessionState.COMPLETED:
-            if session.auto_close_on_final_answer:
-                raise ValueError(f"session {session_id} was closed after its final answer")
             conversation = (
                 self._store.get_conversation(session.current_conversation_id)
                 if session.current_conversation_id is not None
                 else None
             )
             if conversation is None or conversation.status not in _REUSABLE_CONVERSATION_STATES:
+                # an auto-close session keeps its conversation open only for a question (ADR-022)
+                if session.auto_close_on_final_answer:
+                    raise ValueError(f"session {session_id} was closed after its final answer")
                 raise ValueError(f"session {session_id} has no reusable conversation")
             self._lifecycle.transition_session(
                 session_id, SessionState.RUNNING, reason=REASON_USER_REQUEST, final_answer=None
@@ -267,6 +278,57 @@ class ConversationManager:
     def final_answer(self, session_id: str) -> dict[str, Any] | None:
         session = self._store.get_session(session_id)
         return None if session is None else session.final_answer
+
+    def user_responses(self, session_id: str) -> list[dict[str, Any]]:
+        """ADR-022: every valid ``user_response`` of the session, oldest first, across all its
+        conversations, read back from the messages table (no dedicated column). Each item:
+        ``message_id``, ``conversation_id``, ``cycle_id``, ``received_at`` and the content fields
+        ``format``, ``body``, ``status``, ``expects_reply``. Empty for an unknown session."""
+        return [
+            {
+                **self._reply_head(message),
+                **UserResponseContent.model_validate(message.payload["content"]).model_dump(),
+            }
+            for message in self._concluding_messages(session_id)
+            if message.message_type is MessageType.USER_RESPONSE
+        ]
+
+    def last_reply(self, session_id: str) -> dict[str, Any] | None:
+        """ADR-022: the newest concluding reply of the model — a ``final_answer`` or a
+        ``user_response`` — as ``{type, message_id, conversation_id, cycle_id, received_at,
+        content}``, or ``None`` when the model has not concluded a turn yet."""
+        messages = self._concluding_messages(session_id)
+        if not messages:
+            return None
+        last = messages[-1]
+        return {
+            "type": last.message_type.value,
+            **self._reply_head(last),
+            "content": dict(last.payload.get("content", {})),
+        }
+
+    def _concluding_messages(self, session_id: str) -> list[MessageRecord]:
+        """Valid inbound ``final_answer`` / ``user_response`` records, oldest first."""
+        return [
+            message
+            for conversation in self._store.list_conversations(session_id)
+            for message in self._store.list_messages(
+                conversation.conversation_id, direction=MessageDirection.INBOUND
+            )
+            if message.message_type in CONCLUDING_MESSAGE_TYPES
+            and message.validation_status == "valid"
+        ]
+
+    @staticmethod
+    def _reply_head(message: MessageRecord) -> dict[str, Any]:
+        """The identifiers and the timestamp of a reply, rendered as the API renders records."""
+        dumped = message.model_dump(mode="json")
+        return {
+            "message_id": message.message_id,
+            "conversation_id": message.conversation_id,
+            "cycle_id": message.cycle_id,
+            "received_at": dumped["received_at"],
+        }
 
     def running_task_ids(self, session_id: str) -> list[str]:
         return [

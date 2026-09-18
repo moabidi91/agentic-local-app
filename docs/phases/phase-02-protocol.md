@@ -231,13 +231,13 @@ Chaque état d'attente correspond à une ligne de `EXPECTED_INBOUND` : `AttenteD
 
 | `OutboundSituation` | Dernier message sortant | Condition | Types entrants autorisés |
 |---|---|---|---|
-| `initial_user_request` | `user_request` | `conversation.final_answer_received = False` | `discovery_plan` |
-| `follow_up_user_request` | `user_request` | `conversation.final_answer_received = True` | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer` |
-| `execution_result` | `execution_result` | — | `execution_plan`, `priority_clarification`, `final_answer` |
+| `initial_user_request` | `user_request` | `conversation.final_answer_received = False` | `discovery_plan` ; `user_response` si `protocol.allow_direct_response` (ADR-022, défaut `true`) |
+| `follow_up_user_request` | `user_request` | `conversation.final_answer_received = True` (conclu par un `final_answer` ou un `user_response`) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
+| `execution_result` | `execution_result` | — | `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `context_resume_request` | `context_resume_request` | — | `context_resume_ack` |
 | *(aucun)* | `last_outbound = None` | rien n'est en attente | ∅ — tout message reçu est `UNEXPECTED_MESSAGE_TYPE` |
 
-Exactement un message par tour ; `system_error`, `user_request`, `execution_result`, `context_resume_request` et `chunk_request` ne sont jamais des messages entrants.
+Exactement un message par tour ; `system_error`, `user_request`, `execution_result`, `context_resume_request` et `chunk_request` ne sont jamais des messages entrants. La table de base `EXPECTED_INBOUND` garde la ligne initiale stricte de §14 ; `expected_inbound_for(situation, allow_direct_response=…)` y applique le drapeau d'ADR-022, que `ProtocolAdapter.expected_inbound` lit dans sa configuration. Le contenu d'un `user_response` (`UserResponseContent` : `format`, `body` opaque non vide, `status`, `expects_reply`) n'a qu'une règle sémantique, la borne `USER_RESPONSE_TOO_LARGE` (`body` ≤ `payload.max_message_bytes` en UTF-8).
 
 ## 5. Catalogue des codes `ProtocolError`
 

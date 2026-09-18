@@ -1,20 +1,23 @@
 """Phase 2 — protocol layer (spec §2.2, §2.3, §2.5, §3.5, §12, §18.2 ; ADR-004, ADR-005, ADR-007,
-ADR-008, ADR-009, ADR-010, ADR-011, ADR-014, ADR-017).
+ADR-008, ADR-009, ADR-010, ADR-011, ADR-014, ADR-017, ADR-022).
 
 What is pinned here:
 
 1. **building** of every outbound type (``user_request``, ``execution_result``,
    ``context_resume_request``) compared byte-for-byte, in canonical JSON, with the examples of §12;
 2. **parsing** of every inbound type from the very examples of the specification (loaded from
-   ``docs/spec/SPEC-v1.1.md`` so that the schemas can never drift from the text);
+   ``docs/spec/SPEC-v1.1.md`` so that the schemas can never drift from the text), plus the
+   ``user_response`` of ADR-022 (schema, opaque body, size bound);
 3. **rejection** of every malformed message: one test per ``ProtocolError`` code, details checked;
-4. the **table of expected messages** of ADR-007 (four rows + "nothing outstanding") and the full
-   cartesian product *message type × protocol state*;
+4. the **table of expected messages** of ADR-007 (four rows + "nothing outstanding"), the
+   ``protocol.allow_direct_response`` flag of ADR-022 on its initial row, and the full cartesian
+   product *message type × protocol state*;
 5. the **projection of a plan onto records** (``PlanRecord`` / ``TaskRecord``): ADR-009 flags and the
    effective stop rule for the eight flag combinations, ADR-010 output budgets, ADR-008 timeouts,
    ADR-011 chunk fields;
 6. the **protocol instructions** sent to the model at init (ADR-004): configuration values injected,
-   every rule named, every embedded JSON example valid against the schemas.
+   every rule named, every embedded JSON example valid against the schemas, the first-message
+   rule rendered from the ADR-022 flag.
 
 Only the doubles of ``tests/conftest.py`` are used (no shell, network or real database, §18.3).
 """
@@ -32,7 +35,12 @@ from typing import Any
 
 import pytest
 
-from agentic_local_app.config import AppConfig, ExecutionSection, PayloadSection
+from agentic_local_app.config import (
+    AppConfig,
+    ExecutionSection,
+    PayloadSection,
+    ProtocolSection,
+)
 from agentic_local_app.domain.canonical import canonical_json, size_bytes
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.errors import ErrorType, ProtocolError
@@ -67,6 +75,7 @@ from agentic_local_app.protocol.adapter import (
     OutboundMessage,
     OutboundSituation,
     ProtocolAdapter,
+    expected_inbound_for,
     render_instructions,
 )
 from agentic_local_app.protocol.messages import (
@@ -77,6 +86,7 @@ from agentic_local_app.protocol.messages import (
     PlanContent,
     TaskRef,
     TaskResult,
+    UserResponseContent,
     content_model_for,
 )
 
@@ -114,6 +124,19 @@ INBOUND_EXAMPLES: dict[str, MessageType] = {
 REMOTE_ID = "conv-1001"  # the remote conversation id used by the examples of §12.1-§12.7
 RESUME_REMOTE_ID = "conv-2001"  # the child conversation of §12.8 / §12.9
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+#: The ``user_response`` of ADR-022 (not in §12): a markdown analysis, no command.
+USER_RESPONSE_EXAMPLE: dict[str, Any] = {
+    "type": "user_response",
+    "conversation_id": REMOTE_ID,
+    "message_id": "msg-010",
+    "content": {
+        "format": "markdown",
+        "body": "## Why the build fails\n\nThe project targets Java 21 but Maven runs on Java 17.",
+        "status": "completed",
+        "expects_reply": False,
+    },
+}
 
 
 def _section_number(section: str) -> int:
@@ -278,6 +301,7 @@ def _sample_message(message_type: MessageType, conversation_id: str) -> dict[str
         MessageType.PRIORITY_CLARIFICATION: SPEC["12.4"],
         MessageType.EXECUTION_RESULT: SPEC["12.5"],
         MessageType.FINAL_ANSWER: SPEC["12.7"],
+        MessageType.USER_RESPONSE: USER_RESPONSE_EXAMPLE,
         MessageType.CONTEXT_RESUME_REQUEST: SPEC["12.8"],
         MessageType.CONTEXT_RESUME_ACK: SPEC["12.9"],
         MessageType.SYSTEM_ERROR: SPEC["12.10"],
@@ -622,6 +646,70 @@ def given_final_answer_with_extra_fields_when_parsed_then_accepted_and_extras_ke
     assert inbound.content.model_dump()["confidence"] == 0.9
 
 
+def given_user_response_when_parsed_after_result_then_user_response_content_typed(
+    adapter: ProtocolAdapter,
+) -> None:
+    inbound = _parse(adapter, USER_RESPONSE_EXAMPLE, expected=AFTER_EXECUTION_RESULT)
+    assert inbound.message_type is MessageType.USER_RESPONSE
+    assert inbound.plan_type is None
+    assert isinstance(inbound.content, UserResponseContent)
+    assert inbound.content.format == "markdown"
+    assert inbound.content.body.startswith("## Why the build fails")
+    assert inbound.content.status == "completed"
+    assert inbound.content.expects_reply is False
+    assert inbound.warnings == []
+    assert inbound.payload == USER_RESPONSE_EXAMPLE
+    assert inbound.size_bytes == size_bytes(USER_RESPONSE_EXAMPLE)
+    assert content_model_for(MessageType.USER_RESPONSE) is UserResponseContent
+
+
+def given_user_response_with_only_a_body_when_parsed_then_defaults_applied() -> None:
+    content = UserResponseContent.model_validate({"body": "Which module fails?"})
+    assert content.format == "text"
+    assert content.status == "completed"
+    assert content.expects_reply is False
+    assert content.model_dump() == {
+        "format": "text",
+        "body": "Which module fails?",
+        "status": "completed",
+        "expects_reply": False,
+    }
+
+
+def given_user_response_with_json_format_when_parsed_then_body_kept_opaque_never_parsed(
+    adapter: ProtocolAdapter,
+) -> None:
+    raw = copy.deepcopy(USER_RESPONSE_EXAMPLE)
+    raw["content"]["format"] = "json"
+    raw["content"]["body"] = "{not json at all"  # opaque: the body is a string, nothing more
+    inbound = _parse(adapter, raw, expected=AFTER_EXECUTION_RESULT)
+    assert isinstance(inbound.content, UserResponseContent)
+    assert inbound.content.body == "{not json at all"
+
+
+@pytest.mark.parametrize(
+    "status", ["completed", "partial", "failed"], ids=["completed", "partial", "failed"]
+)
+def given_user_response_with_each_status_when_parsed_then_accepted(
+    adapter: ProtocolAdapter, status: str
+) -> None:
+    raw = copy.deepcopy(USER_RESPONSE_EXAMPLE)
+    raw["content"]["status"] = status
+    inbound = _parse(adapter, raw, expected=AFTER_EXECUTION_RESULT)
+    assert isinstance(inbound.content, UserResponseContent)
+    assert inbound.content.status == status
+
+
+def given_user_response_with_question_when_parsed_then_expects_reply_true(
+    adapter: ProtocolAdapter,
+) -> None:
+    raw = copy.deepcopy(USER_RESPONSE_EXAMPLE)
+    raw["content"] = {"body": "Which module fails to build?", "expects_reply": True}
+    inbound = _parse(adapter, raw, expected=AFTER_EXECUTION_RESULT)
+    assert isinstance(inbound.content, UserResponseContent)
+    assert inbound.content.expects_reply is True and inbound.content.format == "text"
+
+
 def given_spec_12_9_ack_when_parsed_after_resume_request_then_ack_content_typed(
     adapter: ProtocolAdapter,
 ) -> None:
@@ -895,6 +983,80 @@ def given_nothing_expected_when_any_message_parsed_then_unexpected_message_type(
     )
     assert details["received"] == "execution_plan"
     assert details["expected"] == []
+
+
+def _user_response(content: Mapping[str, Any]) -> dict[str, Any]:
+    return _message(MessageType.USER_RESPONSE, content, message_id="msg-010")
+
+
+@pytest.mark.parametrize(
+    ("content", "loc"),
+    [
+        ({"format": "markdown"}, "content.body"),
+        ({"body": ""}, "content.body"),
+        ({"body": "x", "format": "html"}, "content.format"),
+        ({"body": "x", "status": "done"}, "content.status"),
+        ({"body": "x", "expects_reply": "maybe"}, "content.expects_reply"),
+        ({"body": "x", "diagnosis": "not a final_answer"}, "content.diagnosis"),
+        ({"body": ["not", "a", "string"]}, "content.body"),
+    ],
+    ids=[
+        "missing_body",
+        "empty_body",
+        "unknown_format",
+        "unknown_status",
+        "non_boolean_expects_reply",
+        "extra_field",
+        "body_not_a_string",
+    ],
+)
+def given_malformed_user_response_when_parsed_then_schema_invalid(
+    adapter: ProtocolAdapter, content: dict[str, Any], loc: str
+) -> None:
+    details = _protocol_error(lambda: _parse(adapter, _user_response(content)), "SCHEMA_INVALID")
+    assert details["stage"] == "content"
+    assert details["message_type"] == "user_response"
+    assert details["message_id"] == "msg-010"
+    assert any(err["loc"] == loc for err in details["errors"]), details["errors"]
+
+
+def given_user_response_body_over_max_message_bytes_when_parsed_then_too_large(
+    config: AppConfig,
+) -> None:
+    small = ProtocolAdapter(
+        config.model_copy(
+            update={
+                "payload": PayloadSection(
+                    max_message_bytes=64, hard_max_output_bytes=32, max_state_summary_bytes=32
+                )
+            }
+        )
+    )
+    body = "é" * 40  # 40 characters, 80 UTF-8 bytes: the bound counts bytes, not characters
+    details = _protocol_error(
+        lambda: _parse(small, _user_response({"body": body})), "USER_RESPONSE_TOO_LARGE"
+    )
+    assert details == {"size_bytes": 80, "max_bytes": 64, "message_id": "msg-010"}
+    # exactly at the bound: accepted (the schema check runs first, the bound is semantic)
+    inbound = _parse(small, _user_response({"body": "é" * 32}))
+    assert isinstance(inbound.content, UserResponseContent)
+
+
+def given_user_response_body_over_bound_and_bad_format_when_parsed_then_schema_checked_first(
+    config: AppConfig,
+) -> None:
+    small = ProtocolAdapter(
+        config.model_copy(
+            update={
+                "payload": PayloadSection(
+                    max_message_bytes=64, hard_max_output_bytes=32, max_state_summary_bytes=32
+                )
+            }
+        )
+    )
+    raw = _user_response({"body": "x" * 100, "format": "pdf"})
+    details = _protocol_error(lambda: _parse(small, raw), "SCHEMA_INVALID")
+    assert details["stage"] == "content"
 
 
 def given_message_for_other_conversation_when_parsed_then_conversation_mismatch(
@@ -1190,17 +1352,41 @@ def given_no_outbound_message_when_expected_inbound_asked_then_nothing_expected(
     assert adapter.expected_inbound(None, _conversation()) == frozenset()
 
 
-def given_initial_user_request_when_expected_inbound_asked_then_only_discovery_plan(
+def given_initial_user_request_when_expected_inbound_asked_then_discovery_plan_or_direct_response(
     adapter: ProtocolAdapter,
 ) -> None:
+    # the default configuration allows a direct user_response (ADR-022 flag on)
     expected = adapter.expected_inbound(
         _outbound_record(MessageType.USER_REQUEST), _conversation(final_answer_received=False)
     )
-    assert expected == frozenset({MessageType.DISCOVERY_PLAN})
-    assert expected == AFTER_INITIAL_REQUEST
+    assert expected == frozenset({MessageType.DISCOVERY_PLAN, MessageType.USER_RESPONSE})
+    assert expected == AFTER_INITIAL_REQUEST | {MessageType.USER_RESPONSE}
+    assert expected == expected_inbound_for(OutboundSituation.INITIAL_USER_REQUEST)
 
 
-def given_follow_up_user_request_when_expected_inbound_asked_then_any_plan_or_final_answer(
+def given_direct_response_disabled_when_initial_expected_inbound_asked_then_only_discovery_plan(
+    config: AppConfig,
+) -> None:
+    strict = ProtocolAdapter(
+        config.model_copy(update={"protocol": ProtocolSection(allow_direct_response=False)})
+    )
+    expected = strict.expected_inbound(
+        _outbound_record(MessageType.USER_REQUEST), _conversation(final_answer_received=False)
+    )
+    assert expected == frozenset({MessageType.DISCOVERY_PLAN}) == AFTER_INITIAL_REQUEST
+    assert expected == expected_inbound_for(
+        OutboundSituation.INITIAL_USER_REQUEST, allow_direct_response=False
+    )
+    # the flag only touches the initial row
+    for situation in OutboundSituation:
+        if situation is not OutboundSituation.INITIAL_USER_REQUEST:
+            assert expected_inbound_for(situation, allow_direct_response=False) == (
+                expected_inbound_for(situation, allow_direct_response=True)
+            )
+            assert expected_inbound_for(situation) == EXPECTED_INBOUND[situation]
+
+
+def given_follow_up_user_request_when_expected_inbound_asked_then_any_plan_final_or_response(
     adapter: ProtocolAdapter,
 ) -> None:
     expected = adapter.expected_inbound(
@@ -1212,22 +1398,94 @@ def given_follow_up_user_request_when_expected_inbound_asked_then_any_plan_or_fi
             MessageType.EXECUTION_PLAN,
             MessageType.PRIORITY_CLARIFICATION,
             MessageType.FINAL_ANSWER,
+            MessageType.USER_RESPONSE,
         }
     )
     assert expected == AFTER_FOLLOW_UP_REQUEST
 
 
-def given_execution_result_when_expected_inbound_asked_then_plan_or_clarification_or_final(
+def given_execution_result_when_expected_inbound_asked_then_plan_clarification_final_or_response(
     adapter: ProtocolAdapter,
 ) -> None:
     expected = adapter.expected_inbound(
         _outbound_record(MessageType.EXECUTION_RESULT), _conversation()
     )
     assert expected == frozenset(
-        {MessageType.EXECUTION_PLAN, MessageType.PRIORITY_CLARIFICATION, MessageType.FINAL_ANSWER}
+        {
+            MessageType.EXECUTION_PLAN,
+            MessageType.PRIORITY_CLARIFICATION,
+            MessageType.FINAL_ANSWER,
+            MessageType.USER_RESPONSE,
+        }
     )
     assert expected == AFTER_EXECUTION_RESULT
     assert MessageType.DISCOVERY_PLAN not in expected
+
+
+@pytest.mark.parametrize("allow_direct_response", [True, False], ids=["direct", "strict"])
+def given_execution_result_or_follow_up_when_user_response_received_then_accepted_whatever_flag(
+    config: AppConfig, allow_direct_response: bool
+) -> None:
+    adapter = ProtocolAdapter(
+        config.model_copy(
+            update={"protocol": ProtocolSection(allow_direct_response=allow_direct_response)}
+        )
+    )
+    for record, conversation in (
+        (_outbound_record(MessageType.EXECUTION_RESULT), _conversation()),
+        (_outbound_record(MessageType.USER_REQUEST), _conversation(final_answer_received=True)),
+    ):
+        expected = adapter.expected_inbound(record, conversation)
+        assert MessageType.USER_RESPONSE in expected
+        inbound = _parse(adapter, USER_RESPONSE_EXAMPLE, expected=expected)
+        assert inbound.message_type is MessageType.USER_RESPONSE
+        assert isinstance(inbound.content, UserResponseContent)
+        assert inbound.plan_type is None and inbound.warnings == []
+
+
+def given_context_resume_request_when_user_response_received_then_unexpected_message_type(
+    adapter: ProtocolAdapter,
+) -> None:
+    expected = adapter.expected_inbound(
+        _outbound_record(MessageType.CONTEXT_RESUME_REQUEST), _conversation(RESUME_REMOTE_ID)
+    )
+    assert MessageType.USER_RESPONSE not in expected
+    raw = dict(USER_RESPONSE_EXAMPLE, conversation_id=RESUME_REMOTE_ID)
+    details = _protocol_error(
+        lambda: _parse(
+            adapter, raw, expected=expected, conversation=_conversation(RESUME_REMOTE_ID)
+        ),
+        "UNEXPECTED_MESSAGE_TYPE",
+    )
+    assert details["received"] == "user_response"
+    assert details["expected"] == ["context_resume_ack"]
+    assert details["inbound"] is True
+
+
+def given_direct_response_disabled_when_user_response_answers_initial_request_then_rejected(
+    config: AppConfig,
+) -> None:
+    strict = ProtocolAdapter(
+        config.model_copy(update={"protocol": ProtocolSection(allow_direct_response=False)})
+    )
+    expected = strict.expected_inbound(_outbound_record(MessageType.USER_REQUEST), _conversation())
+    details = _protocol_error(
+        lambda: _parse(strict, USER_RESPONSE_EXAMPLE, expected=expected), "UNEXPECTED_MESSAGE_TYPE"
+    )
+    assert details["received"] == "user_response"
+    assert details["expected"] == ["discovery_plan"]
+    # the very same message is accepted by the default (direct) adapter
+    default = ProtocolAdapter(config)
+    assert (
+        _parse(
+            default,
+            USER_RESPONSE_EXAMPLE,
+            expected=default.expected_inbound(
+                _outbound_record(MessageType.USER_REQUEST), _conversation()
+            ),
+        ).message_type
+        is MessageType.USER_RESPONSE
+    )
 
 
 def given_execution_result_after_final_answer_when_expected_inbound_asked_then_same_row(
@@ -1820,12 +2078,70 @@ def given_instructions_when_rendered_twice_then_identical(config: AppConfig) -> 
         "diagnosis",
         "evidence",
         "recommended_next_step",
+        # direct answer to the user ADR-022
+        "user_response",
+        "expects_reply",
+        "opaque",
     ],
 )
 def given_instructions_when_rendered_then_rule_keyword_present(
     config: AppConfig, keyword: str
 ) -> None:
     assert keyword in render_instructions(config)
+
+
+def _table_row(text: str, label: str) -> str:
+    """The row of the "You received / You may send" table whose first cell starts with ``label``."""
+    rows = [line for line in text.splitlines() if line.startswith(f"| `{label}")]
+    assert rows, f"no table row for {label}"
+    return rows[0]
+
+
+def given_direct_response_allowed_when_instructions_rendered_then_first_message_row_offers_it(
+    config: AppConfig,
+) -> None:
+    assert config.protocol.allow_direct_response is True
+    text = render_instructions(config)
+    first_row = _table_row(text, "user_request` (first message")
+    assert "`discovery_plan`, `user_response`" in first_row
+    assert "unless the request needs no command at all" in text
+    assert "discovery_plan | user_response" in text
+    assert "**always**" not in text.split("## 1.")[1].split("```")[0]
+    assert "## 9. Answering the user directly: user_response" in text
+    assert re.findall(r"\{[a-z_]+\}", text) == []
+
+
+def given_direct_response_disabled_when_instructions_rendered_then_first_message_is_always_a_plan() -> (
+    None
+):
+    strict = AppConfig(protocol=ProtocolSection(allow_direct_response=False))
+    text = render_instructions(strict)
+    first_row = _table_row(text, "user_request` (first message")
+    assert first_row.rstrip().endswith("| `discovery_plan` |")
+    assert "`user_response`" not in first_row
+    assert "is **always** a" in text
+    assert "only accepted after an `execution_result` or a follow-up `user_request`" in text
+    assert "└─> discovery_plan\n" in text
+    assert "discovery_plan | user_response" not in text
+    # the other rows and the user_response section are unchanged
+    assert "`user_response`" in _table_row(text, "execution_result`")
+    assert "`user_response`" in _table_row(text, "user_request` (follow-up")
+    assert "## 9. Answering the user directly: user_response" in text
+    assert re.findall(r"\{[a-z_]+\}", text) == []
+    assert text != render_instructions(AppConfig())
+
+
+def given_instructions_when_user_response_examples_extracted_then_both_validate_and_one_asks(
+    config: AppConfig,
+) -> None:
+    text = render_instructions(config)
+    blocks = [json.loads(b) for b in re.findall(r"```json[ \t]*\n(.*?)```", text, re.S)]
+    responses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "user_response"]
+    assert len(responses) == 2
+    contents = [UserResponseContent.model_validate(r["content"]) for r in responses]
+    assert [c.expects_reply for c in contents] == [False, True]
+    assert contents[0].format == "markdown" and contents[1].format == "text"
+    assert str(config.payload.max_message_bytes) in text.split("## 9.")[1]
 
 
 def given_instructions_when_json_examples_extracted_then_every_message_validates_against_schemas(

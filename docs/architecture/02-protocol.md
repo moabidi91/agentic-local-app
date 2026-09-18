@@ -2,7 +2,7 @@
 
 **Ce que dit la spec.** Le modèle n'est piloté qu'à travers une grammaire fermée de messages ([§2.2](../spec/SPEC-v1.1.md#22-protocol-model)) : `user_request → discovery_plan → execution_result → execution_plan → execution_result → final_answer`, avec la branche `priority_clarification`, et les dix types de [§3.5](../spec/SPEC-v1.1.md#35-protocoladapter) dont les schémas sont donnés en [§12](../spec/SPEC-v1.1.md#12-protocol-message-schemas). Le `ProtocolAdapter` construit les messages sortants, parse et valide les entrants, et « rejette les réponses malformées ou non déterministes ». La phase 2 (§18.2) doit tester le rejet des messages inattendus *par état protocolaire*.
 
-**Ce que précisent les ADR.** [ADR-007](../adr/ADR-007-amendements-machines-a-etats.md) écrit la **table des messages attendus**, la validation structurelle des plans, fait de `system_error` un objet interne et de `chunk_request` un type de tâche ; [ADR-004](../adr/ADR-004-contrat-de-transport.md) définit le bootstrap des instructions du protocole et l'idempotence par `message_id` ; [ADR-005](../adr/ADR-005-resume-de-contexte-par-le-modele.md) ajoute `state_summary` aux plans ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) `timeout_ms` ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) les défauts des drapeaux et les objets `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) `default_max_output_bytes` et `max_output_bytes_applied` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) les plages, `stream` et le résultat de chunk ; [ADR-014](../adr/ADR-014-continuation-apres-rotation.md) `pending_message_type` et la retransmission ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) la sérialisation canonique et les identifiants injectés.
+**Ce que précisent les ADR.** [ADR-007](../adr/ADR-007-amendements-machines-a-etats.md) écrit la **table des messages attendus**, la validation structurelle des plans, fait de `system_error` un objet interne et de `chunk_request` un type de tâche ; [ADR-004](../adr/ADR-004-contrat-de-transport.md) définit le bootstrap des instructions du protocole et l'idempotence par `message_id` ; [ADR-005](../adr/ADR-005-resume-de-contexte-par-le-modele.md) ajoute `state_summary` aux plans ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) `timeout_ms` ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) les défauts des drapeaux et les objets `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) `default_max_output_bytes` et `max_output_bytes_applied` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) les plages, `stream` et le résultat de chunk ; [ADR-014](../adr/ADR-014-continuation-apres-rotation.md) `pending_message_type` et la retransmission ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) la sérialisation canonique et les identifiants injectés ; [ADR-022](../adr/ADR-022-reponse-utilisateur.md) ajoute le type entrant `user_response` (réponse directe à l'utilisateur, corps opaque borné, question avec `expects_reply`) et le drapeau `protocol.allow_direct_response` sur la première réponse.
 
 Les schémas pydantic sont dans [`protocol/messages.py`](../../src/agentic_local_app/protocol/messages.py) ; toutes les extensions sont **optionnelles**, de sorte que les exemples de §12 valident sans modification. L'adaptateur (`protocol/adapter.py`, phase 2) et le texte des instructions (`protocol/PROTOCOL_INSTRUCTIONS.md`) sont décrits ici par leur contrat.
 
@@ -15,9 +15,10 @@ stateDiagram-v2
     direction TB
     [*] --> AttenteDiscoveryPlan : POST user_request (premier de la conversation)
     AttenteDiscoveryPlan --> ExecutionDuPlan : discovery_plan
+    AttenteDiscoveryPlan --> Terminee : user_response (protocol.allow_direct_response)
     ExecutionDuPlan --> AttentePlanOuFinal : POST execution_result
     AttentePlanOuFinal --> ExecutionDuPlan : execution_plan ou priority_clarification
-    AttentePlanOuFinal --> Terminee : final_answer
+    AttentePlanOuFinal --> Terminee : final_answer ou user_response
     Terminee --> AttentePlanOuFinal : POST user_request de suivi (conversation reutilisable)
     Terminee --> [*] : auto_close_on_final_answer
     AttenteDiscoveryPlan --> Rotation : saturation
@@ -33,9 +34,9 @@ stateDiagram-v2
     Interrompue --> [*] : nouvelle conversation dans la meme session
 ```
 
-Lecture : la branche `priority_clarification` (§2.2) n'est qu'un plan comme un autre, exécuté par `PlanRunner` et suivi d'un `execution_result` ; la grammaire de la spec « `priority_clarification → execution_result → execution_plan | final_answer` » est donc réalisée par `AttentePlanOuFinal`. La rotation ([06](06-context-rotation.md)) et l'interruption ([07](07-interruption-and-recovery.md)) sont orthogonales à la grammaire : la première retransmet le message en attente dans la conversation enfant (ADR-014), la seconde clôt la conversation sans rien envoyer (§8.4, ADR-006).
+Lecture : la branche `priority_clarification` (§2.2) n'est qu'un plan comme un autre, exécuté par `PlanRunner` et suivi d'un `execution_result` ; la grammaire de la spec « `priority_clarification → execution_result → execution_plan | final_answer` » est donc réalisée par `AttentePlanOuFinal`. Un `user_response` (ADR-022) conclut le tour exactement comme un `final_answer` — depuis `AttentePlanOuFinal` toujours, depuis `AttenteDiscoveryPlan` seulement sous `protocol.allow_direct_response` (défaut `true`). La rotation ([06](06-context-rotation.md)) et l'interruption ([07](07-interruption-and-recovery.md)) sont orthogonales à la grammaire : la première retransmet le message en attente dans la conversation enfant (ADR-014), la seconde clôt la conversation sans rien envoyer (§8.4, ADR-006).
 
-## 2. Catalogue des dix types de messages (§3.5, §12)
+## 2. Catalogue des onze types de messages (§3.5, §12, ADR-022)
 
 Enveloppe commune (`Envelope`) : `type`, `conversation_id` (identifiant **distant** de la conversation, celui rendu par l'`init`), `message_id`, `content`. `MessageType` est l'énumération de [`domain/states.py`](../../src/agentic_local_app/domain/states.py) ; `CONTENT_MODELS` associe chaque type à son modèle de contenu.
 
@@ -47,12 +48,13 @@ Enveloppe commune (`Envelope`) : `type`, `conversation_id` (identifiant **distan
 | `priority_clarification` | entrant | modèle → application | idem | `PlanContent` | idem | `clarification` |
 | `execution_result` | sortant | application → modèle | `plan_id`, `status`, `results[]`, `skipped_tasks[]`, `cancelled_tasks[]`, `interrupted_tasks[]`, `stop_reason` | `ExecutionResultContent`, `TaskResult`, `TaskRef` | `status` = statut du plan en minuscules (ADR-009) ; `TaskRef {task_id, reason}` (ADR-009) ; `*_total`, `*_range`, `max_output_bytes_applied`, `timed_out`, `timeout_ms_applied`, `duration_ms`, `reason`, champs de chunk (ADR-008/010/011) | clôt le cycle du plan, ouvre le suivant |
 | `final_answer` | entrant | modèle → application | `status`, `diagnosis`, `evidence[]`, `recommended_next_step` | `FinalAnswerContent` (`extra = allow`) | — | clôt le cycle |
+| `user_response` | entrant | modèle → application | `format` (`text` \| `markdown` \| `json`, défaut `text`), `body` (chaîne non vide, **opaque** : jamais parsée), `status` (`completed` \| `partial` \| `failed`), `expects_reply` (défaut `false`) | `UserResponseContent` (`extra = forbid`) | type entier ajouté par ADR-022 (hors §12) ; `body` ≤ `payload.max_message_bytes` en UTF-8 (`USER_RESPONSE_TOO_LARGE`) | clôt le cycle, comme `final_answer` |
 | `context_resume_request` | sortant | application → modèle (conversation **enfant**) | `original_conversation_id`, `goal`, `context_summary` | `ContextResumeRequestContent` | `pending_message_type` (ADR-014) ; `context_summary` assemblé par le `ContextReducer` (ADR-005) | ouvre `resume` |
 | `context_resume_ack` | entrant | modèle → application (enfant) | `original_conversation_id`, `acknowledged` | `ContextResumeAckContent` | — ; `acknowledged = false` est une erreur de protocole | clôt `resume` |
 | `chunk_request` | — | **type de tâche**, jamais un message autonome (ADR-007) | `task_id`, `type: chunk_request`, `ref_task_id`, `byte_offset`, `max_bytes` | `TaskMessage` (validateur de forme) | `stream` ∈ {stdout, stderr}, défaut `stdout` (ADR-011) | celui du plan porteur |
 | `system_error` | — | objet **interne** : jamais envoyé au modèle (ADR-007) | attributs normalisés de §6 | `SystemErrorContent` | persisté en `FailureRecord`, audité, exposé par l'API / la CLI (ADR-002) | — |
 
-Ensembles utiles (`states.py`) : `PLAN_MESSAGE_TYPES` = {discovery_plan, execution_plan, priority_clarification} ; `OUTBOUND_MESSAGE_TYPES` = {user_request, execution_result, context_resume_request} ; `INBOUND_MESSAGE_TYPES` = plans ∪ {final_answer, context_resume_ack}. `plan_type_for_message` et `cycle_type_for_plan` donnent le `PlanType` et le `CycleType` d'un message de plan.
+Ensembles utiles (`states.py`) : `PLAN_MESSAGE_TYPES` = {discovery_plan, execution_plan, priority_clarification} ; `OUTBOUND_MESSAGE_TYPES` = {user_request, execution_result, context_resume_request} ; `INBOUND_MESSAGE_TYPES` = plans ∪ {final_answer, user_response, context_resume_ack} ; `CONCLUDING_MESSAGE_TYPES` = {final_answer, user_response}, les deux types qui concluent un tour sans plan (ADR-022). `plan_type_for_message` et `cycle_type_for_plan` donnent le `PlanType` et le `CycleType` d'un message de plan.
 
 ### 2.1 Schéma de tâche (`TaskMessage`)
 
@@ -88,14 +90,14 @@ Champs du [`MessageRecord`](../../src/agentic_local_app/domain/models.py) utiles
 
 ## 4. Table des messages attendus (ADR-007)
 
-`ProtocolAdapter.expected_inbound(last_outbound, conversation)` renvoie le `frozenset[MessageType]` autorisé ; `parse_inbound` rejette tout autre type.
+`ProtocolAdapter.expected_inbound(last_outbound, conversation)` renvoie le `frozenset[MessageType]` autorisé ; `parse_inbound` rejette tout autre type. La table de base `EXPECTED_INBOUND` (ADR-007) est amendée par ADR-022 : `expected_inbound_for(situation, allow_direct_response=…)` ajoute `user_response` à la ligne initiale quand `protocol.allow_direct_response` est actif (défaut `true`) ; les autres lignes ne dépendent pas du drapeau.
 
 | Dernier message sortant | Condition sur la conversation | Types entrants autorisés |
 |---|---|---|
-| `user_request` | premier de la conversation : `final_answer_received = false` et `retransmission_of = null` | `discovery_plan` |
-| `user_request` | suivi : `final_answer_received = true` (conversation réutilisée après `COMPLETED → WAITING_USER`) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer` |
+| `user_request` | premier de la conversation : `final_answer_received = false` et `retransmission_of = null` | `discovery_plan` ; `user_response` si `protocol.allow_direct_response` |
+| `user_request` | suivi : `final_answer_received = true` (le modèle a conclu un tour par un `final_answer` ou un `user_response` ; conversation réutilisée après `COMPLETED → WAITING_USER`) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `user_request` | retransmis après rotation (`retransmission_of ≠ null`) | l'ensemble attendu du message d'origine (ADR-014 : « la table des messages attendus est celle de M ») |
-| `execution_result` | — | `execution_plan`, `priority_clarification`, `final_answer` |
+| `execution_result` | — | `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `context_resume_request` | conversation enfant `SATURATED` | `context_resume_ack` |
 | *(aucun)* | rien n'a été envoyé | ∅ — aucun GET n'est légitime |
 
@@ -124,9 +126,12 @@ flowchart TD
     KIND -- "plan" --> PL["Validation structurelle du plan (5.2)"]
     KIND -- "context_resume_ack" --> ACK["acknowledged = true<br/>original_conversation_id = parent"]
     KIND -- "final_answer" --> OK
+    KIND -- "user_response" --> UR{"body en UTF-8<br/>inferieur ou egal a max_message_bytes ?"}
+    UR -- non --> E7["ProtocolError USER_RESPONSE_TOO_LARGE"]
     PL --> OK["InboundMessage valide<br/>MessageRecord validation_status = valid"]
     ACK --> OK
-    E1 & E2 & E3 & E4 & E5 & E6 --> REC["MessageRecord validation_status = invalid<br/>message.rejected + FailureRecord MODEL_PROTOCOL_ERROR<br/>protocol_error_count + 1"]
+    UR -- oui --> OK
+    E1 & E2 & E3 & E4 & E5 & E6 & E7 --> REC["MessageRecord validation_status = invalid<br/>message.rejected + FailureRecord MODEL_PROTOCOL_ERROR<br/>protocol_error_count + 1"]
 ```
 
 Un message rejeté est **quand même persisté** (`validation_status = invalid`) et audité (`message.rejected`) : la reconstruction depuis l'audit (§17.3) doit montrer ce que le modèle a réellement envoyé. Sa taille compte dans `context_bytes` (il est bien dans le contexte du modèle, ADR-013).
@@ -163,12 +168,13 @@ Tous portent `error_type = MODEL_PROTOCOL_ERROR`, `origin = ProtocolAdapter`, `r
 | `FORWARD_DEPENDENCY_IN_SEQUENTIAL` | `sequential` : dépendance vers une tâche postérieure | `task_id`, `dependency` | ADR-007 |
 | `CHUNK_REF_UNKNOWN` | `ref_task_id` ne désigne aucune tâche à sortie stockée de la session (`stored_output_task_ids`) | `task_id`, `ref_task_id` | ADR-007 (voir *Points ouverts* n°1) |
 | `STATE_SUMMARY_TOO_LARGE` | `state_summary` au-delà de `max_state_summary_bytes` | `size_bytes`, `limit` | ADR-005 |
+| `USER_RESPONSE_TOO_LARGE` | `body` d'un `user_response` au-delà de `payload.max_message_bytes` (octets UTF-8), vérifié après le schéma | `size_bytes`, `max_bytes`, `message_id` | ADR-022 |
 | `ACK_NOT_ACKNOWLEDGED` | `context_resume_ack.acknowledged = false` | `original_conversation_id` | §2.6, §10 |
 | `ACK_WRONG_ORIGINAL` | `original_conversation_id` ≠ identifiant distant du parent | `expected`, `received` | §12.9 |
 | `SYSTEM_ERROR_NOT_ALLOWED_INBOUND` | un `system_error` reçu du modèle : le type est interne et n'est jamais attendu en entrée | `message_id` | ADR-007 |
 | `RESPONSE_NOT_JSON`, `RESPONSE_SCHEMA_INVALID` | corps d'une réponse `init` / `post` / `get` non JSON ou hors contrat (levés par le `TransportGateway`, `origin = TransportGateway`) | `operation`, `status`, `body_excerpt` | ADR-004 |
 
-Les codes de l'adaptateur sont ceux de [`protocol/adapter.py`](../../src/agentic_local_app/protocol/adapter.py) (phase 2) ; la table §4 y vit sous le nom `EXPECTED_INBOUND`, indexée par `OutboundSituation` (`initial_user_request`, `follow_up_user_request`, `execution_result`, `context_resume_request`), et `situation_for(last_outbound, conversation)` choisit la ligne à partir de `conversation.final_answer_received`.
+Les codes de l'adaptateur sont ceux de [`protocol/adapter.py`](../../src/agentic_local_app/protocol/adapter.py) (phase 2) ; la table §4 y vit sous le nom `EXPECTED_INBOUND`, indexée par `OutboundSituation` (`initial_user_request`, `follow_up_user_request`, `execution_result`, `context_resume_request`), et `situation_for(last_outbound, conversation)` choisit la ligne à partir de `conversation.final_answer_received` ; `expected_inbound_for` applique le drapeau d'ADR-022 à la ligne initiale.
 
 Avertissements (jamais des erreurs) portés par `InboundMessage.warnings` et publiés en `audit.warning` : `CONTRADICTORY_FLAGS:<task_id>` (ADR-009), `DEFAULT_WORKERS_APPLIED` (`parallel` sans `max_parallel_workers` ⇒ 1), `WORKERS_IGNORED_IN_SEQUENTIAL` (`max_parallel_workers` déclaré en `sequential`).
 
@@ -271,7 +277,7 @@ sequenceDiagram
 
 Un `ref_task_id` connu mais sans blob (tâche interrompue au redémarrage, ADR-016), ou un `byte_offset ≥ total`, donne une tâche `FAILED` (`CHUNK_REF_NOT_FOUND`, `CHUNK_RANGE_INVALID`) dans l'`execution_result`, jamais une erreur de protocole (ADR-008 §5, ADR-011).
 
-### 6.4 Suivi après `final_answer` (§11)
+### 6.4 Suivi après `final_answer` ou `user_response` (§11, ADR-022)
 
 ```mermaid
 sequenceDiagram
@@ -281,21 +287,21 @@ sequenceDiagram
     participant LC as LifecycleManager
     participant M as Modele
 
-    M-->>PO: GET : final_answer
+    M-->>PO: GET : final_answer, ou user_response (ADR-022)
     PO->>LC: conversation WAITING_MODEL_RESPONSE vers COMPLETED, session RUNNING vers COMPLETED
-    alt auto_close_on_final_answer = true
+    alt auto_close_on_final_answer = true, et pas une question (expects_reply = false)
         PO->>LC: conversation COMPLETED vers CLOSED (closure_reason auto_close)
         PO->>M: POST close_url (best effort, si configure)
-    else conversation reutilisable
+    else conversation reutilisable, ou question posee par le modele
         PO->>LC: conversation COMPLETED vers WAITING_USER
-        U->>PO: message de suivi
+        U->>PO: message de suivi (ou reponse a la question)
         PO->>LC: session COMPLETED vers RUNNING, conversation WAITING_USER vers WAITING_MODEL_RESPONSE
         PO->>M: POST user_request (suivi)
-        M-->>PO: GET : discovery_plan, execution_plan, priority_clarification ou final_answer
+        M-->>PO: GET : discovery_plan, execution_plan, priority_clarification, final_answer ou user_response
     end
 ```
 
-Si la fenêtre de contexte de la conversation réutilisable est `SATURATED` au moment du suivi, la rotation a lieu **avant** le POST (contrôle de projection, ADR-013) : le `user_request` de suivi est alors le message en attente retransmis dans l'enfant (ADR-014).
+Si la fenêtre de contexte de la conversation réutilisable est `SATURATED` au moment du suivi, la rotation a lieu **avant** le POST (contrôle de projection, ADR-013) : le `user_request` de suivi est alors le message en attente retransmis dans l'enfant (ADR-014). Un `user_response` n'est jamais écrit dans `SessionRecord.final_answer` : `ConversationManager.user_responses` / `last_reply` (API `GET /sessions/{sid}/responses` / `/reply`) le relisent dans la table des messages (ADR-022).
 
 ## 7. Bootstrap des instructions du protocole (ADR-004)
 
@@ -303,8 +309,9 @@ Le modèle n'apprend le protocole que par le champ `instructions` de l'`init`. L
 
 | Section du texte | Contenu | Source |
 |---|---|---|
-| Rôle et boucle | le modèle planifie, l'application exécute ; un message par tour ; la première réponse est **toujours** un `discovery_plan` (§2.3), y compris après une interruption | §1, §2.2, §2.3, ADR-006 |
-| Enveloppe et schémas | les dix types, l'enveloppe, les exemples JSON (§12 avec les champs ajoutés) | §12, ADR-007 |
+| Rôle et boucle | le modèle planifie, l'application exécute ; un message par tour ; la première réponse est un `discovery_plan` (§2.3), y compris après une interruption — ou un `user_response` quand la demande n'appelle aucune commande, si `protocol.allow_direct_response` (la ligne du tableau et la règle sont rendues d'après le drapeau : `{initial_reply_types}`, `{initial_reply_grammar}`, `{initial_reply_rule}`) | §1, §2.2, §2.3, ADR-006, ADR-022 |
+| Enveloppe et schémas | les onze types, l'enveloppe, les exemples JSON (§12 avec les champs ajoutés, plus `user_response`) | §12, ADR-007, ADR-022 |
+| Réponse directe | section « Answering the user directly: user_response » : quand l'utiliser (explication, analyse, question à l'utilisateur), les champs, `body` opaque borné à `max_message_bytes`, `expects_reply`, le suivi possible | ADR-022 |
 | Tâches | drapeaux et leurs défauts (`continue_on_error` absent ⇒ le plan s'arrête à l'échec), `depends_on`, `resource_lock`, `max_parallel_workers` | ADR-009, §2.4 |
 | Sorties et tailles | `max_output_bytes` par tâche, `default_max_output_bytes` par plan, défaut et plafond de l'application, troncature stderr-d'abord / fin-de-stdout, plages `[début, fin)`, `chunk_request` avec `stream` | ADR-010, ADR-011 |
 | Temps | `timeout_ms` par tâche, défaut et plafond, `TIMED_OUT` rapporté avec `exit_code = null` | ADR-008 |

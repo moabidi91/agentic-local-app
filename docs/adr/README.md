@@ -27,6 +27,7 @@ Format : **Contexte** (ce que dit la spec, où ça coince) · **Décision** · *
 | [ADR-019](ADR-019-consolidation-vague-1.md) | Arbitrages de consolidation après la vague 1 (chunk ref, rotation en WARNING, transitions, bornes, coût de rotation, disjoncteur, noms, lancement, SQLite FULL, savepoints) | ADR-003/004/005/007/008/010/011/012/013/014 | accepté |
 | [ADR-020](ADR-020-transport-enfichable.md) | Transport enfichable : providers choisis par configuration (registre, base template method, `templated_http`) | §3.12, ADR-004 | accepté |
 | [ADR-021](ADR-021-codec-de-messages-par-modele.md) | Codec de messages par modèle : forme brute des réponses (texte, chat completion, appel d'outil) convertie par configuration, décorateur transparent, `UNPARSEABLE_REPLY` | §3.12, §3.5, ADR-004, ADR-020 | accepté |
+| [ADR-022](ADR-022-reponse-utilisateur.md) | `user_response` : le modèle répond directement à l'utilisateur (corps opaque borné, question avec `expects_reply`, drapeau `protocol.allow_direct_response` sur le premier message, chemin du `final_answer`, `GET /responses` / `/reply`, `agentic-app reply`) | §3.5, §11, §12, §14, ADR-007 | accepté |
 
 ## Comment contester un ADR
 

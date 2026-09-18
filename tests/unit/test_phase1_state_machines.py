@@ -545,6 +545,51 @@ def given_completed_session_with_auto_close_when_follow_up_then_rejected(
     assert recorder.events == []
 
 
+def given_auto_close_session_with_conversation_waiting_for_user_when_follow_up_then_running(
+    lifecycle: ConversationLifecycleManager,
+    store: InMemoryConversationStore,
+    recorder: RecordingSubscriber,
+) -> None:
+    """ADR-022: the model asked a question (``user_response`` with ``expects_reply``), the
+    conversation was left ``WAITING_USER`` instead of ``CLOSED`` — the user may answer it."""
+    session = _session_in(lifecycle, SessionState.RUNNING, auto_close=True)
+    conversation = _conversation_in(
+        lifecycle, ConversationState.WAITING_MODEL_RESPONSE, session=session
+    )
+    lifecycle.transition_conversation(
+        conversation.conversation_id,
+        ConversationState.COMPLETED,
+        reason="user_response",
+        final_answer_received=True,
+    )
+    lifecycle.transition_conversation(conversation.conversation_id, ConversationState.WAITING_USER)
+    lifecycle.transition_session(session.session_id, SessionState.COMPLETED, reason="user_response")
+    recorder.clear()
+
+    running = lifecycle.transition_session(
+        session.session_id, SessionState.RUNNING, reason="user_request"
+    )
+
+    assert running.status is SessionState.RUNNING and running.auto_close_on_final_answer is True
+    assert store.get_session(session.session_id) == running
+    assert _only_event(recorder).payload == {
+        "from": "COMPLETED",
+        "to": "RUNNING",
+        "reason": "user_request",
+    }
+    # once the conversation is closed for good, COMPLETED is terminal again
+    lifecycle.transition_conversation(
+        conversation.conversation_id, ConversationState.WAITING_MODEL_RESPONSE
+    )
+    lifecycle.transition_conversation(conversation.conversation_id, ConversationState.COMPLETED)
+    lifecycle.transition_conversation(
+        conversation.conversation_id, ConversationState.CLOSED, closure_reason="auto_close"
+    )
+    lifecycle.transition_session(session.session_id, SessionState.COMPLETED, reason="final_answer")
+    with pytest.raises(InvalidTransitionError):
+        lifecycle.transition_session(session.session_id, SessionState.RUNNING)
+
+
 def given_completed_session_without_auto_close_when_follow_up_then_running(
     lifecycle: ConversationLifecycleManager,
     store: InMemoryConversationStore,

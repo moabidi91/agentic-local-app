@@ -719,6 +719,119 @@ async def given_completed_session_when_final_answer_requested_then_answer_return
     assert (await client.get(_url("/sessions/nope/final-answer"))).status_code == 404
 
 
+# ---- ADR-022: the model's direct responses and the last reply of either kind ------------------
+async def given_session_without_reply_when_responses_and_reply_requested_then_empty_and_404(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    response = await client.get(_url(f"/sessions/{sid}/responses"))
+    assert response.status_code == 200 and response.json() == []
+    response = await client.get(_url(f"/sessions/{sid}/reply"))
+    assert response.status_code == 404
+    error = _error(response)
+    assert error["error_code"] == "REPLY_NOT_FOUND" and sid in error["details"]["message"]
+    assert (await client.get(_url("/sessions/nope/responses"))).status_code == 404
+    assert (await client.get(_url("/sessions/nope/reply"))).status_code == 404
+
+
+async def given_user_response_received_when_responses_requested_then_listed_with_content(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.add_cycle(sid)
+    manager.respond(sid, "## Analysis\n\nThe target release is wrong.", format="markdown")
+    response = await client.get(_url(f"/sessions/{sid}/responses"))
+    assert response.status_code == 200, response.text
+    items = response.json()
+    assert len(items) == 1
+    assert items[0] == {
+        "message_id": "model-msg-0001",
+        "conversation_id": "conv-0001",
+        "cycle_id": "cyc-0001",
+        "received_at": manager.store.list_messages("conv-0001")[0].model_dump(mode="json")[
+            "received_at"
+        ],
+        "format": "markdown",
+        "body": "## Analysis\n\nThe target release is wrong.",
+        "status": "completed",
+        "expects_reply": False,
+    }
+    assert items == manager.user_responses(sid)
+    # the final-answer route stays what it was: a user_response is not a final answer
+    response = await client.get(_url(f"/sessions/{sid}/final-answer"))
+    assert response.json() == {"session_id": sid, "final_answer": None}
+
+
+async def given_user_response_received_when_reply_requested_then_newest_reply_returned(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.respond(sid, "Which module fails?", expects_reply=True)
+    response = await client.get(_url(f"/sessions/{sid}/reply"))
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["type"] == "user_response"
+    assert reply["message_id"] == "model-msg-0001"
+    assert reply["conversation_id"] == "conv-0001"
+    assert reply["content"] == {
+        "format": "text",
+        "body": "Which module fails?",
+        "status": "completed",
+        "expects_reply": True,
+    }
+    assert reply == manager.last_reply(sid)
+    assert manager.require_conversation(sid).status is ConversationState.WAITING_USER
+    # the user answers the question through the existing follow-up route
+    follow_up = await client.post(
+        _url(f"/sessions/{sid}/messages"), json={"user_message": "service-api only"}
+    )
+    assert follow_up.status_code == 202, follow_up.text
+    assert manager.require_conversation(sid).status is ConversationState.WAITING_MODEL_RESPONSE
+    # a final_answer afterwards becomes the newest reply; the responses list keeps the question
+    manager.complete(sid, {"status": "success", "summary": "Fixed"})
+    manager.add_message(
+        sid,
+        direction=MessageDirection.INBOUND,
+        message_type=MessageType.FINAL_ANSWER,
+        payload={
+            "type": "final_answer",
+            "conversation_id": "conv-0001",
+            "message_id": "model-msg-0002",
+            "content": {"status": "success", "summary": "Fixed"},
+        },
+        message_id="model-msg-0002",
+    )
+    reply = (await client.get(_url(f"/sessions/{sid}/reply"))).json()
+    assert reply["type"] == "final_answer" and reply["message_id"] == "model-msg-0002"
+    assert reply["content"] == {"status": "success", "summary": "Fixed"}
+    assert [
+        r["message_id"] for r in (await client.get(_url(f"/sessions/{sid}/responses"))).json()
+    ] == ["model-msg-0001"]
+
+
+async def given_question_under_auto_close_when_follow_up_posted_then_202_conversation_reused(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    session = await manager.start_session(goal="g", user_message="m", auto_close=True)
+    sid = session.session_id
+    manager.respond(sid, "Which module?", expects_reply=True)
+    assert manager.require_conversation(sid).status is ConversationState.WAITING_USER
+    response = await client.post(_url(f"/sessions/{sid}/messages"), json={"user_message": "all"})
+    assert response.status_code == 202, response.text
+    assert response.json()["status"] == "RUNNING"
+
+
+async def given_statement_under_auto_close_when_follow_up_posted_then_409(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    session = await manager.start_session(goal="g", user_message="m", auto_close=True)
+    sid = session.session_id
+    manager.respond(sid, "Done.", expects_reply=False)
+    assert manager.require_conversation(sid).status is ConversationState.CLOSED
+    response = await client.post(_url(f"/sessions/{sid}/messages"), json={"user_message": "x"})
+    assert response.status_code == 409
+
+
 # ================================================================================================
 # conversations, plans, tasks
 # ================================================================================================
@@ -1689,6 +1802,45 @@ async def given_event_types_query_when_events_route_streamed_then_filtered(
     assert [f.event for f in frames] == ["final_answer.received", "session.state_changed"]
     bad = await stream_client.get(_url(f"/sessions/{sid}/events?event_types=nope"))
     assert bad.status_code == 422
+
+
+async def given_user_response_received_when_events_route_streamed_then_frame_carries_payload(
+    stream_client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+
+    def activity() -> None:
+        manager.add_cycle(sid)
+        manager.respond(sid, "Which module fails?", expects_reply=True)
+
+    _, frames = await read_frames(
+        stream_client,
+        _url(f"/sessions/{sid}/events?event_types=user_response.received,session.state_changed"),
+        2,
+        after_start=activity,
+    )
+    assert [f.event for f in frames] == ["user_response.received", "session.state_changed"]
+    frame = frames[0].json
+    assert frame["event_type"] == "user_response.received"
+    assert frame["session_id"] == sid and frame["conversation_id"] == "conv-0001"
+    assert frame["cycle_id"] == "cyc-0001"
+    assert frame["payload"] == {
+        "message_id": "model-msg-0001",
+        "format": "text",
+        "status": "completed",
+        "expects_reply": True,
+        "body_bytes": len("Which module fails?"),
+        "auto_close_on_final_answer": False,
+        "auto_close_skipped": False,
+        "consumed_cycles": 0,
+        "consumed_plans": 0,
+        "session_duration_ms": 0,
+    }
+    assert "body" not in frame["payload"]  # the body is read from the messages table, not the bus
+    assert frames[0].id is not None  # audited, hence replayable
+    audited = manager.store.list_audit_events(sid, limit=100)
+    assert [e.event_type for e in audited].count("user_response.received") == 1
+    assert frames[1].json["payload"]["reason"] == "user_response"
 
 
 async def given_unknown_session_or_task_when_sse_route_requested_then_404(

@@ -378,7 +378,7 @@ Format de scénario (proposé) :
 }
 ```
 
-Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (identifiants déterministes `mock-msg-0001`…), conserve tout ce qu'il reçoit, et sert un `context_resume_ack` automatique à un `context_resume_request` sauf si le scénario dit le contraire.
+Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (identifiants déterministes `mock-msg-0001`…), conserve tout ce qu'il reçoit, et sert un `context_resume_ack` automatique à un `context_resume_request` sauf si le scénario dit le contraire. Deux scénarios sont intégrés (`agentic-app mock-server --scenario-name`) : `java` (défaut, la boucle §12) et `analysis` (un `user_response` sans commande, ADR-022) ; les étapes d'un fichier JSON peuvent porter n'importe quel message, `user_response` compris.
 
 ## 9. Clés de configuration
 

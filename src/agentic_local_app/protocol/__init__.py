@@ -8,6 +8,7 @@ from agentic_local_app.protocol.adapter import (
     OutboundMessage,
     OutboundSituation,
     ProtocolAdapter,
+    expected_inbound_for,
     render_instructions,
     situation_for,
 )
@@ -26,6 +27,7 @@ from agentic_local_app.protocol.messages import (
     TaskRef,
     TaskResult,
     UserRequestContent,
+    UserResponseContent,
     content_model_for,
 )
 
@@ -51,7 +53,9 @@ __all__ = [
     "TaskRef",
     "TaskResult",
     "UserRequestContent",
+    "UserResponseContent",
     "content_model_for",
+    "expected_inbound_for",
     "render_instructions",
     "situation_for",
 ]

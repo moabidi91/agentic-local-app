@@ -38,7 +38,7 @@ Ordre d'inscription fixé au démarrage par `wiring.build_application` : `AuditL
 
 ## 2. Catalogue des événements (`EventType`)
 
-Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté sur le record par le propriétaire), `session_id` (toujours), `conversation_id`, `cycle_id`, `plan_id`, `task_id` (selon l'entité), `payload` (JSON, jamais d'octets bruts). Tous les payloads `*.state_changed` sont `state_change_payload(from, to, reason)` — `reason` absent quand non fourni. Les 30 types de [`domain/events.py`](../../src/agentic_local_app/domain/events.py) :
+Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté sur le record par le propriétaire), `session_id` (toujours), `conversation_id`, `cycle_id`, `plan_id`, `task_id` (selon l'entité), `payload` (JSON, jamais d'octets bruts). Tous les payloads `*.state_changed` sont `state_change_payload(from, to, reason)` — `reason` absent quand non fourni. Les 31 types de [`domain/events.py`](../../src/agentic_local_app/domain/events.py) :
 
 | `event_type` | Émetteur | Moment | Identifiants portés | Payload (contrat) | Audité |
 |---|---|---|---|---|---|
@@ -57,6 +57,7 @@ Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté 
 | `task.state_changed` | PlanRunner · InterruptionHandler · RecoveryCoordinator | après chaque transition de tâche | + `cycle_id`, `plan_id`, `task_id` | `{from, to, reason?}` + selon l'état : `RUNNING` → `{pid, timeout_ms_applied}` ; terminal → `{exit_code, duration_ms, timed_out, truncated, original_size_bytes}` | oui |
 | `task.output` | PlanRunner (via `on_output` de l'exécuteur) | par tranche, ≤ `live_output_chunk_bytes`, ≥ `live_output_interval_ms` d'écart | + `plan_id`, `task_id` | `{stream, offset, size, data}` — `data` décodé UTF-8 avec remplacement | **non** |
 | `final_answer.received` | ProtocolOrchestrator | `final_answer` validé et persisté | + `cycle_id` | `{message_id, status, auto_close_on_final_answer, consumed_cycles, consumed_plans, session_duration_ms}` | oui |
+| `user_response.received` | ProtocolOrchestrator | `user_response` validé et persisté (ADR-022) — jamais le corps lui-même, relu dans la table des messages | + `cycle_id` | `{message_id, format, status, expects_reply, body_bytes, auto_close_on_final_answer, auto_close_skipped, consumed_cycles, consumed_plans, session_duration_ms}` | oui |
 | `failure.recorded` | FailureManager | `FailureRecord` persisté | + ids de l'entité concernée | `{failure_id, error_type, error_code, severity, origin, retryable, recoverable, attempt, max_attempts, operation?, details}` | oui |
 | `retry.scheduled` | FailureManager | `RetryDecisionRecord` persisté, décision `retry` | + `cycle_id` | `{decision_id, operation, error_type, error_code, attempt, max_attempts, delay_ms}` | oui |
 | `breaker.state_changed` | CircuitBreaker | transition du disjoncteur | `session_id` (courante) | `{from, to, reason, consecutive_failures}` | oui |
@@ -184,8 +185,9 @@ Base `http://{api.host}:{api.port}/api/v1` (défaut `127.0.0.1:8765`). Aucun ét
 | GET | `/sessions?status=running,ready&limit=&cursor=` | liste paginée, filtrable | `[SessionRecord]` + `next_cursor` |
 | GET | `/sessions/{sid}` | `SessionRecord` + conversation courante | — |
 | POST | `/sessions/{sid}/interrupt` | interruption ; répond quand `READY` est atteint | `200 InterruptionReport` (`already_idle` si rien à interrompre) |
-| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11) | `202` |
+| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11), ou réponse à une question du modèle (ADR-022) | `202` |
 | GET | `/sessions/{sid}/snapshot` | snapshot complet §4 (une requête pour tout afficher) | `RuntimeSnapshot` |
+| GET | `/sessions/{sid}/responses` · `/sessions/{sid}/reply` | les `user_response` du modèle (ADR-022) ; la dernière réponse concluante, `final_answer` ou `user_response` (404 `REPLY_NOT_FOUND` s'il n'y en a pas) | `[…]` · `{type, message_id, conversation_id, cycle_id, received_at, content}` |
 | GET | `/sessions/{sid}/conversations` · `/conversations/{cid}` | chaîne des conversations (rotations, interruptions) | `[ConversationRecord]` |
 | GET | `/sessions/{sid}/plans` · `/plans/{pid}?include=tasks` | plans avec compteurs, tâches à la demande | `[PlanRecord]` |
 | GET | `/sessions/{sid}/tasks?status=running&plan_id=` | tâches filtrables — la vue « en cours » du front | `[TaskRecord]` |

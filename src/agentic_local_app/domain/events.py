@@ -33,6 +33,7 @@ class EventType(StrEnum):
     TASK_STATE_CHANGED = "task.state_changed"
     TASK_OUTPUT = "task.output"
     FINAL_ANSWER_RECEIVED = "final_answer.received"
+    USER_RESPONSE_RECEIVED = "user_response.received"
     FAILURE_RECORDED = "failure.recorded"
     RETRY_SCHEDULED = "retry.scheduled"
     BREAKER_STATE_CHANGED = "breaker.state_changed"

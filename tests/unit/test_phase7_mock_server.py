@@ -20,10 +20,13 @@ from agentic_local_app.config import TransportSection
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.errors import ErrorType, TransportError
 from agentic_local_app.testing.mock_model_server import (
+    BUILTIN_SCENARIOS,
+    DEFAULT_SCENARIO_NAME,
     Fault,
     Scenario,
     Step,
     create_mock_app,
+    default_analysis_scenario,
     default_java_debug_scenario,
     load_scenario,
     run_mock_server,
@@ -230,6 +233,96 @@ def given_run_mock_server_without_scenario_path_when_called_then_default_scenari
 
     run_mock_server("127.0.0.1", 9000, None, runner=runner)
     assert captured["app"].state.engine.scenario == default_java_debug_scenario()
+    assert DEFAULT_SCENARIO_NAME == "java"
+    assert BUILTIN_SCENARIOS[DEFAULT_SCENARIO_NAME]() == default_java_debug_scenario()
+
+
+# ---- ADR-022: the analysis scenario (a user_response, no command) ------------------------------
+def given_analysis_scenario_when_inspected_then_single_user_response_to_the_user_request() -> None:
+    scenario = default_analysis_scenario()
+    assert [s.on for s in scenario.steps] == ["user_request"]
+    (reply,) = scenario.steps[0].respond
+    assert reply["type"] == "user_response"
+    assert reply["conversation_id"] == "{conversation_id}" and reply["message_id"] == "auto"
+    content = reply["content"]
+    assert content["format"] == "markdown" and content["status"] == "completed"
+    assert content["expects_reply"] is False
+    assert "invalid target release" in content["body"]
+    assert scenario.token is None and scenario.steps[0].fault is None
+    assert set(BUILTIN_SCENARIOS) == {"java", "analysis"}
+    assert BUILTIN_SCENARIOS["analysis"]() == scenario
+
+
+def given_run_mock_server_with_scenario_name_when_called_then_named_scenario_used() -> None:
+    captured: dict[str, Any] = {}
+
+    def runner(app: Any, *, host: str, port: int, **kwargs: Any) -> None:
+        captured["app"] = app
+
+    run_mock_server("127.0.0.1", 9000, None, scenario_name="analysis", runner=runner)
+    assert captured["app"].state.engine.scenario == default_analysis_scenario()
+    with pytest.raises(ValueError, match="unknown built-in scenario 'nope'"):
+        run_mock_server("127.0.0.1", 9000, None, scenario_name="nope", runner=runner)
+
+
+async def given_analysis_scenario_when_user_request_posted_then_user_response_served_by_get() -> (
+    None
+):
+    app = create_mock_app(default_analysis_scenario())
+    async with _client(app) as client:
+        cid = await _init(client)
+        posted = await client.post(
+            f"/v1/conversations/{cid}/messages",
+            json={
+                "type": "user_request",
+                "conversation_id": cid,
+                "message_id": "msg-0001",
+                "content": {
+                    "goal": "Explain a Java build error",
+                    "user_message": "What does invalid target release mean?",
+                    "session_budget": {
+                        "max_cycles": 20,
+                        "max_plans": 10,
+                        "max_total_duration_ms": 300000,
+                    },
+                },
+            },
+        )
+        assert posted.status_code == 202
+        got = await client.get(f"/v1/conversations/{cid}/messages")
+    assert got.status_code == 200
+    messages = got.json()["messages"]
+    assert len(messages) == 1
+    assert messages[0]["type"] == "user_response"
+    assert messages[0]["conversation_id"] == cid
+    assert messages[0]["message_id"] == "mock-msg-0001"
+    assert messages[0]["content"]["format"] == "markdown"
+    assert got.json()["cursor"] == "mock-msg-0001"
+
+
+async def given_scenario_with_user_response_step_when_json_loaded_then_reply_kept_verbatim(
+    tmp_path: Path,
+) -> None:
+    reply = {
+        "type": "user_response",
+        "conversation_id": "{conversation_id}",
+        "message_id": "auto",
+        "content": {"body": "Which module?", "expects_reply": True},
+    }
+    path = tmp_path / "question.json"
+    path.write_text(
+        json.dumps({"steps": [{"on": "user_request", "respond": [reply]}]}), encoding="utf-8"
+    )
+    scenario = load_scenario(path)
+    assert scenario.steps[0].respond == [reply]
+    app = create_mock_app(scenario)
+    async with _client(app) as client:
+        cid = await _init(client)
+        await client.post(
+            f"/v1/conversations/{cid}/messages", json=_app_message("user_request", "m1", cid)
+        )
+        got = await client.get(f"/v1/conversations/{cid}/messages")
+    assert got.json()["messages"][0]["content"] == {"body": "Which module?", "expects_reply": True}
 
 
 # ------------------------------------------------------------------------------------------------

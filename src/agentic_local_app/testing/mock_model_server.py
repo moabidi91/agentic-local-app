@@ -50,11 +50,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from agentic_local_app.domain.clock import SystemClock
 
 __all__ = [
+    "BUILTIN_SCENARIOS",
+    "DEFAULT_SCENARIO_NAME",
     "Fault",
     "MockEngine",
     "Scenario",
     "Step",
     "create_mock_app",
+    "default_analysis_scenario",
     "default_java_debug_scenario",
     "load_scenario",
     "run_mock_server",
@@ -360,12 +363,22 @@ def run_mock_server(
     port: int,
     scenario_path: str | Path | None,
     *,
+    scenario_name: str | None = None,
     runner: Callable[..., Any] | None = None,
 ) -> None:
-    """Serve a scenario with uvicorn (``agentic-app mock-server``). ``runner`` is injectable for tests."""
-    scenario = (
-        load_scenario(scenario_path) if scenario_path is not None else default_java_debug_scenario()
-    )
+    """Serve a scenario with uvicorn (``agentic-app mock-server``): a JSON file, else a built-in
+    scenario by name (:data:`BUILTIN_SCENARIOS`, default :data:`DEFAULT_SCENARIO_NAME`).
+    ``runner`` is injectable for tests; an unknown name is a ``ValueError``."""
+    if scenario_path is not None:
+        scenario = load_scenario(scenario_path)
+    else:
+        name = scenario_name if scenario_name is not None else DEFAULT_SCENARIO_NAME
+        try:
+            scenario = BUILTIN_SCENARIOS[name]()
+        except KeyError:
+            raise ValueError(
+                f"unknown built-in scenario {name!r}; known: {', '.join(sorted(BUILTIN_SCENARIOS))}"
+            ) from None
     app = create_mock_app(scenario)
     if runner is None:
         import uvicorn
@@ -493,3 +506,45 @@ def default_java_debug_scenario() -> Scenario:
             Step(on="execution_result", respond=[final_answer]),
         ]
     )
+
+
+# ------------------------------------------------------------------------------------------------
+# analysis scenario: the model answers the user directly, without any command (ADR-022)
+# ------------------------------------------------------------------------------------------------
+ANALYSIS_BODY = (
+    "## What the error means\n\n"
+    "`invalid target release: 21` is raised by the Java compiler plugin when the project asks "
+    "for a **language level** (`maven.compiler.release` / `target` = 21) that the JDK running "
+    "Maven cannot produce: the JDK is older than 21.\n\n"
+    "## What to do\n\n"
+    "1. Check the JDK Maven uses: `mvn -version` (look at the `Java version` line).\n"
+    "2. Either install a JDK 21 and point `JAVA_HOME` to it, or lower "
+    "`maven.compiler.release` in `pom.xml` to the installed version.\n\n"
+    "Ask me to run the checks on this machine if you want the diagnosis confirmed."
+)
+
+
+def default_analysis_scenario() -> Scenario:
+    """``user_request -> user_response`` (markdown, ``expects_reply`` false): the model answers a
+    pure analysis question without planning a single command (ADR-022, requires
+    ``protocol.allow_direct_response``, the default)."""
+    user_response = {
+        "type": "user_response",
+        "conversation_id": CONVERSATION_ID_PLACEHOLDER,
+        "message_id": AUTO_MESSAGE_ID,
+        "content": {
+            "format": "markdown",
+            "body": ANALYSIS_BODY,
+            "status": "completed",
+            "expects_reply": False,
+        },
+    }
+    return Scenario(steps=[Step(on="user_request", respond=[user_response])])
+
+
+#: The scenarios selectable by name (``agentic-app mock-server --scenario-name``).
+BUILTIN_SCENARIOS: Mapping[str, Callable[[], Scenario]] = {
+    "java": default_java_debug_scenario,
+    "analysis": default_analysis_scenario,
+}
+DEFAULT_SCENARIO_NAME = "java"

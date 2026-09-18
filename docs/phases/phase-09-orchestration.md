@@ -39,6 +39,8 @@ classDiagram
         +list_sessions(statuses, limit, offset) list
         +snapshot(session_id) RuntimeSnapshot
         +final_answer(session_id) dict
+        +user_responses(session_id) list
+        +last_reply(session_id) dict
         +running_task_ids(session_id) list
         +loop_task(session_id) Task
         +shutdown()
@@ -160,7 +162,11 @@ flowchart TD
     P1 -- oui --> P4["MessageRecord valid, get_cursor, context_bytes ; message.inbound ; evaluate"]
     P4 --> T{"Type ?"}
     T -- final_answer --> FA["session.final_answer ; conversation COMPLETED ; final_answer.received ; cycle COMPLETED"]
+    T -- "user_response (ADR-022)" --> UA["conversation COMPLETED (final_answer_received) ; user_response.received ; cycle COMPLETED — session.final_answer intact"]
     FA --> FB{"auto_close_on_final_answer ?"}
+    UA --> UB{"auto_close_on_final_answer et expects_reply = false ?"}
+    UB -- oui --> FC
+    UB -- "non (réutilisable, ou question posée : auto_close_skipped)" --> FD
     FB -- oui --> FC["Conversation CLOSED (auto_close), close distant best effort"]
     FB -- non --> FD["Conversation WAITING_USER (réutilisable)"]
     FC --> FE["Session COMPLETED"]
@@ -261,11 +267,11 @@ Un message de suivi (§11) reprend la même séquence à partir de `continue_ses
 | Membre | Contrat | États acceptés |
 |---|---|---|
 | `start_session(*, goal, user_message, budget=None, auto_close=None) -> SessionRecord` | session `READY → RUNNING`, conversation `NEW → ACTIVE`, boucle en tâche de fond, retour immédiat ; `budget` `None` ⇒ défauts `[budget]`, `auto_close` `None` ⇒ `budget.auto_close_on_final_answer` | — |
-| `continue_session(session_id, user_message) -> SessionRecord` | `COMPLETED` réutilisable ⇒ `RUNNING`, suivi dans la même conversation ; `READY` (après interruption ou redémarrage) ⇒ `RUNNING`, **nouvelle** conversation fille de la précédente (ADR-006 §3), `discovery_plan` à nouveau obligatoire ; `ValueError` sinon (auto_close, `FAILED`, `RUNNING`…), `KeyError` si inconnue | `COMPLETED`, `READY` |
+| `continue_session(session_id, user_message) -> SessionRecord` | `COMPLETED` réutilisable ⇒ `RUNNING`, suivi dans la même conversation — y compris la réponse à une question du modèle (`user_response` avec `expects_reply`, ADR-022), même sous auto-close tant que la conversation est `WAITING_USER` ; `READY` (après interruption ou redémarrage) ⇒ `RUNNING`, **nouvelle** conversation fille de la précédente (ADR-006 §3), la règle du premier message s'applique à nouveau ; `ValueError` sinon (auto_close après un `final_answer`, `FAILED`, `RUNNING`…), `KeyError` si inconnue | `COMPLETED`, `READY` |
 | `resume_session(session_id) -> SessionRecord` | session `RUNNING` laissée reprenable par la reprise : POST rejoué si non confirmé puis GET d'abord ; `ValueError` sinon | `RUNNING` reprenable |
 | `interrupt(session_id) -> InterruptionReport` | délégué à `InterruptionHandler.interrupt` ; répond quand la session est `READY` | tous |
 | `wait(session_id, *, timeout_ms=None) -> SessionRecord` | attend la fin de la boucle (`COMPLETED` / `FAILED` / `READY`) ; `TimeoutError` au-delà ; une exception inattendue de la boucle (déjà reflétée `FAILED`) est relevée | tous |
-| `get_session`, `list_sessions(statuses, limit, offset)`, `snapshot` (`ExecutionTracker`), `final_answer`, `running_task_ids`, `loop_task` | lectures pures du store et du tracker | — |
+| `get_session`, `list_sessions(statuses, limit, offset)`, `snapshot` (`ExecutionTracker`), `final_answer`, `user_responses`, `last_reply` (ADR-022 : depuis la table des messages), `running_task_ids`, `loop_task` | lectures pures du store et du tracker | — |
 | `recovery_report`, `config`, `store`, `bus`, `clock`, `tracker`, `audit`, `telemetry` | accès pour l'API | — |
 | `shutdown()` | interrompt proprement (raison `shutdown`) chaque session `RUNNING` et attend sa boucle (borné par le drain + 1 s, puis annulation) | — |
 
@@ -385,10 +391,11 @@ Une seconde exécution est un no-op (les entités terminales ne sont jamais touc
 | `audit.warning` | orchestrateur (avertissements de `parse_inbound`) | `cycle_id`, `plan_id` | `{code, entity: "plan", id, details}` |
 | `plan.state_changed`, `task.state_changed` | orchestrateur (plan refusé pour budget : `PENDING → FAILED`, tâches `PENDING → SKIPPED`), reprise (`→ INTERRUPTED`, `reason = restart`) | `cycle_id`, `plan_id`, `task_id?` | `{from, to, reason, stop_reason?}` (+ `exit_code`, `duration_ms`, `timed_out`, `truncated` depuis `RUNNING`) |
 | `final_answer.received` | orchestrateur | `cycle_id` | `{message_id, status, auto_close_on_final_answer, consumed_cycles, consumed_plans, session_duration_ms}` |
+| `user_response.received` | orchestrateur (ADR-022) | `cycle_id` | `{message_id, format, status, expects_reply, body_bytes, auto_close_on_final_answer, auto_close_skipped, consumed_cycles, consumed_plans, session_duration_ms}` — jamais le corps |
 | `budget.updated` | orchestrateur | — | `{consumed_cycles, consumed_plans, consumed_duration_ms, max_cycles, max_plans, max_total_duration_ms}` |
 | `budget.exceeded` | orchestrateur | `plan_id?` | `{limit, limit_value, consumed, stage}` avec `stage ∈ {before_cycle, before_plan, between_tasks}` |
 | `context.window_state_changed` | via `LifecycleManager` | `conversation_id` | raisons : `threshold`, `projection`, `saturation_ratio`, `context_window_error`, `unusable_reply` (et `resume_acknowledged`, `rotation_requested` du coordinateur) |
-| `session.state_changed`, `conversation.state_changed` | via `LifecycleManager` | — | raisons : `user_request`, `plan_received`, `execution_result`, `final_answer`, `reusable`, `auto_close`, `failure`, `budget_exceeded`, `rotation_failed`, `restart`, `shutdown` |
+| `session.state_changed`, `conversation.state_changed` | via `LifecycleManager` | — | raisons : `user_request`, `plan_received`, `execution_result`, `final_answer`, `user_response` (ADR-022), `reusable`, `auto_close`, `failure`, `budget_exceeded`, `rotation_failed`, `restart`, `shutdown` |
 | `recovery.started` | reprise | par session touchée (ou `*`) | `{findings: {running_tasks, open_plans, running_cycles, active_conversations, open_sessions}, sessions_found}` |
 | `recovery.action` | reprise | ceux de l'entité | `{entity, entity_id, id, from, to, reason, details?}` avec `reason ∈ {restart, resumable, orphan_terminated}` |
 | `recovery.completed` | reprise | par session touchée (ou `*`) | `RecoveryReport.summary()` : `{actions, orphans_terminated, sessions_ready, sessions_resumable, sessions_failed, sessions_completed, elapsed_ms}` |

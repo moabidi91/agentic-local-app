@@ -53,7 +53,7 @@ Détail des horodatages posés par le manager (phase 1) : `started_at` au premie
 
 ## 3. Session (ADR-006, ADR-007, ADR-012)
 
-La session est l'unité utilisateur : une demande, un budget, une chaîne de conversations. C'est elle qui porte `READY`. Une session `COMPLETED` dont `auto_close_on_final_answer` est vrai est terminale de fait : la seule règle hors table du manager refuse alors `COMPLETED → RUNNING` (annoncé dans le commentaire de `SESSION_TRANSITIONS`).
+La session est l'unité utilisateur : une demande, un budget, une chaîne de conversations. C'est elle qui porte `READY`. Une session `COMPLETED` dont `auto_close_on_final_answer` est vrai est terminale de fait : la seule règle hors table du manager refuse alors `COMPLETED → RUNNING` (annoncé dans le commentaire de `SESSION_TRANSITIONS`) — sauf si sa conversation courante est restée `WAITING_USER` parce que le modèle a posé une question (`user_response` avec `expects_reply`, ADR-022) : l'utilisateur doit pouvoir y répondre.
 
 ```mermaid
 stateDiagram-v2
@@ -77,7 +77,7 @@ stateDiagram-v2
 | RUNNING → FAILED | `BUDGET_EXCEEDED` (ADR-012), `ROTATION_FAILED` (§2.6), échec non rejouable ou retries épuisés (§7) ; `ended_at` posé, `last_failure_id` renseigné | ConversationLifecycleManager | `session.state_changed` | §7, ADR-012, ADR-014 |
 | INTERRUPTING → READY | toutes les entités affectées persistées `INTERRUPTED` et auditées ; `interrupted_at` conservé | ConversationLifecycleManager (InterruptionHandler) | `session.state_changed` | §9, ADR-006 §2 |
 | INTERRUPTING → FAILED | échec de persistance ou d'audit pendant le nettoyage (voir *Points ouverts* n°1) | ConversationLifecycleManager | `session.state_changed` | code du socle |
-| COMPLETED → RUNNING | message de suivi de l'utilisateur sur une conversation réutilisable ; **refusé** (`InvalidTransitionError`) si `auto_close_on_final_answer` | ConversationLifecycleManager | `session.state_changed` | §11, ADR-007 |
+| COMPLETED → RUNNING | message de suivi de l'utilisateur sur une conversation réutilisable ; **refusé** (`InvalidTransitionError`) si `auto_close_on_final_answer`, sauf conversation courante `WAITING_USER` (question du modèle, ADR-022) | ConversationLifecycleManager | `session.state_changed` | §11, ADR-007, ADR-022 |
 
 Terminaux : `FAILED` ; `COMPLETED` lorsque `auto_close_on_final_answer = true`. La création d'une session (état initial `READY`) publie `session.created` avec `{goal, budget}`.
 
@@ -133,15 +133,15 @@ stateDiagram-v2
 | ROTATING → FAILED | `ROTATION_FAILED` (résumé hors budget après tous les paliers, `max_rotations_per_session` atteint, ack absent après politique §7) | ConversationLifecycleManager | `conversation.state_changed`, `rotation.failed` | §2.6, ADR-005, ADR-013 §5 |
 | WAITING_USER → WAITING_MODEL_RESPONSE | message de suivi de l'utilisateur persisté et POSTé dans la même conversation | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §5.1, §11 |
 | WAITING_USER → FAILED | échec non rejouable | ConversationLifecycleManager | `conversation.state_changed` | ADR-007 |
-| COMPLETED → WAITING_USER | `auto_close_on_final_answer = false` : conversation réutilisable | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §2.7, §11 |
-| COMPLETED → CLOSED | `auto_close_on_final_answer = true` ; `closure_reason = auto_close` ; fermeture distante (`close_url`) en *best effort* | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §2.7, §11, ADR-004 |
+| COMPLETED → WAITING_USER | `auto_close_on_final_answer = false` : conversation réutilisable ; ou question du modèle (`user_response` avec `expects_reply`, ADR-022), même sous auto-close | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §2.7, §11, ADR-022 |
+| COMPLETED → CLOSED | `auto_close_on_final_answer = true` (et pas une question) ; `closure_reason = auto_close` ; fermeture distante (`close_url`) en *best effort* | ConversationLifecycleManager (ProtocolOrchestrator) | `conversation.state_changed` | §2.7, §11, ADR-004 |
 | COMPLETED → FAILED | échec non rejouable | ConversationLifecycleManager | `conversation.state_changed` | ADR-007 |
 
 Ce qui a été **retiré** de la table de la spec : `INTERRUPTED → READY` et `READY → ACTIVE` (déplacées vers la session, ADR-006) ; `ROTATING → WAITING_MODEL_RESPONSE` (c'est la conversation **enfant** qui suit `NEW → ACTIVE → WAITING_MODEL_RESPONSE`, ADR-007). La création d'une conversation publie `conversation.created` avec `{parent_conversation_id, context_window_state}` ; l'enfant d'une rotation naît avec `context_window_state = SATURATED` hérité (ADR-007, ADR-014).
 
 ## 5. Cycle (ADR-007)
 
-Un cycle est un tour de protocole. Il naît `RUNNING` quand le message sortant est persisté (avant le POST) et se termine quand l'`execution_result` du plan reçu est persisté, ou quand un `final_answer` / `context_resume_ack` est traité. `retry_count` compte les retries de transport du cycle ; `consumed_cycles` de la session s'incrémente à son ouverture (ADR-012), y compris pour un cycle `resume`.
+Un cycle est un tour de protocole. Il naît `RUNNING` quand le message sortant est persisté (avant le POST) et se termine quand l'`execution_result` du plan reçu est persisté, ou quand un `final_answer` / `user_response` (ADR-022) / `context_resume_ack` est traité. `retry_count` compte les retries de transport du cycle ; `consumed_cycles` de la session s'incrémente à son ouverture (ADR-012), y compris pour un cycle `resume`.
 
 ```mermaid
 stateDiagram-v2
@@ -158,7 +158,7 @@ stateDiagram-v2
 | De → vers | Déclencheur | Propriétaire | Événement publié | Réf. |
 |---|---|---|---|---|
 | (création) RUNNING | `MessageRecord` sortant persisté ; `cycle_type` ∈ {discovery, execution, clarification, resume} déduit du plan reçu ou du type de message (`resume` pour un `context_resume_request`) | ProtocolOrchestrator | `cycle.started` | ADR-007, ADR-012 |
-| RUNNING → COMPLETED | `execution_result` du plan de ce cycle persisté ; ou `final_answer` traité ; ou `context_resume_ack` traité | ProtocolOrchestrator | `cycle.ended` (`status = COMPLETED`) | ADR-007 |
+| RUNNING → COMPLETED | `execution_result` du plan de ce cycle persisté ; ou `final_answer` / `user_response` traité ; ou `context_resume_ack` traité | ProtocolOrchestrator | `cycle.ended` (`status = COMPLETED`) | ADR-007, ADR-022 |
 | RUNNING → FAILED | décision `fail` du FailureManager, `rotate` (le cycle du message en attente est clos `FAILED`, `reason = rotation`), `BUDGET_EXCEEDED` | ProtocolOrchestrator | `cycle.ended` (`status = FAILED`, `reason`) | §7, ADR-012, ADR-014 |
 | RUNNING → INTERRUPTED | interruption pendant le cycle (attente de réponse ou exécution du plan) ; redémarrage | InterruptionHandler · RecoveryCoordinator | `cycle.ended` (`status = INTERRUPTED`, `reason`) | §2.9, ADR-016 |
 
@@ -291,7 +291,7 @@ Le « marquage de la conversation comme dégradée » de §7.4 n'est pas un éta
 |---|---|---|
 | Plan reçu | cycle `RUNNING` (déjà ouvert au POST) · plan `PENDING` (`plan.received`) · conversation `WAITING_MODEL_RESPONSE → RUNNING_PLAN` · plan `PENDING → RUNNING` · tâches | §14, ADR-012 |
 | Plan terminé | tâches terminales · plan `RUNNING → COMPLETED / STOPPED_ON_FAILURE / SHORT_CIRCUITED_ON_SUCCESS` · `execution_result` persisté · cycle `RUNNING → COMPLETED` · nouveau cycle `RUNNING` · conversation `RUNNING_PLAN → WAITING_MODEL_RESPONSE` | ADR-007 |
-| `final_answer` | conversation `WAITING_MODEL_RESPONSE → COMPLETED` · cycle `COMPLETED` · session `RUNNING → COMPLETED` · conversation `COMPLETED → CLOSED` (auto_close) ou `COMPLETED → WAITING_USER` | §11 |
+| `final_answer` ou `user_response` | conversation `WAITING_MODEL_RESPONSE → COMPLETED` · cycle `COMPLETED` · session `RUNNING → COMPLETED` · conversation `COMPLETED → CLOSED` (auto_close, sauf question posée) ou `COMPLETED → WAITING_USER` | §11, ADR-022 |
 | Interruption | session `RUNNING → INTERRUPTING` · tâches `→ INTERRUPTED` · plan `→ INTERRUPTED` · cycle `→ INTERRUPTED` · conversation `ANY_ACTIVE_STATE → INTERRUPTED` · session `INTERRUPTING → READY` | §9, ADR-006, [07](07-interruption-and-recovery.md) |
 | Rotation | parent `→ ROTATING` · enfant `NEW` (`SATURATED`) · enfant `NEW → ACTIVE → WAITING_MODEL_RESPONSE` · ack : enfant fenêtre `SATURATED → HEALTHY` · parent `ROTATING → CLOSED` · retransmission de M dans l'enfant | §10, ADR-014, [06](06-context-rotation.md) |
 | Budget dépassé | plan `PENDING → FAILED` ou `RUNNING → FAILED` · cycle `FAILED` · conversation `→ FAILED` · session `RUNNING → FAILED` | ADR-012 |

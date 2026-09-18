@@ -130,6 +130,10 @@ class ConversationManagerLike(Protocol):
 
     def final_answer(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def user_responses(self, session_id: str) -> list[dict[str, Any]]: ...
+
+    def last_reply(self, session_id: str) -> dict[str, Any] | None: ...
+
     def running_task_ids(self, session_id: str) -> list[str]: ...
 
     async def shutdown(self) -> None: ...
@@ -403,6 +407,22 @@ def create_app(
         return JSONResponse(
             content={"session_id": sid, "final_answer": _jsonable(manager.final_answer(sid))}
         )
+
+    @router.get("/sessions/{sid}/responses")
+    async def user_responses(sid: str) -> JSONResponse:
+        """ADR-022: every ``user_response`` of the session, oldest first (empty list if none)."""
+        require_session(sid)
+        return JSONResponse(content=_jsonable(manager.user_responses(sid)))
+
+    @router.get("/sessions/{sid}/reply")
+    async def last_reply(sid: str) -> JSONResponse:
+        """ADR-022: the newest concluding reply (``final_answer`` or ``user_response``); 404
+        (``REPLY_NOT_FOUND``) while the model has not concluded a turn."""
+        require_session(sid)
+        reply = manager.last_reply(sid)
+        if reply is None:
+            raise _NotFoundError("REPLY_NOT_FOUND", f"session {sid} has no reply yet")
+        return JSONResponse(content=_jsonable(reply))
 
     # ---- conversations, plans, tasks -------------------------------------------------------
     @router.get("/sessions/{sid}/conversations")

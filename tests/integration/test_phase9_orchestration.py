@@ -1294,7 +1294,8 @@ async def given_unexpected_message_type_in_healthy_window_when_received_then_ses
         (ErrorType.MODEL_PROTOCOL_ERROR, "UNEXPECTED_MESSAGE_TYPE")
     ]
     assert failures[0].details["received"] == "final_answer"
-    assert failures[0].details["expected"] == ["discovery_plan"]
+    # the initial row of ADR-007 amended by ADR-022 (protocol.allow_direct_response defaults on)
+    assert failures[0].details["expected"] == ["discovery_plan", "user_response"]
     assert failures[0].conversation_id == "conv-0001"
     assert [(d.operation, d.decision) for d in rig.store.list_retry_decisions(sid)] == [
         ("GET", "fail")

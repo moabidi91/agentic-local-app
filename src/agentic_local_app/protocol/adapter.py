@@ -4,11 +4,14 @@ The adapter is **pure**: no I/O, no clock of its own (``plan_to_records`` receiv
 no identifier generation (``message_id`` is passed in by the caller, ADR-017). It owns:
 
 - the construction of the three outbound types (§12.1, §12.5, §12.8 + ADR-014) as canonical JSON;
-- the **table of expected inbound messages** of ADR-007 (:data:`EXPECTED_INBOUND`);
+- the **table of expected inbound messages** of ADR-007 (:data:`EXPECTED_INBOUND`), amended by
+  ADR-022: ``user_response`` after an ``execution_result`` or a follow-up ``user_request``, and
+  after the initial ``user_request`` only when ``protocol.allow_direct_response`` is set
+  (:func:`expected_inbound_for`);
 - the structural validation of every inbound message: envelope, direction, expectation, content
   schema, then the semantic rules of ADR-007 (uniqueness, dependencies, chunk references,
-  ``state_summary`` bound of ADR-005), each failure being a :class:`ProtocolError` with an
-  explicit code and JSON-serialisable ``details``;
+  ``state_summary`` bound of ADR-005) and ADR-022 (``user_response`` body bound), each failure
+  being a :class:`ProtocolError` with an explicit code and JSON-serialisable ``details``;
 - the projection of an accepted plan onto ``PlanRecord`` / ``TaskRecord`` with the effective
   values of ADR-008 (timeouts), ADR-009 (flags), ADR-010 (output budgets) and ADR-011 (chunks);
 - the rendering of ``PROTOCOL_INSTRUCTIONS.md`` sent to the model at init (ADR-004).
@@ -67,6 +70,7 @@ from agentic_local_app.protocol.messages import (
     SessionBudgetContent,
     TaskMessage,
     UserRequestContent,
+    UserResponseContent,
 )
 
 __all__ = [
@@ -77,6 +81,7 @@ __all__ = [
     "OutboundMessage",
     "OutboundSituation",
     "ProtocolAdapter",
+    "expected_inbound_for",
     "render_instructions",
     "situation_for",
 ]
@@ -101,7 +106,7 @@ class OutboundMessage:
     message_type: MessageType
 
 
-InboundContent = PlanContent | FinalAnswerContent | ContextResumeAckContent
+InboundContent = PlanContent | FinalAnswerContent | UserResponseContent | ContextResumeAckContent
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,8 @@ class OutboundSituation(StrEnum):
     CONTEXT_RESUME_REQUEST = "context_resume_request"
 
 
+#: The base table (ADR-007 amended by ADR-022). The initial row is the strict one of spec §14;
+#: :func:`expected_inbound_for` adds ``user_response`` to it under ``protocol.allow_direct_response``.
 EXPECTED_INBOUND: Mapping[OutboundSituation, frozenset[MessageType]] = MappingProxyType(
     {
         OutboundSituation.INITIAL_USER_REQUEST: frozenset({MessageType.DISCOVERY_PLAN}),
@@ -145,6 +152,7 @@ EXPECTED_INBOUND: Mapping[OutboundSituation, frozenset[MessageType]] = MappingPr
                 MessageType.EXECUTION_PLAN,
                 MessageType.PRIORITY_CLARIFICATION,
                 MessageType.FINAL_ANSWER,
+                MessageType.USER_RESPONSE,
             }
         ),
         OutboundSituation.EXECUTION_RESULT: frozenset(
@@ -152,6 +160,7 @@ EXPECTED_INBOUND: Mapping[OutboundSituation, frozenset[MessageType]] = MappingPr
                 MessageType.EXECUTION_PLAN,
                 MessageType.PRIORITY_CLARIFICATION,
                 MessageType.FINAL_ANSWER,
+                MessageType.USER_RESPONSE,
             }
         ),
         OutboundSituation.CONTEXT_RESUME_REQUEST: frozenset({MessageType.CONTEXT_RESUME_ACK}),
@@ -159,10 +168,27 @@ EXPECTED_INBOUND: Mapping[OutboundSituation, frozenset[MessageType]] = MappingPr
 )
 
 
+def expected_inbound_for(
+    situation: OutboundSituation, *, allow_direct_response: bool = True
+) -> frozenset[MessageType]:
+    """The row of :data:`EXPECTED_INBOUND` for ``situation``, with the ADR-022 flag applied: the
+    initial ``user_request`` also accepts a ``user_response`` when ``allow_direct_response`` is
+    set (the default); the other rows never depend on it."""
+    expected = EXPECTED_INBOUND[situation]
+    if situation is OutboundSituation.INITIAL_USER_REQUEST and allow_direct_response:
+        return expected | {MessageType.USER_RESPONSE}
+    return expected
+
+
 def situation_for(
     last_outbound: MessageRecord, conversation: ConversationRecord
 ) -> OutboundSituation:
-    """Classify the last outbound message into a row of :data:`EXPECTED_INBOUND`."""
+    """Classify the last outbound message into a row of :data:`EXPECTED_INBOUND`.
+
+    ``conversation.final_answer_received`` means "the model concluded a turn in this conversation
+    with a ``final_answer`` or a ``user_response``" (ADR-022): the next ``user_request`` is then a
+    follow-up, whatever the type of that concluding message.
+    """
     if last_outbound.direction is not MessageDirection.OUTBOUND:
         raise ValueError(f"{last_outbound.message_id} is not an outbound message")
     match last_outbound.message_type:
@@ -194,8 +220,27 @@ def _instructions_template() -> str:
     )
 
 
+#: Text of the first-message rule rendered into the instructions (ADR-022), by flag value.
+_INITIAL_REPLY_RULE_DIRECT = (
+    "Your first response to a `user_request` in a new conversation is a `discovery_plan` "
+    "(that is how you learn the operating system, the shell, the working directory, the installed "
+    "tools and their versions), unless the request needs no command at all — an explanation, an "
+    "analysis of the text you were given, or a question back to the user: then it is a "
+    "`user_response` (section 9). A request about the machine always starts with a "
+    "`discovery_plan`."
+)
+_INITIAL_REPLY_RULE_STRICT = (
+    "Your first response to a `user_request` in a new conversation is **always** a "
+    "`discovery_plan`: that is how you learn the operating system, the shell, the working "
+    "directory, the installed tools and their versions. A `user_response` (section 9) is only "
+    "accepted after an `execution_result` or a follow-up `user_request`."
+)
+
+
 def render_instructions(config: AppConfig) -> str:
-    """The protocol text sent to the model at init, with the configured limits injected."""
+    """The protocol text sent to the model at init, with the configured limits injected and the
+    first-message rule of ADR-022 rendered from ``protocol.allow_direct_response``."""
+    direct = config.protocol.allow_direct_response
     values = {
         "default_max_output_bytes": config.payload.default_max_output_bytes,
         "hard_max_output_bytes": config.payload.hard_max_output_bytes,
@@ -203,6 +248,11 @@ def render_instructions(config: AppConfig) -> str:
         "max_state_summary_bytes": config.payload.max_state_summary_bytes,
         "default_task_timeout_ms": config.execution.default_task_timeout_ms,
         "max_task_timeout_ms": config.execution.max_task_timeout_ms,
+        "initial_reply_types": (
+            "`discovery_plan`, `user_response`" if direct else "`discovery_plan`"
+        ),
+        "initial_reply_grammar": "discovery_plan | user_response" if direct else "discovery_plan",
+        "initial_reply_rule": _INITIAL_REPLY_RULE_DIRECT if direct else _INITIAL_REPLY_RULE_STRICT,
     }
 
     def substitute(match: re.Match[str]) -> str:
@@ -349,10 +399,14 @@ class ProtocolAdapter:
     def expected_inbound(
         self, last_outbound: MessageRecord | None, conversation: ConversationRecord
     ) -> frozenset[MessageType]:
-        """ADR-007 table. Nothing outstanding (``None``) means nothing is expected."""
+        """ADR-007 table with the ADR-022 flag applied (``protocol.allow_direct_response``).
+        Nothing outstanding (``None``) means nothing is expected."""
         if last_outbound is None:
             return frozenset()
-        return EXPECTED_INBOUND[situation_for(last_outbound, conversation)]
+        return expected_inbound_for(
+            situation_for(last_outbound, conversation),
+            allow_direct_response=self.config.protocol.allow_direct_response,
+        )
 
     # -------------------------------------------------------------------------- inbound -----
     def parse_inbound(
@@ -372,7 +426,7 @@ class ProtocolAdapter:
         Raises ``ValueError`` on an empty list (the caller must not call), :class:`ProtocolError`
         for every protocol violation. Checks run in a fixed order: count, envelope schema,
         conversation, message id, direction, expectation, content schema, then the semantic rules
-        of the message type.
+        of the message type (plan rules of ADR-007, ack rules of ADR-014, body bound of ADR-022).
         """
         if not raw_messages:
             raise ValueError("parse_inbound requires at least one message")
@@ -442,6 +496,10 @@ class ProtocolAdapter:
             plan_type = plan_type_for_message(message_type)
         elif message_type is MessageType.FINAL_ANSWER:
             content = self._validate_content(envelope, FinalAnswerContent)
+        elif message_type is MessageType.USER_RESPONSE:
+            response = self._validate_content(envelope, UserResponseContent)
+            self._validate_user_response(response, envelope.message_id)
+            content = response
         else:
             ack = self._validate_content(envelope, ContextResumeAckContent)
             self._validate_ack(ack, expected_original_conversation_id)
@@ -569,6 +627,18 @@ class ProtocolAdapter:
         for task in plan.tasks:
             if task.critical and task.continue_on_error:
                 warnings.append(f"CONTRADICTORY_FLAGS:{task.task_id}")
+
+    def _validate_user_response(self, response: UserResponseContent, message_id: str) -> None:
+        """ADR-022: the opaque body is never parsed; its only semantic rule is the size bound."""
+        body_bytes = len(response.body.encode("utf-8"))
+        limit = self.config.payload.max_message_bytes
+        if body_bytes > limit:
+            raise ProtocolError(
+                "USER_RESPONSE_TOO_LARGE",
+                size_bytes=body_bytes,
+                max_bytes=limit,
+                message_id=message_id,
+            )
 
     @staticmethod
     def _validate_ack(ack: ContextResumeAckContent, expected_original: str | None) -> None:

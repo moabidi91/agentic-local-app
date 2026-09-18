@@ -140,6 +140,19 @@ class PayloadSection(_Section):
     max_state_summary_bytes: int = Field(default=4_096, gt=0)
 
 
+class ProtocolSection(_Section):
+    """ADR-022: the model's direct answers to the user.
+
+    ``allow_direct_response`` lets the model answer the **initial** ``user_request`` of a
+    conversation with a ``user_response`` (an analysis, an explanation or a question that needs no
+    command) instead of the mandatory ``discovery_plan`` of spec §14; after an ``execution_result``
+    or a follow-up ``user_request`` a ``user_response`` is always accepted. ``false`` keeps the
+    strict grammar of the specification. The correction policy of ADR-023 will live here too.
+    """
+
+    allow_direct_response: bool = True
+
+
 class ContextSection(_Section):
     """ADR-013 / ADR-005."""
 
@@ -203,6 +216,7 @@ class AppConfig(BaseModel):
     transport: TransportSection = Field(default_factory=TransportSection)
     execution: ExecutionSection = Field(default_factory=ExecutionSection)
     payload: PayloadSection = Field(default_factory=PayloadSection)
+    protocol: ProtocolSection = Field(default_factory=ProtocolSection)
     context: ContextSection = Field(default_factory=ContextSection)
     budget: BudgetSection = Field(default_factory=BudgetSection)
     retry: RetrySection = Field(default_factory=RetrySection)

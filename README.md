@@ -42,7 +42,7 @@ flowchart LR
 
 ## 2. La boucle protocolaire
 
-Le modèle doit respecter une grammaire fermée. La première réponse est **toujours** un `discovery_plan` (c'est ainsi que le modèle découvre l'OS, le shell, le répertoire courant, les versions installées — l'application n'injecte rien).
+Le modèle doit respecter une grammaire fermée. La première réponse est un `discovery_plan` (c'est ainsi que le modèle découvre l'OS, le shell, le répertoire courant, les versions installées — l'application n'injecte rien) — ou, quand la demande n'appelle aucune commande (une explication, une analyse, une question à poser à l'utilisateur), un `user_response` ([ADR-022](docs/adr/ADR-022-reponse-utilisateur.md) ; `protocol.allow_direct_response = false` rétablit la règle stricte de la spec). Un `user_response` conclut le tour comme un `final_answer` : son corps est opaque, borné, affiché tel quel ; `expects_reply = true` signifie que le modèle attend une réponse de l'utilisateur (`agentic-app reply <sid> "…"`).
 
 ```mermaid
 sequenceDiagram
@@ -54,7 +54,7 @@ sequenceDiagram
 
     U->>A: user_request (goal, message, session_budget)
     A->>M: POST user_request
-    M-->>A: GET → discovery_plan
+    M-->>A: GET → discovery_plan (ou user_response : le tour se termine, ADR-022)
     loop pour chaque tâche du plan
         A->>S: cmd
         S-->>A: stdout / stderr / exit_code
@@ -65,10 +65,10 @@ sequenceDiagram
         A->>S: cmd …
         S-->>A: …
         A->>M: POST execution_result
-        M-->>A: GET → execution_plan | final_answer
+        M-->>A: GET → execution_plan | final_answer | user_response
     end
-    M-->>A: GET → final_answer
-    A-->>U: diagnostic, preuves, prochaine étape
+    M-->>A: GET → final_answer (ou user_response)
+    A-->>U: diagnostic, preuves, prochaine étape (ou la réponse directe du modèle)
     Note over U,A: À tout instant : interruption → SIGTERM + drain → tout marqué INTERRUPTED → READY
 ```
 
@@ -164,10 +164,14 @@ Les tests suivent la convention imposée par la spec (§18.4) : `given_<état>_w
 ```bash
 # 1. lancer un modèle simulé (rejoue le scénario Java de la spec §12, contrat ADR-004)
 uv run agentic-app mock-server --host 127.0.0.1 --port 9000
+#    ou le scénario « analyse » : le modèle répond directement, sans commande (ADR-022)
+uv run agentic-app mock-server --scenario-name analysis
 
 # 2. lancer une session en console (affichage en direct, Ctrl-C = interruption propre)
 uv run agentic-app run "Understand the root cause of a Java build failure" \
     --message "Please debug the Java error in my project."
+#    quand le modèle pose une question (user_response avec expects_reply), lui répondre :
+uv run agentic-app reply <sid> "Only the service-api module fails."
 
 # 3. ou exposer l'API locale (REST + flux SSE) pour un front ou un autre outil
 uv run agentic-app serve --host 127.0.0.1 --port 8765
@@ -176,6 +180,7 @@ curl -X POST http://127.0.0.1:8765/api/v1/sessions \
      -d '{"goal":"…","user_message":"…"}'
 curl -N http://127.0.0.1:8765/api/v1/events            # flux live de tous les événements
 curl http://127.0.0.1:8765/api/v1/sessions/<sid>/snapshot
+curl http://127.0.0.1:8765/api/v1/sessions/<sid>/reply  # la dernière réponse : final_answer ou user_response
 
 # 4. vérifier ou afficher la configuration effective
 uv run agentic-app config validate
@@ -190,7 +195,7 @@ uv run agentic-app codec list
 uv run agentic-app codec show
 ```
 
-Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
+Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, réponse directe du modèle (`[protocol]`), budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
 
 **Choisir un provider de transport.** Le contrat `TransportGateway` est unique, mais son implémentation se choisit **par configuration** avec `transport.provider` ([ADR-020](docs/adr/ADR-020-transport-enfichable.md)) :
 

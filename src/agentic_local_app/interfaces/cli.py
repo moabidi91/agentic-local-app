@@ -1,7 +1,8 @@
 """``agentic-app`` — the console interface (ADR-002, ADR-018).
 
 Commands: ``run`` (a session in-process, live display, **Ctrl-C = interruption**), ``serve`` (the
-HTTP API), ``status`` / ``sessions`` / ``interrupt`` / ``audit verify`` (clients of the API),
+HTTP API), ``status`` / ``sessions`` / ``interrupt`` / ``reply`` / ``audit verify`` (clients of
+the API; ``reply`` answers a question the model asked with a ``user_response``, ADR-022),
 ``config show`` / ``config validate``, ``transport list`` / ``transport show`` (the pluggable
 transport providers of ADR-020; ``show`` also names the effective message codec), ``codec list`` /
 ``codec show`` (the message codecs of ADR-021), ``mock-server`` (the scripted model), ``version``.
@@ -46,7 +47,11 @@ from agentic_local_app.domain.models import SessionBudget, SessionRecord
 from agentic_local_app.domain.states import SessionState
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
-from agentic_local_app.testing.mock_model_server import run_mock_server
+from agentic_local_app.testing.mock_model_server import (
+    BUILTIN_SCENARIOS,
+    DEFAULT_SCENARIO_NAME,
+    run_mock_server,
+)
 from agentic_local_app.transport.codecs import CodecRegistry
 from agentic_local_app.transport.registry import PluginInfo, PluginRegistry, TransportRegistry
 
@@ -504,17 +509,43 @@ def _report_dict(report: InterruptionReport | None) -> dict[str, Any] | None:
     }
 
 
+def _render_user_response(sid: str, status: str, reply: dict[str, Any]) -> list[RenderableType]:
+    """The panel of a ``user_response`` (ADR-022) and, for a question, how to answer it."""
+    content = reply.get("content") or {}
+    body = content.get("body")
+    title = (
+        f"Model response ({_value(content.get('format', 'text'))}, "
+        f"{_value(content.get('status', 'completed'))}) — session {sid} [{status}]"
+    )
+    parts: list[RenderableType] = [
+        Panel(
+            Text(body if isinstance(body, str) else _value(body)), title=title, title_align="left"
+        )
+    ]
+    if content.get("expects_reply"):
+        parts.append(
+            Text(
+                "The model is waiting for your answer. Reply with:\n"
+                f'  agentic-app reply {sid} "..."'
+            )
+        )
+    return parts
+
+
 def _print_outcome(
     console: Console, manager: ConversationManagerLike, outcome: _RunOutcome, json_output: bool
 ) -> None:
     session = outcome.session
-    final_answer = manager.final_answer(session.session_id)
+    sid = session.session_id
+    final_answer = manager.final_answer(sid)
+    last_reply = manager.last_reply(sid)
     if json_output:
         document = {
-            "session_id": session.session_id,
+            "session_id": sid,
             "status": session.status.value,
             "exit_code": outcome.exit_code,
             "final_answer": final_answer,
+            "last_reply": last_reply,
             "interruption": _report_dict(outcome.interruption),
             "error": outcome.error.model_dump(mode="json") if outcome.error else None,
             "snapshot": outcome.snapshot,
@@ -526,16 +557,19 @@ def _print_outcome(
     if outcome.error is not None:
         _print_error(outcome.error)
     status = session.status.value
-    if final_answer is not None:
+    if last_reply is not None and last_reply.get("type") == "user_response":
+        for part in _render_user_response(sid, status, last_reply):
+            console.print(part)
+    elif final_answer is not None:
         console.print(
             Panel(
                 json.dumps(final_answer, indent=2, ensure_ascii=False, default=str),
-                title=f"Final answer — session {session.session_id} [{status}]",
+                title=f"Final answer — session {sid} [{status}]",
                 title_align="left",
             )
         )
     else:
-        console.print(f"Session {session.session_id} ended [{status}] without a final answer.")
+        console.print(f"Session {sid} ended [{status}] without a final answer.")
 
 
 def _budget(
@@ -633,16 +667,34 @@ def mock_server(
     scenario: Annotated[
         Path | None, typer.Option("--scenario", help="Scenario JSON (default: Java debug loop).")
     ] = None,
+    scenario_name: Annotated[
+        str | None,
+        typer.Option(
+            "--scenario-name",
+            help=f"A built-in scenario: {', '.join(sorted(BUILTIN_SCENARIOS))} "
+            f"(default: {DEFAULT_SCENARIO_NAME}).",
+        ),
+    ] = None,
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 9000,
 ) -> None:
     """Serve the mock model (a scripted scenario) for local runs and demos."""
     deps = _deps(ctx)
-    typer.echo(
-        f"Mock model server on http://{host}:{port} "
-        f"(scenario: {scenario if scenario is not None else 'default java debug'})"
+    if scenario is not None and scenario_name is not None:
+        raise _fail("--scenario and --scenario-name are mutually exclusive.")
+    if scenario_name is not None and scenario_name not in BUILTIN_SCENARIOS:
+        raise _fail(
+            f"Unknown scenario {scenario_name!r}; built-in scenarios: "
+            f"{', '.join(sorted(BUILTIN_SCENARIOS))}."
+        )
+    if scenario is not None:
+        label = str(scenario)
+    else:
+        label = f"built-in {scenario_name or DEFAULT_SCENARIO_NAME}"
+    typer.echo(f"Mock model server on http://{host}:{port} (scenario: {label})")
+    run_mock_server(
+        host, port, scenario, scenario_name=scenario_name, runner=deps.mock_server_runner
     )
-    run_mock_server(host, port, scenario, runner=deps.mock_server_runner)
 
 
 # ================================================================================================
@@ -723,6 +775,31 @@ def interrupt(
         typer.echo(json.dumps(report, indent=2, sort_keys=True))
         return
     _console().print(_render_report(report))
+
+
+@app.command()
+def reply(
+    ctx: typer.Context,
+    session_id: Annotated[str, typer.Argument()],
+    message: Annotated[str, typer.Argument(help="Your answer, or a new request.")],
+    api_url: ApiUrlOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Answer the model (after a user_response that expects a reply) or send a follow-up
+    message through the API; the session runs again in the same conversation (§11, ADR-022)."""
+    deps = _deps(ctx)
+    base = _api_base(_load(deps.config_path), api_url)
+    session = _api_call(
+        deps, base, "POST", f"/sessions/{session_id}/messages", json={"user_message": message}
+    )
+    if json_output:
+        typer.echo(json.dumps(session, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"Session {_value(session.get('session_id'))} [{_value(session.get('status'))}]: "
+        f"message accepted in conversation {_value(session.get('current_conversation_id'))}. "
+        f"Follow it with: agentic-app status {session_id}"
+    )
 
 
 @audit_app.command("verify")

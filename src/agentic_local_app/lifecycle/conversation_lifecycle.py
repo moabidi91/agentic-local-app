@@ -140,9 +140,12 @@ class ConversationLifecycleManager:
         """``current.status -> to`` per ``SESSION_TRANSITIONS``, with ``updates`` in the same write.
 
         ``COMPLETED -> RUNNING`` (follow-up message) is refused when the session has
-        ``auto_close_on_final_answer`` set: ``COMPLETED`` is then terminal for it (ADR-007).
-        ``started_at`` is set on the first ``RUNNING``, ``ended_at`` on ``COMPLETED`` / ``FAILED``
-        (and cleared when the session runs again), ``interrupted_at`` on ``INTERRUPTING``.
+        ``auto_close_on_final_answer`` set: ``COMPLETED`` is then terminal for it (ADR-007) —
+        unless its current conversation was deliberately left ``WAITING_USER`` because the model
+        concluded with a question (``user_response`` with ``expects_reply``, ADR-022): the user
+        must be able to answer it. ``started_at`` is set on the first ``RUNNING``, ``ended_at`` on
+        ``COMPLETED`` / ``FAILED`` (and cleared when the session runs again), ``interrupted_at``
+        on ``INTERRUPTING``.
         """
         current = self._require_session(session_id)
         _reject_managed_fields(updates, _SESSION_MANAGED_FIELDS, SESSION_ENTITY)
@@ -151,6 +154,7 @@ class ConversationLifecycleManager:
             current.status is SessionState.COMPLETED
             and to is SessionState.RUNNING
             and current.auto_close_on_final_answer
+            and not self._conversation_waits_for_user(current)
         ):
             raise InvalidTransitionError(
                 entity=SESSION_ENTITY, current=current.status.value, target=to.value
@@ -178,6 +182,14 @@ class ConversationLifecycleManager:
             payload=state_change_payload(current.status.value, to.value, reason),
         )
         return session
+
+    def _conversation_waits_for_user(self, session: SessionRecord) -> bool:
+        """ADR-022: the current conversation of an auto-close session is ``WAITING_USER`` only
+        when the model asked a question, which the user is entitled to answer."""
+        if session.current_conversation_id is None:
+            return False
+        conversation = self._store.get_conversation(session.current_conversation_id)
+        return conversation is not None and conversation.status is ConversationState.WAITING_USER
 
     def update_session(self, session_id: str, **updates: Any) -> SessionRecord:
         """Change plain fields (counters, pointers...) without a state change; no event."""

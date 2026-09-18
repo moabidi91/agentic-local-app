@@ -96,6 +96,24 @@ def given_repo_config_toml_when_loaded_then_valid() -> None:
     assert "{conversation_id}" in cfg.transport.post_url
 
 
+def given_repo_config_toml_when_loaded_then_identical_to_the_code_defaults() -> None:
+    """``config.toml`` is the commented model of the defaults: the two never diverge."""
+    root = Path(__file__).resolve().parents[2]
+    from_file = load_config(root / "config.toml", environ={}, load_env_file=False)
+    assert from_file == AppConfig()
+
+
+def given_protocol_section_when_config_loaded_then_direct_response_allowed_by_default() -> None:
+    """ADR-022: ``[protocol] allow_direct_response`` defaults to true and can be turned off."""
+    assert AppConfig().protocol.allow_direct_response is True
+    cfg = load_config(
+        None, environ={"AGENTIC__PROTOCOL__ALLOW_DIRECT_RESPONSE": "false"}, load_env_file=False
+    )
+    assert cfg.protocol.allow_direct_response is False
+    with pytest.raises(ConfigError):
+        load_config(None, environ={"AGENTIC__PROTOCOL__SURPRISE": "1"}, load_env_file=False)
+
+
 def given_env_override_when_config_loaded_then_value_replaced_and_coerced(tmp_path: Path) -> None:
     cfg = load_config(
         None,

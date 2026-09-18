@@ -33,6 +33,7 @@ __all__ = [
     "PLAN_MESSAGE_TYPES",
     "OUTBOUND_MESSAGE_TYPES",
     "INBOUND_MESSAGE_TYPES",
+    "CONCLUDING_MESSAGE_TYPES",
     "plan_type_for_message",
     "cycle_type_for_plan",
 ]
@@ -152,7 +153,8 @@ class CircuitState(StrEnum):
 @unique
 class MessageType(StrEnum):
     """Protocol message types (§3.5). ``chunk_request`` is kept for completeness but is a task type
-    in practice (§12.6, ADR-007); ``system_error`` is internal and never sent to the model."""
+    in practice (§12.6, ADR-007); ``system_error`` is internal and never sent to the model;
+    ``user_response`` is the model's direct, opaque answer to the user (ADR-022)."""
 
     USER_REQUEST = "user_request"
     DISCOVERY_PLAN = "discovery_plan"
@@ -160,6 +162,7 @@ class MessageType(StrEnum):
     PRIORITY_CLARIFICATION = "priority_clarification"
     EXECUTION_RESULT = "execution_result"
     FINAL_ANSWER = "final_answer"
+    USER_RESPONSE = "user_response"
     CONTEXT_RESUME_REQUEST = "context_resume_request"
     CONTEXT_RESUME_ACK = "context_resume_ack"
     CHUNK_REQUEST = "chunk_request"
@@ -175,7 +178,13 @@ OUTBOUND_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
 )
 
 INBOUND_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
-    PLAN_MESSAGE_TYPES | {MessageType.FINAL_ANSWER, MessageType.CONTEXT_RESUME_ACK}
+    PLAN_MESSAGE_TYPES
+    | {MessageType.FINAL_ANSWER, MessageType.USER_RESPONSE, MessageType.CONTEXT_RESUME_ACK}
+)
+
+#: The two inbound types that conclude the model's turn without a plan (§11, ADR-022).
+CONCLUDING_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
+    {MessageType.FINAL_ANSWER, MessageType.USER_RESPONSE}
 )
 
 

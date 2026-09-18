@@ -89,6 +89,8 @@ class ConversationRecord(Record):
     current_cycle_id: str | None = None
     current_plan_id: str | None = None
     last_completed_plan_id: str | None = None
+    #: The model concluded a turn in this conversation with a ``final_answer`` or a
+    #: ``user_response`` (ADR-022): the next ``user_request`` is a follow-up (ADR-007 table).
     final_answer_received: bool = False
     last_outbound_message_id: str | None = None
     last_inbound_message_id: str | None = None

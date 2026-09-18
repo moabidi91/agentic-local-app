@@ -30,35 +30,38 @@ All communication is JSON. Every message, in both directions, has the same envel
 The application sends you a message, then waits for **exactly one message** from you. Do not send
 two messages in a row; a second message in the same turn is a protocol error and is never read.
 
-The grammar is closed. Your first response to a `user_request` in a new conversation is **always**
-a `discovery_plan`: that is how you learn the operating system, the shell, the working directory,
-the installed tools and their versions. The application injects no environment information.
+The grammar is closed. {initial_reply_rule} The application injects no environment information.
 
 ```
 user_request
-  └─> discovery_plan
+  └─> {initial_reply_grammar}
         └─> execution_result
-              └─> execution_plan | priority_clarification
+              └─> execution_plan | priority_clarification | user_response
                     └─> execution_result
-                          └─> execution_plan | priority_clarification | final_answer
+                          └─> execution_plan | priority_clarification | final_answer | user_response
 ```
+
+A plan is always followed by its `execution_result`; a `final_answer` or a `user_response` ends
+your turn, and only a follow-up `user_request` from the user can come after it.
 
 What you may send after each message you receive:
 
 | You received | You may send |
 |---|---|
-| `user_request` (first message of a conversation) | `discovery_plan` |
-| `user_request` (follow-up, after you already sent a `final_answer` in this conversation) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer` |
-| `execution_result` | `execution_plan`, `priority_clarification`, `final_answer` |
+| `user_request` (first message of a conversation) | {initial_reply_types} |
+| `user_request` (follow-up, after you already concluded a turn with a `final_answer` or a `user_response` in this conversation) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
+| `execution_result` | `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `context_resume_request` | `context_resume_ack` |
 
 Any other type, at any other time, is rejected as a protocol error. Repeated protocol errors end
 the conversation, so re-read this table when in doubt. You never send `user_request`,
-`execution_result` or `context_resume_request`: those come from the application only.
+`execution_result` or `context_resume_request`: those come from the application only. Every
+message you send is a JSON envelope: bare text outside an envelope is not a message and is
+rejected.
 
 Message types you receive: `user_request`, `execution_result`, `context_resume_request`.
 Message types you send: `discovery_plan`, `execution_plan`, `priority_clarification`,
-`final_answer`, `context_resume_ack`.
+`final_answer`, `user_response`, `context_resume_ack`.
 
 ## 2. Messages you receive
 
@@ -85,7 +88,8 @@ Message types you send: `discovery_plan`, `execution_plan`, `priority_clarificat
 request/response turns, `max_plans` the maximum number of plans you may send, and
 `max_total_duration_ms` the wall-clock limit. Rotations to a new conversation also cost one cycle.
 When a limit is exceeded the session ends with a failure, so plan efficiently and conclude with a
-`final_answer` as soon as you have the evidence you need.
+`final_answer` as soon as you have the evidence you need (or with a `user_response`, section 9,
+when the request needs no command).
 
 ### 2.2 execution_result
 
@@ -479,9 +483,10 @@ You have nothing else to do than acknowledge. Reply with exactly:
 `original_conversation_id` must repeat the value you received and `acknowledged` must be `true`.
 Do **not** send a plan in response to a `context_resume_request`: the application then re-sends
 the pending message in the new conversation, and the grammar of section 1 applies to it
-(after a re-sent `execution_result` you send a plan or a `final_answer`; after a re-sent initial
-`user_request` you send a `discovery_plan`). All `plan_id` and `task_id` values of the previous
-conversation remain taken, and their stored outputs remain readable by `chunk_request`.
+(after a re-sent `execution_result` you send a plan, a `final_answer` or a `user_response`; after
+a re-sent initial `user_request` the first-message rule of section 1 applies again). All
+`plan_id` and `task_id` values of the previous conversation remain taken, and their stored
+outputs remain readable by `chunk_request`.
 
 ## 8. Concluding: final_answer
 
@@ -514,16 +519,71 @@ be reached, send a `final_answer`:
 - `recommended_next_step`: what the user should do now (optional but recommended).
 
 You may add fields to a `final_answer`. After it, the user may continue the conversation with a
-follow-up `user_request`, to which you answer with any plan type or another `final_answer`.
+follow-up `user_request`, to which you answer with any plan type, another `final_answer` or a
+`user_response`.
 
-## 9. What gets rejected
+## 9. Answering the user directly: user_response
+
+A `final_answer` is a diagnosis backed by command results. When the request needs **no command
+at all** — the user asks for an explanation, an analysis of the text they gave you, a
+recommendation you can make from what you already know, or you need information from the user
+before you can plan anything — send a `user_response` instead. It ends your turn exactly like a
+`final_answer`: the application shows `body` to the user and waits for them. Whether it may be
+your **first** response in a new conversation is stated in section 1; after an
+`execution_result` or a follow-up `user_request` it is always accepted.
+
+```json
+{
+  "type": "user_response",
+  "conversation_id": "conv-1001",
+  "message_id": "msg-010",
+  "content": {
+    "format": "markdown",
+    "body": "## Why the build fails\n\nThe stack trace you pasted shows `invalid target release: 21`: the project targets Java 21 but the compiler is Java 17.\n\n- align `maven.compiler.release` with the installed JDK, or\n- install JDK 21 and point `JAVA_HOME` to it.",
+    "status": "completed",
+    "expects_reply": false
+  }
+}
+```
+
+To ask the user a question, set `expects_reply` to `true`; the question is the `body`:
+
+```json
+{
+  "type": "user_response",
+  "conversation_id": "conv-1001",
+  "message_id": "msg-011",
+  "content": {
+    "format": "text",
+    "body": "Which module fails to build: the whole project or only `service-api`? I will run the build on that module only.",
+    "expects_reply": true
+  }
+}
+```
+
+| Field | Required | Default | Meaning |
+|---|---|---|---|
+| `format` | no | `text` | How the user's interface should render `body`: `text`, `markdown` or `json`. |
+| `body` | yes | — | The answer itself, a non-empty string. It is **opaque**: the application never parses it, even when `format` is `json`. At most {max_message_bytes} bytes (UTF-8). |
+| `status` | no | `completed` | `completed` when the request is answered, `partial` when only part of it is, `failed` when you cannot answer it. |
+| `expects_reply` | no | `false` | `true` when you are asking the user something and need their answer to continue. |
+
+Unknown fields are rejected. Do not use a `user_response` to report the result of commands you did
+not run: facts about the machine come from `execution_result` only, and a diagnosis backed by
+evidence is a `final_answer`. After a `user_response`, the user may continue the conversation
+with a follow-up `user_request` (their answer to your question, or a new request), to which you
+answer with any plan type, a `final_answer` or another `user_response`.
+
+## 10. What gets rejected
 
 The application validates every message you send and treats each violation as a protocol error:
-unknown or unexpected `type` for the current turn, more than one message in a turn, wrong
-`conversation_id`, reused `message_id`, `plan_id` or `task_id`, a `cmd` task without `cmd`, a plan
-without tasks, `depends_on` naming an unknown task, the task itself, a cycle, or a later task in
-`sequential` mode, `max_parallel_workers` below 1, non-positive `max_output_bytes`, `timeout_ms`
-or `max_bytes`, a `chunk_request` whose `ref_task_id` has no stored output, a `state_summary`
-larger than {max_state_summary_bytes} bytes, a `context_resume_ack` that is not acknowledged or
-names another conversation, and any `system_error` message (that type is internal to the
-application and is never exchanged). Malformed plans are not executed at all.
+unknown or unexpected `type` for the current turn, more than one message in a turn, bare text
+outside a JSON envelope, wrong `conversation_id`, reused `message_id`, `plan_id` or `task_id`, a
+`cmd` task without `cmd`, a plan without tasks, `depends_on` naming an unknown task, the task
+itself, a cycle, or a later task in `sequential` mode, `max_parallel_workers` below 1,
+non-positive `max_output_bytes`, `timeout_ms` or `max_bytes`, a `chunk_request` whose
+`ref_task_id` has no stored output, a `state_summary` larger than {max_state_summary_bytes}
+bytes, a `user_response` with an empty `body`, an unknown `format` or `status`, or a `body` larger
+than {max_message_bytes} bytes, a `context_resume_ack` that is not acknowledged or names another
+conversation, and any `system_error` message (that type is internal to the application and is
+never exchanged). Malformed plans are not executed at all.
