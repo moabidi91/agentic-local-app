@@ -78,6 +78,7 @@ markers = [
     "phase9: protocol orchestration (integration)",
     "phase10: audit and observability",
     "real_subprocess: spawns a real shell process (skipped on CI platforms that cannot run it)",
+    "conformance: protocol conformance battery (what the application does with a misbehaving model)",
 ]
 
 [tool.ruff]
