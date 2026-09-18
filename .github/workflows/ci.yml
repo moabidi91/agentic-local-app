@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: write   # the failure report step pushes pytest output to the ci-logs branch
+
 jobs:
   tests:
     name: pytest (${{ matrix.os }}, py${{ matrix.python }})
@@ -33,9 +36,36 @@ jobs:
         run: uv run mypy
 
       - name: Unit + integration tests
-        run: uv run pytest -q --cov=agentic_local_app --cov-report=xml
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run pytest -q -ra --tb=short --cov=agentic_local_app --cov-report=xml 2>&1 | tee pytest-report.txt
+
+      - name: Publish failure report to the ci-logs branch
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          LABEL: ${{ matrix.os }}-py${{ matrix.python }}
+        run: |
+          api() { curl -sS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$@"; }
+          # ensure the ci-logs branch exists (created from the current commit the first time)
+          if ! api -o /dev/null -f "https://api.github.com/repos/$REPO/git/ref/heads/ci-logs"; then
+            api -X POST "https://api.github.com/repos/$REPO/git/refs" \
+              -d "{\"ref\":\"refs/heads/ci-logs\",\"sha\":\"$SHA\"}" > /dev/null || true
+          fi
+          REPORT=$( { echo "# pytest report — $LABEL — commit $SHA — run $RUN_ID"; echo; tail -c 200000 pytest-report.txt; } )
+          CONTENT=$(printf '%s' "$REPORT" | base64 | tr -d '\n')
+          PATH_IN_REPO="reports/${SHA:0:7}-$LABEL-$RUN_ID.txt"
+          printf '{"message":"ci: pytest failure report %s (%s)","branch":"ci-logs","content":"%s"}' "${SHA:0:7}" "$LABEL" "$CONTENT" > payload.json
+          api -X PUT "https://api.github.com/repos/$REPO/contents/$PATH_IN_REPO" --data-binary @payload.json > /dev/null
+          echo "report pushed to ci-logs:$PATH_IN_REPO"
 
       - name: Upload coverage artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-${{ matrix.os }}-py${{ matrix.python }}
