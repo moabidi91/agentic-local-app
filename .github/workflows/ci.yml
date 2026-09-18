@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install project (with dev extras)
+        run: uv sync --extra dev --python ${{ matrix.python }}
+
+      - name: Lint (ruff)
+        run: uv run ruff check src tests
+
+      - name: Type-check (mypy)
+        run: uv run mypy
+
+      - name: Unit + integration tests
+        run: uv run pytest -q --cov=agentic_local_app --cov-report=xml
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}-py${{ matrix.python }}
+          path: coverage.xml
