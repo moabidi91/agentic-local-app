@@ -23,7 +23,7 @@ from agentic_local_app.domain.states import SessionState
 from agentic_local_app.observability.event_bus import EventBus, RecordingSubscriber
 from agentic_local_app.persistence.memory import InMemoryConversationStore
 
-pytestmark = pytest.mark.phase1
+pytestmark = pytest.mark.phase0
 
 
 def _session(ids: SequentialIdGenerator, clock: FakeClock) -> SessionRecord:
