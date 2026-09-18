@@ -116,6 +116,7 @@ class _Conversation:
     acks: dict[str, dict[str, Any]] = field(default_factory=dict)  # message_id -> ack body
     last_step: int | None = None
     closed: bool = False
+    session_key: str = "global"
 
 
 class MockEngine:
@@ -128,7 +129,10 @@ class MockEngine:
         self.inits: list[dict[str, Any]] = []
         self.received: list[tuple[str, dict[str, Any]]] = []
         self.closed: list[str] = []
-        self._next_step = 0
+        # one scenario cursor per session (``metadata.session_id`` of the init); conversations of
+        # the same session — e.g. a rotation child — continue where the parent left off, while a
+        # new session restarts the scenario from its first step.
+        self._cursors: dict[str, int] = {}
         self._fault_remaining: dict[int, int] = {
             index: step.fault.times
             for index, step in enumerate(scenario.steps)
@@ -151,12 +155,18 @@ class MockEngine:
     def init(self, body: Any) -> Reply:
         if not isinstance(body, dict):
             return 400, {"error": "invalid_json"}
-        fault = self._take_fault(self._next_step, "init")
+        metadata = body.get("metadata")
+        session_key = "global"
+        if isinstance(metadata, dict) and isinstance(metadata.get("session_id"), str):
+            session_key = metadata["session_id"]
+        fault = self._take_fault(self._cursors.get(session_key, 0), "init")
         if fault is not None:
             return self._fault_reply(fault, "init")
         self._conversation_counter += 1
         conversation_id = f"mock-conv-{self._conversation_counter:04d}"
-        self.conversations[conversation_id] = _Conversation(conversation_id)
+        self.conversations[conversation_id] = _Conversation(
+            conversation_id, session_key=session_key
+        )
         self.inits.append(dict(body))
         return 201, {"conversation_id": conversation_id}
 
@@ -177,19 +187,20 @@ class MockEngine:
         cached = conversation.acks.get(message_id)
         if cached is not None:
             return 202, dict(cached)  # idempotent re-POST: same ack, nothing republished
-        fault = self._take_fault(self._next_step, "post")
+        next_step = self._cursors.get(conversation.session_key, 0)
+        fault = self._take_fault(next_step, "post")
         if fault is not None:
             return self._fault_reply(fault, "post")
-        if self._next_step < len(self.scenario.steps):
-            step = self.scenario.steps[self._next_step]
+        if next_step < len(self.scenario.steps):
+            step = self.scenario.steps[next_step]
             if step.on != "*" and step.on != body["type"]:
                 return 409, {
                     "error": "unexpected_message_type",
                     "expected": step.on,
                     "received": body["type"],
                 }
-            conversation.last_step = self._next_step
-            self._next_step += 1
+            conversation.last_step = next_step
+            self._cursors[conversation.session_key] = next_step + 1
             available_at = self._now_ms() + step.delay_ms
             for template in step.respond:
                 conversation.outbox.append(

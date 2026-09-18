@@ -102,6 +102,8 @@ class FakeConversationManager:
         self.wait_raises: deque[BaseException] = deque()
         #: run by successive ``wait`` calls (one per call) to make the session progress.
         self.wait_script: deque[Callable[[FakeConversationManager, str], None]] = deque()
+        #: façade contract: ``wait`` raises ``TimeoutError`` while the session is still RUNNING.
+        self.wait_times_out: bool = True
         #: raised by the next ``start_session`` (uniform error handling tests).
         self.start_raises: BaseException | None = None
         #: raised by the next ``interrupt`` (a second Ctrl-C while the interruption runs).
@@ -184,7 +186,14 @@ class FakeConversationManager:
         if self.wait_script:
             self.wait_script.popleft()(self, session_id)
         await asyncio.sleep(0)
-        return self.require_session(session_id)
+        session = self.require_session(session_id)
+        if (
+            timeout_ms is not None
+            and session.status is SessionState.RUNNING
+            and self.wait_times_out
+        ):
+            raise TimeoutError(f"session {session_id} still running after {timeout_ms} ms")
+        return session
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         return self.store.get_session(session_id)

@@ -431,6 +431,9 @@ async def _run_session(
                 seen_active = seen_active or session.status in _ACTIVE_SESSION_STATES
                 try:
                     session = await manager.wait(sid, timeout_ms=config.cli.refresh_interval_ms)
+                except TimeoutError:
+                    # still running: refresh the record and redraw (the façade raises on timeout)
+                    session = manager.get_session(sid) or session
                 except (asyncio.CancelledError, KeyboardInterrupt):
                     _uncancel()
                     if not json_output:
