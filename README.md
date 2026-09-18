@@ -156,7 +156,34 @@ uv run mypy                  # typage strict
 
 Les tests suivent la convention imposée par la spec (§18.4) : `given_<état>_when_<action>_then_<résultat>`. pytest est configuré pour collecter directement ces fonctions (`python_functions = given_*`).
 
-## 7. Feuille de route (ordre imposé par la spec §20)
+## 7. Utilisation
+
+```bash
+# 1. lancer un modèle simulé (rejoue le scénario Java de la spec §12, contrat ADR-004)
+uv run agentic-app mock-server --host 127.0.0.1 --port 9000
+
+# 2. lancer une session en console (affichage en direct, Ctrl-C = interruption propre)
+uv run agentic-app run "Understand the root cause of a Java build failure" \
+    --message "Please debug the Java error in my project."
+
+# 3. ou exposer l'API locale (REST + flux SSE) pour un front ou un autre outil
+uv run agentic-app serve --host 127.0.0.1 --port 8765
+curl -X POST http://127.0.0.1:8765/api/v1/sessions \
+     -H "Content-Type: application/json" \
+     -d '{"goal":"…","user_message":"…"}'
+curl -N http://127.0.0.1:8765/api/v1/events            # flux live de tous les événements
+curl http://127.0.0.1:8765/api/v1/sessions/<sid>/snapshot
+
+# 4. vérifier ou afficher la configuration effective
+uv run agentic-app config validate
+uv run agentic-app config show
+```
+
+Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence.
+
+Les routes de l'API sont listées dans [docs/phases/phase-09-interfaces.md](docs/phases/phase-09-interfaces.md) et [ADR-018](docs/adr/ADR-018-api-pour-un-front-et-flux-live.md).
+
+## 8. Feuille de route (ordre imposé par la spec §20)
 
 ```mermaid
 flowchart LR
@@ -171,8 +198,8 @@ flowchart LR
     P10 --> P9[Phase 9<br/>Orchestration complète]
 ```
 
-Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md).
+Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md). **État : les 10 phases sont livrées et vertes** (2 155 tests, couverture 97 %, Python 3.11/3.12, Linux + Windows).
 
-## 8. Périmètre de la v1 — à lire avant de lancer l'application sur une vraie machine
+## 9. Périmètre de la v1 — à lire avant de lancer l'application sur une vraie machine
 
 Le modèle est un **orchestrateur de confiance** : les commandes sont exécutées **telles quelles**, sans sandbox ni contrôle de périmètre (spec §1). L'application est donc, de fait, un shell distant piloté par le modèle. Le sandboxing est explicitement reporté à une version ultérieure.
