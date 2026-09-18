@@ -342,14 +342,20 @@ class InterruptionHandler:
     async def _drain(self, session_id: str) -> bool:
         """Wait for the registered loop at most ``interrupt_drain_timeout_ms``; ``True`` when it
         ended in time (or when no loop was registered)."""
-        event = self._loops.pop(session_id, None)
+        # The event stays registered while we wait so that ``loop_finished(session_id)`` called by
+        # the orchestrator's ``finally`` wakes us up; it is dropped once the drain is over.
+        event = self._loops.get(session_id)
         if event is None or event.is_set():
+            self._loops.pop(session_id, None)
             return True
         timeout_s = self._config.execution.interrupt_drain_timeout_ms / 1000
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout_s)
         except TimeoutError:
             return False
+        finally:
+            if self._loops.get(session_id) is event:
+                self._loops.pop(session_id, None)
         return True
 
     # ------------------------------------------------------------------ 5. sweep -----------
