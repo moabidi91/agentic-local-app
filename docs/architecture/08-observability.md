@@ -213,7 +213,7 @@ data: {"event_type":"task.output","payload":{"data":"[INFO] Scanning…","offset
 : ping
 ```
 
-`data` est le JSON canonique (ADR-017) de l'événement : `event_id`, `sequence`, `event_type`, `timestamp`, `session_id`, `conversation_id`, `cycle_id`, `plan_id`, `task_id`, `payload`. `id` = `event_id` d'audit ; un `task.output` n'a **pas** de ligne `id` (non audité) et n'est donc pas rejouable — la sortie complète se relit par `/tasks/{tid}/output`. Un commentaire `: ping` est envoyé périodiquement pour garder la connexion.
+`data` est le JSON canonique (ADR-017) de l'événement : `event_id`, `sequence`, `event_type`, `timestamp`, `session_id`, `conversation_id`, `cycle_id`, `plan_id`, `task_id`, `payload`. `id` = séquence d'audit de la session (`"<sequence>"` pour un événement audité, `"<sequence>.<n>"` pour un `task.output`), `event_id` et `sequence` étant repris dans `data` ; un `task.output` porte un `id` dérivé (`"<sequence>.<n>"`) mais n'est pas rejouable (non audité) — la sortie complète se relit par `/tasks/{tid}/output`. Un commentaire `: ping` est envoyé périodiquement pour garder la connexion.
 
 ### 6.2 Reprise avec `Last-Event-ID`
 
