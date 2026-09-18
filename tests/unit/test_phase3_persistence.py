@@ -1804,7 +1804,13 @@ def given_inner_savepoint_rolled_back_when_sibling_inner_transaction_follows_the
     assert [c.cycle_id for c in sqlite_store.list_cycles("conv-0001")] == ["cyc-kept"]
 
 
-def given_sqlite_file_store_when_1000_audit_events_appended_then_under_two_seconds(
+# Sanity bound, not a benchmark: with ``synchronous=FULL`` (ADR-019 §9) every append fsyncs, which
+# costs ~0.1 ms on Linux tmpfs but ~4 ms on the Windows CI runners; the bound only guards against
+# pathological slowness (per-event cost is negligible next to the model round-trips).
+AUDIT_APPEND_SANITY_BOUND_S = 15.0
+
+
+def given_sqlite_file_store_when_1000_audit_events_appended_then_within_sanity_bound(
     sqlite_store: SqliteConversationStore,
 ) -> None:
     chain = audit_chain("sess-perf", 1000)
@@ -1812,7 +1818,7 @@ def given_sqlite_file_store_when_1000_audit_events_appended_then_under_two_secon
     for event in chain:
         sqlite_store.append_audit_event(event)
     elapsed = time.perf_counter() - started
-    assert elapsed < 2.0, f"1000 appends took {elapsed:.2f}s"
+    assert elapsed < AUDIT_APPEND_SANITY_BOUND_S, f"1000 appends took {elapsed:.2f}s"
     assert sqlite_store.count_audit_events("sess-perf") == 1000
     assert sqlite_store.get_last_audit_event("sess-perf") == chain[-1]
     assert sqlite_store.list_audit_events("sess-perf", after_sequence=998) == chain[998:]
