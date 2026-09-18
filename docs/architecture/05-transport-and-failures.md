@@ -2,9 +2,9 @@
 
 **Ce que dit la spec.** Le modèle n'est joignable que par `POST message` / `GET messages` ([§2.1](../spec/SPEC-v1.1.md#21-conversation-model)) à travers le `TransportGateway` (§3.12 : gzip optionnel, erreurs normalisées, abandon des appels en vol). Toute défaillance est classée dans la taxonomie fermée de [§6](../spec/SPEC-v1.1.md#6-error-taxonomy) et traitée par la politique déterministe de [§7](../spec/SPEC-v1.1.md#7-deterministic-failure-policy) : retry borné sur les seuls types rejouables (§7.1), aucun retry sur les autres (§7.2), backoff exponentiel borné et décisions persistées (§7.3), disjoncteur (§7.4). `FailureManager` classe et décide (§3.13), `RetryController` calcule (§3.14), `CircuitBreaker` protège (§3.15).
 
-**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED`.
+**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-020](../adr/ADR-020-transport-enfichable.md) : plusieurs implémentations (*providers*) du même contrat, choisies par `transport.provider` (registre, base « template method », provider `templated_http` décrit par configuration) ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED`.
 
-Code : [`domain/errors.py`](../../src/agentic_local_app/domain/errors.py) (`ErrorType`, `NormalizedError`, `TransportError`…), [`config.py`](../../src/agentic_local_app/config.py) (`TransportSection`, `RetrySection`, `CircuitBreakerSection`), `transport/gateway.py`, `transport/fake.py`, `resilience/*`, `testing/mock_model_server.py` (phase 7). La machine à états du disjoncteur est dans [01](01-state-machines.md#9-disjoncteur-74).
+Code : [`domain/errors.py`](../../src/agentic_local_app/domain/errors.py) (`ErrorType`, `NormalizedError`, `TransportError`…), [`config.py`](../../src/agentic_local_app/config.py) (`TransportSection`, `RetrySection`, `CircuitBreakerSection`), `transport/base.py` (contrat), `transport/http_base.py`, `transport/registry.py`, `transport/providers/*`, `transport/fake.py`, `transport/gateway.py` (façade de compatibilité), `resilience/*`, `testing/mock_model_server.py` (phase 7). La machine à états du disjoncteur est dans [01](01-state-machines.md#9-disjoncteur-74).
 
 ## 1. Contrat d'endpoints (ADR-004)
 
@@ -70,7 +70,88 @@ sequenceDiagram
 
 Le GET est un **polling** : chaque requête est bornée par `request_timeout_ms` ; l'attente globale d'une réponse est bornée par `reply_timeout_ms` (défaut 120 000 ms) → `TIMEOUT_ERROR / MODEL_GET_TIMEOUT`, rejouable (§7.1). `abandon()` annule les appels en vol et la boucle de polling (interruption, §2.9) ; le `MessageRecord` sortant reste persisté pour la reprise (ADR-016).
 
-Interface (`TransportGateway`, ABC) : `init_conversation(instructions, metadata) -> str` · `post_message(remote_conversation_id, payload) -> PostAck {accepted, message_id, http_status}` · `get_messages(remote_conversation_id, after) -> GetResult {messages, cursor, http_status, polls}` · `close_conversation(remote_conversation_id)` · `abandon()`. Implémentations : `HttpTransportGateway` (httpx, `timeout = request_timeout_ms`, `verify = verify_tls`) et `FakeTransportGateway` (réponses scriptées, erreurs injectables, aucun réseau).
+Interface (`TransportGateway`, ABC) : `init_conversation(instructions, metadata) -> str` · `post_message(remote_conversation_id, payload) -> PostAck {accepted, message_id, http_status}` · `get_messages(remote_conversation_id, after) -> GetResult {messages, cursor, http_status, polls}` · `close_conversation(remote_conversation_id)` · `abandon()`. Implémentations : `HttpTransportGateway` (httpx, `timeout = request_timeout_ms`, `verify = verify_tls`) — désormais le provider `generic_http` — et `FakeTransportGateway` (réponses scriptées, erreurs injectables, aucun réseau) ; les autres providers sont décrits en §1.2.
+
+### 1.2 Providers : plusieurs implémentations du contrat (ADR-020)
+
+Le contrat reste unique, mais le modèle réel branché n'expose pas forcément les endpoints d'ADR-004. Un **provider** est une classe concrète de `TransportGateway`, construite par convention `Provider(config.transport, clock, **kwargs)` (`kwargs` : `transport` httpx et `sleep`, injectés par les tests) et choisie **par configuration seulement** : `transport.provider` désigne un nom enregistré (`generic_http`, `templated_http`, `fake`), un chemin d'import `paquet.module:Classe` ou un entry point du groupe `agentic_local_app.transports` ; `transport.options` est la sous-table propre au provider, validée par son `options_model` (pydantic, `extra = forbid`).
+
+```mermaid
+classDiagram
+    direction TB
+    class TransportGateway {
+        <<abstract>>
+        +init_conversation(instructions, metadata) str
+        +post_message(remote_id, payload) PostAck
+        +get_messages(remote_id, after) GetResult
+        +wait_for_reply(remote_id, after) GetResult
+        +close_conversation(remote_id)
+        +abandon()
+    }
+    class HttpCall {
+        +method
+        +url
+        +headers
+        +json
+        +expected_statuses
+        +parse_json
+    }
+    class HttpProviderBase {
+        <<abstract>>
+        +options_model
+        +headers(operation) dict
+        +build_init(instructions, metadata) HttpCall
+        +parse_init(status, body) str
+        +build_post(remote_id, payload) HttpCall
+        +parse_post(status, body, payload) PostAck
+        +build_get(remote_id, after) HttpCall
+        +parse_get(status, body) GetResult
+        +build_close(remote_id)
+        +classify_error(operation, status, body, headers) TransportError
+        +redact_url(url) str
+        -_send(operation, call)
+        -_wait(remote_id, after)
+    }
+    class GenericHttpProvider {
+        contrat ADR-004
+    }
+    class TemplatedHttpProvider {
+        +options_model TemplatedOptions
+        placeholders et env
+        chemins de reponse
+    }
+    class FakeTransportGateway {
+        double scripte, aucun reseau
+    }
+    class FakeTransportProvider
+    class TransportRegistry {
+        +register(name)
+        +names() list
+        +resolve(spec) type
+        +create(config, clock, kwargs) TransportGateway
+    }
+    TransportGateway <|-- HttpProviderBase
+    TransportGateway <|-- FakeTransportGateway
+    HttpProviderBase <|-- GenericHttpProvider
+    HttpProviderBase <|-- TemplatedHttpProvider
+    FakeTransportGateway <|-- FakeTransportProvider
+    HttpProviderBase ..> HttpCall : construit puis envoie
+    TransportRegistry ..> TransportGateway : resolve(nom, chemin, entry point) puis create
+    note for GenericHttpProvider "generic_http : HttpTransportGateway est le meme objet de classe (alias)"
+    note for TemplatedHttpProvider "templated_http : decrit par transport.options"
+    note for FakeTransportProvider "fake : construit depuis config.transport"
+```
+
+`HttpProviderBase` (« template method ») porte tout le commun : client httpx et timeouts, `InFlightGuard` / `abandon()`, JSON canonique et gzip, polling de `wait_for_reply` (`MODEL_GET_TIMEOUT`), statuts attendus, table HTTP → `ErrorType` du §2 (`classify_error`, surchargeable) et les `details` `operation` / `http_status` / `url` estampillés sur chaque erreur. Un provider décrit chaque opération par un `HttpCall` (`build_*`) et lit chaque réponse (`parse_*`) ; un corps hors contrat se signale par `InvalidResponseError`, transformé par la base en `MODEL_PROTOCOL_ERROR / INVALID_RESPONSE_BODY`.
+
+| Provider | Classe | Options | Ce qu'il fait |
+|---|---|---|---|
+| `generic_http` (défaut) | `GenericHttpProvider` = `HttpTransportGateway` | aucune | le contrat du §1 tel quel ; `close_url` avec `transport.close_method` (`POST` / `DELETE`) |
+| `templated_http` | `TemplatedHttpProvider` | `TemplatedOptions` : `headers` communs, tables `init` / `post` / `get` / `close` (`method`, `url`, `headers`, `body`, `expected_statuses`, chemins de réponse) | méthode, URL, en-têtes et corps de chaque opération sont des gabarits (`{conversation_id}`, `{after}`, `{instructions}`, `{user_id}`, `{metadata_json}`, `{message_json}`, `{message_id}`, `{message_type}`, `{token}`, `${env:VAR}` résolu à l'appel) ; les réponses se lisent par chemins pointés avec index (`data.items[0].id`) ; n'envoie ni `X-User-Id` ni `Authorization` sans que les options le disent |
+| `fake` | `FakeTransportProvider` (sous-classe de `FakeTransportGateway`) | aucune | le double scripté, pour un lancement sans réseau |
+| chemin d'import / entry point | n'importe quelle classe concrète de `TransportGateway` | son `options_model` | extension sans modification du dépôt (ADR-020 §6) |
+
+Le `TransportRegistry` résout le nom (nom enregistré > chemin d'import > entry point, découverte paresseuse) et instancie le provider après validation des options ; `build_application` l'appelle avant d'ouvrir le store quand aucun transport n'est injecté. Erreurs : `TRANSPORT_PROVIDER_UNKNOWN` (avec les noms disponibles), `TRANSPORT_PROVIDER_INVALID`, `TRANSPORT_OPTIONS_INVALID`, et à l'appel `TRANSPORT_ENV_MISSING` (variable `${env:…}` ou `{token}` absente). CLI : `agentic-app transport list` et `agentic-app transport show` (options masquées : valeurs `${env:…}` et clés `*key*` / `*token*` / `*secret*`).
 
 ## 2. Classification HTTP → taxonomie (ADR-004)
 
@@ -268,6 +349,9 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 | `[transport]` | `reply_timeout_ms` | 120 000 | attente maximale d'une réponse (`MODEL_GET_TIMEOUT`) | ADR-004 |
 | `[transport]` | `gzip` | `true` | `Content-Encoding: gzip` sur les POST | §3.12 |
 | `[transport]` | `verify_tls` | `true` | vérification TLS (à ne désactiver que pour un mock local) | — |
+| `[transport]` | `provider` | `generic_http` | implémentation du transport : nom enregistré, `paquet.module:Classe` ou entry point `agentic_local_app.transports` | ADR-020 |
+| `[transport]` | `close_method` | `POST` | méthode HTTP de `close_url` pour `generic_http` (`POST` ou `DELETE`) | ADR-020 |
+| `[transport.options]` | (sous-table) | `{}` | options propres au provider, validées par son `options_model` (`templated_http` : `headers`, `init`, `post`, `get`, `close`) | ADR-020 |
 | `[retry]` | `max_attempts` | 4 | tentatives au total, retries compris | §7.3 |
 | `[retry]` | `base_delay_ms` | 500 | base du backoff | ADR-017 |
 | `[retry]` | `max_delay_ms` | 8 000 | plafond d'un délai | ADR-017 |

@@ -2,7 +2,8 @@
 
 Resolution order of the file: ``--config`` (CLI) > ``AGENTIC_APP_CONFIG`` env var > ``./config.toml``
 > built-in defaults. Every value can be overridden by an environment variable named
-``AGENTIC__<SECTION>__<KEY>`` (double underscores), e.g. ``AGENTIC__TRANSPORT__USER_ID=alice``.
+``AGENTIC__<SECTION>__<KEY>`` (double underscores), e.g. ``AGENTIC__TRANSPORT__USER_ID=alice``;
+lists and tables are given as JSON (``AGENTIC__TRANSPORT__OPTIONS='{"init": {...}}'``).
 
 Secrets never live in the file: ``transport.token_env`` names the environment variable holding the
 model API token (an optional ``.env`` file is loaded into the environment first, without overriding
@@ -15,7 +16,7 @@ import os
 import tomllib
 from collections.abc import MutableMapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -24,6 +25,13 @@ from agentic_local_app.domain.errors import ConfigError
 ENV_CONFIG_PATH = "AGENTIC_APP_CONFIG"
 ENV_PREFIX = "AGENTIC__"
 DEFAULT_CONFIG_FILENAME = "config.toml"
+#: The default transport provider (ADR-020): the ADR-004 contract over httpx.
+DEFAULT_TRANSPORT_PROVIDER = "generic_http"
+#: Marker of an environment reference inside a provider option (``${env:VAR}``, ADR-020).
+ENV_REFERENCE_MARKER = "${env:"
+#: Option keys whose values are always masked by :meth:`AppConfig.masked` (substring match).
+SECRET_KEY_MARKERS: tuple[str, ...] = ("key", "token", "secret", "password", "authorization")
+MASK = "***"
 
 
 class _Section(BaseModel):
@@ -38,7 +46,15 @@ class AppSection(_Section):
 
 
 class TransportSection(_Section):
-    """ADR-004. URL templates accept ``{conversation_id}`` and ``{after}`` placeholders."""
+    """ADR-004 (endpoints, token, user id, timeouts) and ADR-020 (pluggable provider).
+
+    URL templates accept ``{conversation_id}`` and ``{after}`` placeholders. ``provider`` selects
+    the implementation by configuration only: a registered name (``generic_http``,
+    ``templated_http``, ``fake``), an entry point of the ``agentic_local_app.transports`` group or
+    an import path ``package.module:ClassName``. ``options`` is the provider-specific sub-table,
+    validated by the provider itself (``options_model``); ``close_method`` is the HTTP method of
+    ``close_url`` for ``generic_http``.
+    """
 
     init_url: str = "http://127.0.0.1:9000/v1/conversations"
     post_url: str = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages"
@@ -51,6 +67,18 @@ class TransportSection(_Section):
     reply_timeout_ms: int = Field(default=120_000, gt=0)
     gzip: bool = True
     verify_tls: bool = True
+    # ADR-020
+    provider: str = DEFAULT_TRANSPORT_PROVIDER
+    close_method: Literal["POST", "DELETE"] = "POST"
+    options: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("provider")
+    @classmethod
+    def _provider_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must name a transport provider")
+        return value
 
     @field_validator("post_url", "get_url")
     @classmethod
@@ -179,10 +207,39 @@ class AppConfig(BaseModel):
         return self
 
     def masked(self) -> dict[str, Any]:
-        """Effective configuration as a dict with the token masked (for ``config show`` / ``/config``)."""
+        """Effective configuration as a dict with the token masked (for ``config show`` / ``/config``).
+
+        Provider options (ADR-020) are masked with a simple guard: any value containing an
+        environment reference (``${env:...}``) and any value under a key that looks secret
+        (``*key*``, ``*token*``, ``*secret*``, ``*password*``, ``*authorization*``) becomes ``***``.
+        """
         data = self.model_dump()
-        data["transport"]["token"] = "***" if self.transport.token else None
+        data["transport"]["token"] = MASK if self.transport.token else None
+        data["transport"]["options"] = mask_options(self.transport.options)
         return data
+
+
+def _looks_secret(key: str) -> bool:
+    lowered = key.lower()
+    return any(marker in lowered for marker in SECRET_KEY_MARKERS)
+
+
+def mask_options(value: Any, *, under_secret_key: bool = False) -> Any:
+    """A deep copy of provider options with the secret-looking leaves replaced by ``***``."""
+    if isinstance(value, dict):
+        return {
+            str(key): mask_options(
+                item, under_secret_key=under_secret_key or _looks_secret(str(key))
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [mask_options(item, under_secret_key=under_secret_key) for item in value]
+    if isinstance(value, str) and ENV_REFERENCE_MARKER in value:
+        return MASK
+    if under_secret_key and value is not None:
+        return MASK
+    return value
 
 
 # ------------------------------------------------------------------------------------------------
@@ -223,7 +280,7 @@ def _apply_env_overrides(data: dict[str, Any], environ: MutableMapping[str, str]
             raise ConfigError("INVALID_ENV_OVERRIDE", variable=name)
         section, key = parts
         parsed: Any = value
-        if value.startswith("[") or value.lower() in {"true", "false"}:
+        if value.startswith(("[", "{")) or value.lower() in {"true", "false"}:
             import json
 
             try:

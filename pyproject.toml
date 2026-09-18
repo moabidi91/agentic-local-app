@@ -28,6 +28,14 @@ dev = [
 [project.scripts]
 agentic-app = "agentic_local_app.interfaces.cli:main"
 
+# Transport providers (ADR-020). The built-in ones are registered by name when the transport
+# package is imported; they are also published here to show how a third-party distribution
+# exposes a provider (registered names take precedence, so nothing is listed twice).
+[project.entry-points."agentic_local_app.transports"]
+generic_http = "agentic_local_app.transport.providers.generic_http:GenericHttpProvider"
+templated_http = "agentic_local_app.transport.providers.templated_http:TemplatedHttpProvider"
+fake = "agentic_local_app.transport.fake:FakeTransportProvider"
+
 [build-system]
 requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"

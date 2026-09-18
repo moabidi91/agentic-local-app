@@ -1,6 +1,7 @@
 """``build_application`` — assemble every component with the injection points of §18.3.
 
-Production defaults: ``open_store(config)`` (SQLite under ``app.data_dir``), ``HttpTransportGateway``,
+Production defaults: ``open_store(config)`` (SQLite under ``app.data_dir``), the transport provider
+named by ``transport.provider`` (``TransportRegistry.create``, ADR-020; ``generic_http`` by default),
 ``SubprocessCommandExecutor`` (with its platform adapter, used by the recovery to terminate
 orphans, ADR-016), ``SystemClock``, ``UuidIdGenerator``. Tests inject their doubles through the
 keyword arguments; an injected executor is a test double, so no platform adapter (and no orphan
@@ -43,7 +44,8 @@ from agentic_local_app.protocol.adapter import ProtocolAdapter, render_instructi
 from agentic_local_app.resilience.circuit_breaker import CircuitBreaker
 from agentic_local_app.resilience.failure_manager import FailureManager
 from agentic_local_app.resilience.retry_controller import RetryController
-from agentic_local_app.transport.gateway import HttpTransportGateway, TransportGateway
+from agentic_local_app.transport.base import TransportGateway
+from agentic_local_app.transport.registry import TransportRegistry
 
 __all__ = ["Application", "build_application"]
 
@@ -112,13 +114,10 @@ def build_application(
     clock = clock if clock is not None else SystemClock()
     ids = ids if ids is not None else UuidIdGenerator()
     bus = bus if bus is not None else EventBus()
+    if transport is None:  # before the store: a provider misconfiguration must not open a database
+        transport_kwargs: dict[str, Any] = {"sleep": sleep} if sleep is not None else {}
+        transport = TransportRegistry.create(config, clock=clock, **transport_kwargs)
     store = store if store is not None else open_store(config)
-    if transport is None:
-        transport = (
-            HttpTransportGateway(config.transport, clock, sleep=sleep)
-            if sleep is not None
-            else HttpTransportGateway(config.transport, clock)
-        )
     if executor is None:
         subprocess_executor = SubprocessCommandExecutor(config.execution, clock)
         executor = subprocess_executor

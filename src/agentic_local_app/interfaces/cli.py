@@ -2,7 +2,8 @@
 
 Commands: ``run`` (a session in-process, live display, **Ctrl-C = interruption**), ``serve`` (the
 HTTP API), ``status`` / ``sessions`` / ``interrupt`` / ``audit verify`` (clients of the API),
-``config show`` / ``config validate``, ``mock-server`` (the scripted model), ``version``.
+``config show`` / ``config validate``, ``transport list`` / ``transport show`` (the pluggable
+transport providers of ADR-020), ``mock-server`` (the scripted model), ``version``.
 
 Everything external is injectable through :class:`CliDependencies` (``ctx.obj``): the application
 factory (``orchestration.wiring.build_application``, imported lazily so that this module never
@@ -45,6 +46,8 @@ from agentic_local_app.domain.states import SessionState
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
 from agentic_local_app.testing.mock_model_server import run_mock_server
+from agentic_local_app.transport.base import validate_options
+from agentic_local_app.transport.registry import TransportRegistry
 
 __all__ = [
     "CLI_SUBSCRIBER_NAME",
@@ -99,8 +102,12 @@ app = typer.Typer(
 )
 config_app = typer.Typer(help="Show or validate the effective configuration (config.toml).")
 audit_app = typer.Typer(help="Audit chain tools.")
+transport_app = typer.Typer(
+    help="Transport providers: list the available ones, show the effective one."
+)
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
+app.add_typer(transport_app, name="transport")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", help="Path of config.toml (else AGENTIC_APP_CONFIG).")
@@ -178,7 +185,12 @@ def _build_application(deps: CliDependencies, config: AppConfig) -> ApplicationL
             factory = cast(Callable[[AppConfig], ApplicationLike], getattr(wiring, WIRING_FACTORY))
         except (ImportError, AttributeError) as exc:  # pragma: no cover - not deployed
             raise _fail(f"The orchestration package is not available: {exc}") from None
-    return factory(config)
+    try:
+        return factory(config)
+    except ConfigError as exc:  # e.g. an unknown transport provider (ADR-020)
+        for line in _config_error_lines(exc):
+            typer.echo(line, err=True)
+        raise typer.Exit(EXIT_FAILED) from None
 
 
 def _api_base(config: AppConfig, api_url: str | None) -> str:
@@ -756,6 +768,57 @@ def config_validate(ctx: typer.Context, config: ConfigOption = None) -> None:
     _load(path)
     source = str(path) if path is not None else "AGENTIC_APP_CONFIG / ./config.toml / defaults"
     typer.echo(f"Configuration valid ({source}).")
+
+
+# ================================================================================================
+# transport list · transport show (ADR-020)
+# ================================================================================================
+@transport_app.command("list")
+def transport_list(json_output: JsonOption = False) -> None:
+    """List the selectable transport providers (name, class, origin)."""
+    rows = [
+        {"name": info.name, "class": info.qualified_name, "origin": info.origin}
+        for info in TransportRegistry.list_providers()
+    ]
+    if json_output:
+        typer.echo(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    columns = ("name", "class", "origin")
+    widths = {key: max(len(key), *(len(row[key]) for row in rows)) for key in columns}
+    typer.echo("  ".join(key.upper().ljust(widths[key]) for key in columns).rstrip())
+    for row in rows:
+        typer.echo("  ".join(row[key].ljust(widths[key]) for key in columns).rstrip())
+
+
+@transport_app.command("show")
+def transport_show(
+    ctx: typer.Context, config: ConfigOption = None, json_output: JsonOption = False
+) -> None:
+    """Show the effective transport provider and its options (secrets masked)."""
+    cfg = _load(_config_path(ctx, config))
+    try:
+        info, provider = TransportRegistry.describe(cfg.transport.provider)
+        validate_options(provider, cfg.transport.options)
+    except ConfigError as exc:
+        for line in _config_error_lines(exc):
+            typer.echo(line, err=True)
+        raise typer.Exit(EXIT_FAILED) from None
+    options_model = getattr(provider, "options_model", None)
+    masked = cfg.masked()["transport"]
+    document = {
+        "provider": cfg.transport.provider,
+        "class": info.qualified_name,
+        "origin": info.origin,
+        "options_model": options_model.__name__ if options_model is not None else None,
+        "options": masked["options"],
+        "transport": masked,
+    }
+    if json_output:
+        typer.echo(json.dumps(document, indent=2, sort_keys=True, default=str))
+        return
+    for key in ("provider", "class", "origin", "options_model"):
+        typer.echo(f"{key}: {_value(document[key])}")
+    typer.echo(f"options: {json.dumps(document['options'], indent=2, sort_keys=True)}")
 
 
 @app.command()

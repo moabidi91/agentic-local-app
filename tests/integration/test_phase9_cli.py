@@ -638,3 +638,194 @@ def given_invalid_config_when_run_then_exit_1_before_building_the_application(
     assert "CONFIG_INVALID" in result.output
     assert "config" not in deps.captured  # type: ignore[attr-defined]
     assert fake.calls == []
+
+
+# ================================================================================================
+# transport list · transport show (ADR-020)
+# ================================================================================================
+KEY_ENV = "AGENTIC_PHASE9_CLI_MODEL_KEY"
+GENERIC_CLASS = "agentic_local_app.transport.providers.generic_http:GenericHttpProvider"
+TEMPLATED_CLASS = "agentic_local_app.transport.providers.templated_http:TemplatedHttpProvider"
+FAKE_CLASS = "agentic_local_app.transport.fake:FakeTransportProvider"
+
+
+def _templated_config(tmp_path: Path, provider: str = "templated_http") -> Path:
+    path = tmp_path / "templated.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[transport]",
+                f'provider = "{provider}"',
+                f'token_env = "{TOKEN_ENV}"',
+                "[transport.options]",
+                f'headers = {{ "X-Api-Key" = "${{env:{KEY_ENV}}}", "Accept" = "application/json" }}',
+                "[transport.options.init]",
+                'url = "https://api.example.com/v1/threads"',
+                'body = { instructions = "{instructions}", api_secret = "literal" }',
+                'conversation_id_path = "data.id"',
+                "[transport.options.post]",
+                'url = "https://api.example.com/v1/threads/{conversation_id}/messages"',
+                'body = { content = "{message_json}" }',
+                "[transport.options.get]",
+                'url = "https://api.example.com/v1/threads/{conversation_id}/messages?since={after}"',
+                'messages_path = "items"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def given_cli_when_transport_list_then_builtin_providers_with_class_and_origin(
+    runner: CliRunner,
+) -> None:
+    result = runner.invoke(app, ["transport", "list"])
+    assert result.exit_code == 0, result.output
+    rows = {line.split()[0]: line for line in result.output.splitlines() if line.strip()}
+    assert "generic_http" in rows and GENERIC_CLASS in rows["generic_http"]
+    assert "templated_http" in rows and TEMPLATED_CLASS in rows["templated_http"]
+    assert "fake" in rows and FAKE_CLASS in rows["fake"]
+    assert all("builtin" in rows[name] for name in ("generic_http", "templated_http", "fake"))
+
+
+def given_cli_when_transport_list_json_then_machine_readable_sorted_rows(
+    runner: CliRunner,
+) -> None:
+    result = runner.invoke(app, ["transport", "list", "--json"])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)
+    assert [row["name"] for row in rows] == sorted(row["name"] for row in rows)
+    by_name = {row["name"]: row for row in rows}
+    assert by_name["generic_http"] == {
+        "name": "generic_http",
+        "class": GENERIC_CLASS,
+        "origin": "builtin",
+    }
+    assert by_name["templated_http"]["class"] == TEMPLATED_CLASS
+    assert by_name["fake"]["class"] == FAKE_CLASS
+
+
+def given_default_config_when_transport_show_then_generic_http_without_options(
+    runner: CliRunner, config_file: Path
+) -> None:
+    result = runner.invoke(app, ["transport", "show", "--config", str(config_file)])
+    assert result.exit_code == 0, result.output
+    assert "provider: generic_http" in result.output
+    assert f"class: {GENERIC_CLASS}" in result.output
+    assert "origin: builtin" in result.output
+    assert "options: {}" in result.output
+
+
+def given_templated_config_with_secrets_when_transport_show_then_options_masked(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(KEY_ENV, "k-secret")
+    monkeypatch.setenv(TOKEN_ENV, "t-secret")
+    result = runner.invoke(app, ["transport", "show", "--config", str(_templated_config(tmp_path))])
+    assert result.exit_code == 0, result.output
+    assert "k-secret" not in result.output and "t-secret" not in result.output
+    assert "provider: templated_http" in result.output
+    assert f"class: {TEMPLATED_CLASS}" in result.output
+    assert "options_model: TemplatedOptions" in result.output
+    assert '"X-Api-Key": "***"' in result.output
+    assert '"api_secret": "***"' in result.output
+    assert '"instructions": "{instructions}"' in result.output
+
+
+def given_templated_config_when_transport_show_json_then_document_with_masked_options(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(KEY_ENV, "k-secret")
+    monkeypatch.setenv(TOKEN_ENV, "t-secret")
+    result = runner.invoke(
+        app, ["transport", "show", "--json", "--config", str(_templated_config(tmp_path))]
+    )
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["provider"] == "templated_http"
+    assert document["class"] == TEMPLATED_CLASS
+    assert document["origin"] == "builtin"
+    assert document["options_model"] == "TemplatedOptions"
+    assert document["options"]["headers"] == {"X-Api-Key": "***", "Accept": "application/json"}
+    assert document["options"]["init"]["body"] == {
+        "instructions": "{instructions}",
+        "api_secret": "***",
+    }
+    assert document["transport"]["token"] == "***"
+    assert document["transport"]["options"] == document["options"]
+    assert "k-secret" not in result.stdout and "t-secret" not in result.stdout
+
+
+def given_unknown_provider_when_transport_show_then_exit_1_with_available_names(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = _templated_config(tmp_path, provider="carrier_pigeon")
+    result = runner.invoke(app, ["transport", "show", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert "TRANSPORT_PROVIDER_UNKNOWN" in result.output
+    assert "carrier_pigeon" in result.output and "generic_http" in result.output
+
+
+def given_options_for_a_provider_without_options_when_transport_show_then_exit_1_options_invalid(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = _templated_config(tmp_path, provider="generic_http")
+    result = runner.invoke(app, ["transport", "show", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert "TRANSPORT_OPTIONS_INVALID" in result.output
+    assert "GenericHttpProvider" in result.output
+
+
+def given_invalid_templated_options_when_transport_show_then_exit_1_with_location(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text(
+        '[transport]\nprovider = "templated_http"\n[transport.options.init]\nurl = "http://x"\n',
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["transport", "show", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert "TRANSPORT_OPTIONS_INVALID" in result.output
+    assert "init.conversation_id_path" in result.output
+    assert "post" in result.output and "get" in result.output
+
+
+def given_invalid_config_file_when_transport_show_then_exit_1_config_invalid(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text('[transport]\nclose_method = "PUT"\n', encoding="utf-8")
+    result = runner.invoke(app, ["transport", "show", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert "CONFIG_INVALID" in result.output and "transport.close_method" in result.output
+
+
+def given_cli_when_help_then_transport_command_listed(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0 and "transport" in result.output
+    sub = runner.invoke(app, ["transport", "--help"])
+    assert sub.exit_code == 0 and "list" in sub.output and "show" in sub.output
+
+
+def given_unknown_transport_provider_when_run_with_real_factory_then_exit_1_before_any_session(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        "\n".join(
+            [
+                "[app]",
+                f'data_dir = "{(tmp_path / "data").as_posix()}"',
+                "[transport]",
+                'provider = "carrier_pigeon"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    result = runner.invoke(app, ["run", "goal", "--config", str(path)], obj=CliDependencies())
+    assert result.exit_code == 1, result.output
+    assert "TRANSPORT_PROVIDER_UNKNOWN" in result.output and "carrier_pigeon" in result.output
+    assert not (tmp_path / "data").exists()  # the store was never opened

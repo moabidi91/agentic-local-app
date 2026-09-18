@@ -16,13 +16,19 @@ log_level = "INFO"
 env_file = ".env"            # chargé au démarrage, sans écraser les variables déjà définies
 
 # --------------------------------------------------------------------------------------------
-# Transport vers le modèle distant (ADR-004). Placeholders : {conversation_id}, {after}
+# Transport vers le modèle distant (ADR-004, ADR-020). Placeholders : {conversation_id}, {after}
 # --------------------------------------------------------------------------------------------
 [transport]
+provider  = "generic_http"              # implémentation (ADR-020) : generic_http (contrat ADR-004),
+                                        # templated_http (API décrite par [transport.options]),
+                                        # fake (double scripté, aucun réseau), un entry point du
+                                        # groupe agentic_local_app.transports, ou "paquet.module:Classe"
+                                        # (`agentic-app transport list` / `transport show`)
 init_url  = "http://127.0.0.1:9000/v1/conversations"
 post_url  = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages"
 get_url   = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages?after={after}"
 close_url = ""                          # optionnel ; vide = fermeture locale seulement
+close_method = "POST"                   # generic_http : méthode de close_url, POST ou DELETE
 token_env = "AGENTIC_TRANSPORT_TOKEN"   # variable d'environnement portant le jeton (facultatif)
 user_id   = "local-user"                # envoyé en en-tête X-User-Id et dans l'init
 request_timeout_ms = 15000              # timeout d'un appel HTTP
@@ -30,6 +36,40 @@ poll_interval_ms   = 1000               # intervalle entre deux GET sans répons
 reply_timeout_ms   = 120000             # attente maximale d'une réponse du modèle (MODEL_GET_TIMEOUT)
 gzip = true
 verify_tls = true
+
+# Options propres au provider (ADR-020) : aucune pour generic_http et fake. Exemple complet pour
+# templated_http, qui décrit n'importe quelle API HTTP : méthode, URL, en-têtes et corps de chaque
+# opération, chemins de lecture des réponses. Placeholders : {conversation_id}, {after} (encodés
+# dans les URL), {instructions}, {user_id}, {metadata_json}, {message_json}, {message_id},
+# {message_type}, {token} ; ${env:VAR} partout, résolu au moment de l'appel (jamais écrit ici).
+# Une feuille de corps valant exactement "{message_json}" ou "{metadata_json}" reçoit l'objet
+# JSON lui-même ; les chemins de réponse acceptent les index de liste (data.items[0].id).
+#
+# [transport]
+# provider = "templated_http"
+# [transport.options]
+# headers = { "X-Api-Key" = "${env:MY_MODEL_KEY}" }        # en-têtes communs à toutes les opérations
+# [transport.options.init]
+# method = "POST"
+# url = "https://api.example.com/v1/threads"
+# body = { instructions = "{instructions}", user = "{user_id}", meta = "{metadata_json}" }
+# conversation_id_path = "data.id"
+# expected_statuses = [200, 201]
+# [transport.options.post]
+# method = "POST"
+# url = "https://api.example.com/v1/threads/{conversation_id}/messages"
+# body = { role = "user", content = "{message_json}" }
+# accepted_path = "ok"                                      # optionnel : absent => accepté si statut attendu
+# message_id_path = "id"                                    # optionnel : absent => message_id du message envoyé
+# [transport.options.get]
+# method = "GET"
+# url = "https://api.example.com/v1/threads/{conversation_id}/messages?since={after}"
+# messages_path = "items"
+# message_path = "payload"                                  # optionnel : message protocolaire dans chaque élément
+# cursor_path = "next_cursor"                               # optionnel : absent => message_id du dernier message
+# [transport.options.close]                                 # optionnel : absent => fermeture locale seulement
+# method = "DELETE"
+# url = "https://api.example.com/v1/threads/{conversation_id}"
 
 # --------------------------------------------------------------------------------------------
 # Exécution des commandes (ADR-003, ADR-008, ADR-018)

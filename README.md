@@ -177,9 +177,41 @@ curl http://127.0.0.1:8765/api/v1/sessions/<sid>/snapshot
 # 4. vérifier ou afficher la configuration effective
 uv run agentic-app config validate
 uv run agentic-app config show
+
+# 5. choisir l'implémentation du transport (ADR-020) : lister les providers, voir l'effectif
+uv run agentic-app transport list
+uv run agentic-app transport show
 ```
 
 Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence.
+
+**Choisir un provider de transport.** Le contrat `TransportGateway` est unique, mais son implémentation se choisit **par configuration** avec `transport.provider` ([ADR-020](docs/adr/ADR-020-transport-enfichable.md)) :
+
+| `transport.provider` | Quand | Configuration |
+|---|---|---|
+| `generic_http` (défaut) | le modèle expose le contrat ADR-004 (le serveur mock, ou un adaptateur qui le respecte) | `init_url`, `post_url`, `get_url`, `close_url` + `close_method` (`POST` / `DELETE`), `token_env`, `user_id` |
+| `templated_http` | le modèle expose une API HTTP quelconque | `[transport.options]` : pour chaque opération `init` / `post` / `get` / `close`, la méthode, l'URL, les en-têtes et le corps sous forme de gabarits (`{conversation_id}`, `{after}`, `{instructions}`, `{user_id}`, `{metadata_json}`, `{message_json}`, `{message_id}`, `{message_type}`, `{token}`, `${env:VAR}` résolu à l'appel) et les chemins de lecture des réponses (`conversation_id_path = "data.id"`, `messages_path = "items"`, `cursor_path`…) ; exemple complet commenté dans `config.toml` |
+| `fake` | un lancement sans aucun réseau (démonstration, tests d'interface) | aucune |
+| `paquet.module:Classe` ou un entry point `agentic_local_app.transports` | un provider écrit en dehors du dépôt (dérivant de `HttpProviderBase` ou directement de `TransportGateway`) | ses propres options, validées par son `options_model` |
+
+```toml
+[transport]
+provider = "templated_http"
+[transport.options]
+headers = { "X-Api-Key" = "${env:MY_MODEL_KEY}" }
+[transport.options.init]
+url = "https://api.example.com/v1/threads"
+body = { instructions = "{instructions}", user = "{user_id}", meta = "{metadata_json}" }
+conversation_id_path = "data.id"
+[transport.options.post]
+url = "https://api.example.com/v1/threads/{conversation_id}/messages"
+body = { role = "user", content = "{message_json}" }
+[transport.options.get]
+url = "https://api.example.com/v1/threads/{conversation_id}/messages?since={after}"
+messages_path = "items"
+```
+
+`agentic-app transport show` affiche le provider effectif, sa classe et ses options avec les secrets masqués ; un provider inconnu ou des options invalides sont refusés au démarrage avec un message explicite.
 
 Les routes de l'API sont listées dans [docs/phases/phase-09-interfaces.md](docs/phases/phase-09-interfaces.md) et [ADR-018](docs/adr/ADR-018-api-pour-un-front-et-flux-live.md).
 
@@ -198,7 +230,7 @@ flowchart LR
     P10 --> P9[Phase 9<br/>Orchestration complète]
 ```
 
-Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md). **État : les 10 phases sont livrées et vertes** (2 155 tests, couverture 97 %, Python 3.11/3.12, Linux + Windows).
+Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md). **État : les 10 phases sont livrées et vertes** (2 317 tests, couverture 97 %, Python 3.11/3.12, Linux + Windows).
 
 ## 9. Périmètre de la v1 — à lire avant de lancer l'application sur une vraie machine
 

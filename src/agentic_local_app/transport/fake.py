@@ -14,6 +14,10 @@ No network, no waiting: every call returns immediately. The scenario is written 
   which raises ``TransportError(INTERRUPTED, "ABANDONED")`` exactly like the HTTP gateway (§2.9).
 
 Everything the orchestrator sent is recorded: ``inits``, ``posted``, ``get_calls``, ``closed``.
+
+``FakeTransportProvider`` is the same double under the registry convention of ADR-020 (built from
+``config.transport`` and a clock), selectable with ``transport.provider = "fake"`` for a run that
+must never reach a network.
 """
 
 from __future__ import annotations
@@ -22,9 +26,10 @@ import asyncio
 from collections import defaultdict, deque
 from typing import Any
 
+from agentic_local_app.config import TransportSection
 from agentic_local_app.domain.clock import Clock
 from agentic_local_app.domain.errors import ErrorType, TransportError
-from agentic_local_app.transport.gateway import (
+from agentic_local_app.transport.base import (
     OP_CLOSE,
     OP_GET,
     OP_INIT,
@@ -33,9 +38,11 @@ from agentic_local_app.transport.gateway import (
     InFlightGuard,
     PostAck,
     TransportGateway,
+    validate_options,
 )
+from agentic_local_app.transport.registry import TransportRegistry
 
-__all__ = ["FakeTransportGateway"]
+__all__ = ["FakeTransportGateway", "FakeTransportProvider"]
 
 _OPERATIONS: dict[str, str] = {"init": OP_INIT, "post": OP_POST, "get": OP_GET, "close": OP_CLOSE}
 
@@ -185,3 +192,16 @@ class FakeTransportGateway(TransportGateway):
             raise ValueError(
                 f"unknown operation {operation!r}; expected one of {sorted(_OPERATIONS)}"
             )
+
+
+@TransportRegistry.register("fake")
+class FakeTransportProvider(FakeTransportGateway):
+    """The ``fake`` provider: the scripted double built like any provider (ADR-020).
+
+    ``reply_timeout_ms`` comes from the transport section; no option is accepted; the keyword
+    arguments of the registry convention (``transport``, ``sleep``...) are ignored.
+    """
+
+    def __init__(self, config: TransportSection, clock: Clock, **kwargs: Any) -> None:
+        validate_options(type(self), config.options)
+        super().__init__(clock, reply_timeout_ms=config.reply_timeout_ms)

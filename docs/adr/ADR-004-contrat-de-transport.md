@@ -1,6 +1,6 @@
 # ADR-004 — Contrat de transport : endpoints configurables, jeton optionnel, user id, serveur mock
 
-**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md) et par [ADR-020](ADR-020-transport-enfichable.md) (ce contrat est celui du provider `generic_http` ; d'autres providers coexistent, choisis par `transport.provider`)
 
 ## Contexte
 
@@ -60,6 +60,6 @@ Application FastAPI qui implémente exactement ce contrat et joue le rôle du mo
 
 ## Conséquences
 
-- `TransportGateway` (interface) : `init_conversation()`, `post_message()`, `get_messages(after)`, `close_conversation()`, `abandon()` (interruption : annule les appels en vol, §2.9). Implémentations : `HttpTransportGateway` (httpx) et `FakeTransportGateway` (réponses scriptées, aucun réseau).
+- `TransportGateway` (interface) : `init_conversation()`, `post_message()`, `get_messages(after)`, `close_conversation()`, `abandon()` (interruption : annule les appels en vol, §2.9). Implémentations : `HttpTransportGateway` (httpx) et `FakeTransportGateway` (réponses scriptées, aucun réseau). *Amendé par ADR-020* : `HttpTransportGateway` est le provider `generic_http` (`GenericHttpProvider`), bâti sur la base `HttpProviderBase` ; le provider effectif est choisi par `transport.provider` (registre), et `close_url` est appelée avec la méthode `transport.close_method` (`POST` par défaut, `DELETE` possible).
 - `message_id` est généré par l'application (`IdGenerator`, ADR-017) et persisté **avant** le POST, ce qui rend le retry après erreur réseau sûr.
-- Le contrat est isolé dans une seule classe ; changer d'endpoint réel = changer la configuration, changer de forme de réponse = changer une méthode de mapping.
+- Le contrat est isolé dans une seule classe ; changer d'endpoint réel = changer la configuration, changer de forme de réponse = changer une méthode de mapping. *Amendé par ADR-020* : une forme d'API différente se décrit désormais par configuration (`templated_http`) ou par un provider dédié, sans modifier cette classe.

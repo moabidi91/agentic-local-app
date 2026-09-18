@@ -35,9 +35,15 @@ src/agentic_local_app/
 │   └── plan_runner.py             PlanRunner : DAG, locks, workers, stop conditions, drain     [phase 5]
 ├── interruption/
 │   └── handler.py                 InterruptionHandler (jeton = CancellationToken par session)   [phase 6]
-├── transport/
-│   ├── gateway.py                 TransportGateway (ABC), HttpTransportGateway                  [phase 7]
-│   └── fake.py                    FakeTransportGateway (scénarios scriptés)
+├── transport/                     ADR-020 : providers choisis par configuration
+│   ├── base.py                    TransportGateway (ABC), PostAck, GetResult, InFlightGuard, OP_*  [phase 7]
+│   ├── http_base.py               HttpProviderBase (template method httpx), HttpCall, InvalidResponseError
+│   ├── registry.py                TransportRegistry : register / names / resolve / create, entry points
+│   ├── providers/
+│   │   ├── generic_http.py        GenericHttpProvider = HttpTransportGateway (contrat ADR-004)
+│   │   └── templated_http.py      TemplatedHttpProvider + TemplatedOptions (API décrite par options)
+│   ├── gateway.py                 façade de compatibilité : réexporte base.* et HttpTransportGateway
+│   └── fake.py                    FakeTransportGateway (scénarios scriptés), FakeTransportProvider (« fake »)
 ├── resilience/
 │   ├── failure_manager.py         FailureManager : classify(), decide()                         [phase 7]
 │   ├── retry_controller.py        RetryController : backoff borné déterministe
@@ -57,7 +63,7 @@ src/agentic_local_app/
 │   ├── recovery.py                RecoveryCoordinator + RecoveryReport
 │   └── wiring.py                  build_application(config) : assemble tout (injection)
 ├── interfaces/
-│   ├── cli.py                     typer : run / serve / status / config / mock-server            [phase 9]
+│   ├── cli.py                     typer : run / serve / status / config / transport / mock-server [phase 9]
 │   └── http_api.py                FastAPI : REST + SSE (ADR-018)
 └── testing/
     ├── fake_executor.py           FakeCommandExecutor (sorties, délais, annulation simulés)     [phase 4]
@@ -73,6 +79,7 @@ tests/
 │   ├── test_phase5_plan_execution.py
 │   ├── test_phase6_interruption.py
 │   ├── test_phase7_transport_failures.py
+│   ├── test_phase7_providers.py   registre, HttpProviderBase, generic_http, templated_http, câblage (ADR-020)
 │   ├── test_phase8_context_rotation.py
 │   └── test_phase10_observability.py
 └── integration/
@@ -86,6 +93,7 @@ Un fichier de tests par phase peut être découpé en plusieurs (`test_phase7_tr
 ```mermaid
 flowchart TB
     IF[interfaces] --> ORC[orchestration]
+    IF -. "transport list / show : registre seulement" .-> TR
     ORC --> LC[lifecycle] & PA[protocol] & EX[execution] & IH[interruption] & CX[context] & RS[resilience] & TR[transport]
     LC & PA & EX & IH & CX & RS & TR --> OBS[observability]
     LC & EX & CX & IH --> PS[persistence]
@@ -96,7 +104,7 @@ flowchart TB
 
 1. `domain` ne dépend de rien d'autre que pydantic et la bibliothèque standard.
 2. Personne n'importe `interfaces` ni `orchestration` en dehors d'eux-mêmes.
-3. `persistence`, `execution.executor`, `transport` sont des **frontières** : une ABC + une implémentation réelle + un double. Le reste du code ne connaît que l'ABC.
+3. `persistence`, `execution.executor`, `transport` sont des **frontières** : une ABC + une implémentation réelle + un double. Le reste du code ne connaît que l'ABC. Pour `transport`, l'implémentation réelle est le **provider** choisi par `transport.provider` (ADR-020) : les providers dérivent de l'ABC (le plus souvent via `HttpProviderBase`), sont résolus par `TransportRegistry` (nom enregistré, `paquet.module:Classe`, entry point `agentic_local_app.transports`) et instanciés par `build_application` ; ajouter un provider ne modifie ni l'ABC ni les providers existants.
 4. Aucune horloge (`datetime.now`, `time.*`) ni aléa (`uuid4`, `random`) en dehors de `domain/clock.py`, `domain/ids.py` et du `jitter` optionnel de `RetryController` (test d'inspection en phase 10).
 5. Toute transition d'état passe par `domain.transitions.assert_transition` puis est **persistée avant publication** (ADR-015).
 
@@ -114,7 +122,10 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | `ResultCollector()` | `build(plan: PlanRecord, tasks: list[TaskRecord], task_outputs: dict[str, TruncatedOutput], chunk_results: dict[str, ChunkResult]) -> ExecutionResultContent` |
 | `PlanRunner(store, bus, executor, payload_guard, clock, ids, config, *, failure_manager=None)` | `async run(plan: PlanRecord, tasks: list[TaskRecord], session: SessionRecord, *, interrupt: CancellationToken) -> PlanOutcome(plan, tasks, execution_result \| None, interrupted, budget_exceeded, stop_reason)` |
 | `InterruptionHandler(store, bus, lifecycle, clock, ids, config, *, transport=None)` | `token_for(session_id) -> CancellationToken` · `register_loop(session_id) -> asyncio.Event` · `loop_finished(session_id)` · `async interrupt(session_id, *, reason="user_interrupt") -> InterruptionReport` (borné par `interrupt_drain_timeout_ms`) · `is_interrupting(session_id)` · `raise_if_interrupted(session_id)` |
-| `HttpTransportGateway(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` | `async init_conversation(instructions, metadata) -> str` · `async post_message(remote_conversation_id, payload) -> PostAck` · `async get_messages(remote_conversation_id, after) -> GetResult` · `async wait_for_reply(remote_conversation_id, after) -> GetResult` (polling borné, `MODEL_GET_TIMEOUT`) · `async close_conversation(remote_conversation_id)` · `abandon()` |
+| `HttpTransportGateway(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` (= `GenericHttpProvider`, ADR-020) | `async init_conversation(instructions, metadata) -> str` · `async post_message(remote_conversation_id, payload) -> PostAck` · `async get_messages(remote_conversation_id, after) -> GetResult` · `async wait_for_reply(remote_conversation_id, after) -> GetResult` (polling borné, `MODEL_GET_TIMEOUT`) · `async close_conversation(remote_conversation_id)` · `abandon()` |
+| `HttpProviderBase(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` (ABC, ADR-020) | toute l'ABC `TransportGateway` + points d'extension : `headers(operation) -> dict` · `build_init(instructions, metadata) -> HttpCall` · `parse_init(status, body) -> str` · `build_post(remote_conversation_id, payload) -> HttpCall` · `parse_post(status, body, *, payload) -> PostAck` · `build_get(remote_conversation_id, after) -> HttpCall` · `parse_get(status, body) -> GetResult` · `build_close(remote_conversation_id) -> HttpCall \| None` · `classify_error(operation, status, body, headers) -> TransportError` · `redact_url(url) -> str` · attribut de classe `options_model` |
+| `TemplatedHttpProvider(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` | `HttpProviderBase` piloté par `TemplatedOptions` (`options_model`) : `headers` communs, `init` / `post` / `get` / `close` (`method`, `url`, `headers`, `body`, `expected_statuses`, `conversation_id_path`, `accepted_path`, `message_id_path`, `messages_path`, `message_path`, `cursor_path`) |
+| `TransportRegistry` (classe, état de processus) | `register(name)` (décorateur de classe) · `names() -> list[str]` · `list_providers() -> list[ProviderInfo]` · `resolve(spec) -> type[TransportGateway]` · `describe(spec) -> (ProviderInfo, type)` · `create(config, *, clock, **kwargs) -> TransportGateway` |
 | `FailureManager(config, store, bus, clock, ids, retry=None, breaker=None)` | `classify(exc) -> NormalizedError` · `decide(error, attempt, *, operation) -> Decision(kind: retry \| abort \| rotate \| fail, delay_ms, reason)` · `record(error, *, session_id, conversation_id=None, plan_id=None, task_id=None) -> FailureRecord` · `record_decision(...) -> RetryDecisionRecord` · `handle(exc, attempt, *, operation, session_id, ...) -> (NormalizedError, Decision)` · `note_success()` |
 | `RetryController(config.retry)` | `delay_ms(attempt) -> int` · `can_retry(attempt) -> bool` |
 | `CircuitBreaker(config.circuit_breaker, clock, bus)` | `allow() -> bool` · `record_success()` · `record_failure()` · `state` |
@@ -133,7 +144,7 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | Frontière | Double | Où |
 |---|---|---|
 | shell | `FakeCommandExecutor` : sorties configurables par `cmd` ou par `task_id`, délai simulé (avec `FakeClock`), échec de spawn, blocage jusqu'à annulation, tranches de sortie live | `testing/fake_executor.py` |
-| réseau | `FakeTransportGateway` : file de réponses scriptées par conversation, erreurs injectables (type, code, HTTP), latence, `init` retournant un id déterministe | `transport/fake.py` |
+| réseau | `FakeTransportGateway` : file de réponses scriptées par conversation, erreurs injectables (type, code, HTTP), latence, `init` retournant un id déterministe ; `FakeTransportProvider` la rend sélectionnable par `transport.provider = "fake"` | `transport/fake.py` |
 | base | `InMemoryConversationStore` (+ `fail_next_write`) | `persistence/memory.py` |
 | temps / ids | `FakeClock`, `SequentialIdGenerator` | `domain/` |
 | bus | `RecordingSubscriber` | `observability/event_bus.py` |
