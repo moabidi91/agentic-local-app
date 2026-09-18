@@ -1,0 +1,104 @@
+# ============================================================================================
+# agentic-local-app — configuration globale (ADR-018)
+#
+# Un seul fichier pour tout ce qui est externe ou paramétrable. Chaque valeur peut être
+# surchargée par une variable d'environnement AGENTIC__<SECTION>__<CLE>, par exemple :
+#   AGENTIC__TRANSPORT__USER_ID=alice
+#   AGENTIC__API__PORT=9000
+# Les secrets ne sont jamais écrits ici : le jeton du modèle est lu dans la variable nommée par
+# transport.token_env (un fichier .env local, ignoré par git, peut la fournir).
+# ============================================================================================
+
+[app]
+name = "agentic-local-app"
+data_dir = "./data"          # base SQLite, blobs, journal d'audit
+log_level = "INFO"
+env_file = ".env"            # chargé au démarrage, sans écraser les variables déjà définies
+
+# --------------------------------------------------------------------------------------------
+# Transport vers le modèle distant (ADR-004). Placeholders : {conversation_id}, {after}
+# --------------------------------------------------------------------------------------------
+[transport]
+init_url  = "http://127.0.0.1:9000/v1/conversations"
+post_url  = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages"
+get_url   = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages?after={after}"
+close_url = ""                          # optionnel ; vide = fermeture locale seulement
+token_env = "AGENTIC_TRANSPORT_TOKEN"   # variable d'environnement portant le jeton (facultatif)
+user_id   = "local-user"                # envoyé en en-tête X-User-Id et dans l'init
+request_timeout_ms = 15000              # timeout d'un appel HTTP
+poll_interval_ms   = 1000               # intervalle entre deux GET sans réponse
+reply_timeout_ms   = 120000             # attente maximale d'une réponse du modèle (MODEL_GET_TIMEOUT)
+gzip = true
+verify_tls = true
+
+# --------------------------------------------------------------------------------------------
+# Exécution des commandes (ADR-003, ADR-008, ADR-018)
+# --------------------------------------------------------------------------------------------
+[execution]
+shell = ""                              # "" = défaut plateforme : bash/sh (POSIX), PowerShell (Windows)
+cwd = "."                               # répertoire de travail des commandes
+default_task_timeout_ms = 60000         # appliqué si la tâche ne déclare pas timeout_ms
+max_task_timeout_ms = 900000            # plafond d'une valeur déclarée
+cancel_drain_timeout_ms = 5000          # drain après une stop condition (SIGTERM -> SIGKILL)
+interrupt_drain_timeout_ms = 5000       # drain après une interruption utilisateur (§2.9)
+live_output_chunk_bytes = 4096          # taille max d'un événement task.output (flux live)
+live_output_interval_ms = 250           # cadence max des événements task.output par tâche
+
+# --------------------------------------------------------------------------------------------
+# Limites de payload (ADR-010, ADR-005)
+# --------------------------------------------------------------------------------------------
+[payload]
+default_max_output_bytes = 8192         # si ni la tâche ni le plan ne déclarent max_output_bytes
+hard_max_output_bytes = 262144          # plafond absolu par tâche
+max_message_bytes = 1048576             # taille max d'un message sortant sérialisé
+max_state_summary_bytes = 4096          # taille max du state_summary porté par le modèle
+
+# --------------------------------------------------------------------------------------------
+# Fenêtre de contexte et rotation (ADR-013, ADR-005)
+# --------------------------------------------------------------------------------------------
+[context]
+budget_bytes = 400000                   # octets cumulés échangés par conversation
+warning_ratio = 0.70                    # HEALTHY -> WARNING
+saturation_ratio = 0.90                 # WARNING -> SATURATED
+protocol_errors_before_rotation = 2     # erreurs de protocole répétées => SATURATED
+max_rotations_per_session = 5           # au-delà : ROTATION_FAILED
+summary_budget_bytes = 32768            # budget dur du résumé de contexte
+
+# --------------------------------------------------------------------------------------------
+# Budget de session par défaut (§2.8, ADR-012) — la user_request peut le surcharger
+# --------------------------------------------------------------------------------------------
+[budget]
+default_max_cycles = 20
+default_max_plans = 10
+default_max_total_duration_ms = 300000
+auto_close_on_final_answer = false      # §2.7
+
+# --------------------------------------------------------------------------------------------
+# Retries de transport (§7.3) et disjoncteur (§7.4)
+# --------------------------------------------------------------------------------------------
+[retry]
+max_attempts = 4
+base_delay_ms = 500
+max_delay_ms = 8000
+jitter_ratio = 0.0                      # 0 = backoff strictement déterministe
+
+[circuit_breaker]
+failure_threshold = 5                   # échecs consécutifs avant ouverture
+open_duration_ms = 30000                # durée d'ouverture avant HALF_OPEN
+half_open_max_calls = 1
+
+# --------------------------------------------------------------------------------------------
+# API HTTP locale pour la CLI et le futur front (ADR-018)
+# --------------------------------------------------------------------------------------------
+[api]
+host = "127.0.0.1"
+port = 8765
+cors_origins = ["http://localhost:3000"]
+page_size = 100
+sse_queue_size = 1000                   # événements en attente par client SSE avant abandon du client
+
+[cli]
+refresh_interval_ms = 250
+
+[telemetry]
+enabled = true
