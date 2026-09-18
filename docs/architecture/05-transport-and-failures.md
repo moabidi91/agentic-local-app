@@ -2,7 +2,7 @@
 
 **Ce que dit la spec.** Le modèle n'est joignable que par `POST message` / `GET messages` ([§2.1](../spec/SPEC-v1.1.md#21-conversation-model)) à travers le `TransportGateway` (§3.12 : gzip optionnel, erreurs normalisées, abandon des appels en vol). Toute défaillance est classée dans la taxonomie fermée de [§6](../spec/SPEC-v1.1.md#6-error-taxonomy) et traitée par la politique déterministe de [§7](../spec/SPEC-v1.1.md#7-deterministic-failure-policy) : retry borné sur les seuls types rejouables (§7.1), aucun retry sur les autres (§7.2), backoff exponentiel borné et décisions persistées (§7.3), disjoncteur (§7.4). `FailureManager` classe et décide (§3.13), `RetryController` calcule (§3.14), `CircuitBreaker` protège (§3.15).
 
-**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-020](../adr/ADR-020-transport-enfichable.md) : plusieurs implémentations (*providers*) du même contrat, choisies par `transport.provider` (registre, base « template method », provider `templated_http` décrit par configuration) ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED`.
+**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-020](../adr/ADR-020-transport-enfichable.md) : plusieurs implémentations (*providers*) du même contrat, choisies par `transport.provider` (registre, base « template method », provider `templated_http` décrit par configuration) ; [ADR-021](../adr/ADR-021-codec-de-messages-par-modele.md) : un *codec* optionnel, choisi par `transport.codec`, convertit la forme brute des réponses d'un modèle (texte, chat completion, appel d'outil) en enveloppes protocolaires et inversement, appliqué par un décorateur transparent (`UNPARSEABLE_REPLY` quand la réponse est illisible) ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED`.
 
 Code : [`domain/errors.py`](../../src/agentic_local_app/domain/errors.py) (`ErrorType`, `NormalizedError`, `TransportError`…), [`config.py`](../../src/agentic_local_app/config.py) (`TransportSection`, `RetrySection`, `CircuitBreakerSection`), `transport/base.py` (contrat), `transport/http_base.py`, `transport/registry.py`, `transport/providers/*`, `transport/fake.py`, `transport/gateway.py` (façade de compatibilité), `resilience/*`, `testing/mock_model_server.py` (phase 7). La machine à états du disjoncteur est dans [01](01-state-machines.md#9-disjoncteur-74).
 
@@ -152,6 +152,52 @@ classDiagram
 | chemin d'import / entry point | n'importe quelle classe concrète de `TransportGateway` | son `options_model` | extension sans modification du dépôt (ADR-020 §6) |
 
 Le `TransportRegistry` résout le nom (nom enregistré > chemin d'import > entry point, découverte paresseuse) et instancie le provider après validation des options ; `build_application` l'appelle avant d'ouvrir le store quand aucun transport n'est injecté. Erreurs : `TRANSPORT_PROVIDER_UNKNOWN` (avec les noms disponibles), `TRANSPORT_PROVIDER_INVALID`, `TRANSPORT_OPTIONS_INVALID`, et à l'appel `TRANSPORT_ENV_MISSING` (variable `${env:…}` ou `{token}` absente). CLI : `agentic-app transport list` et `agentic-app transport show` (options masquées : valeurs `${env:…}` et clés `*key*` / `*token*` / `*secret*`).
+
+### 1.3 Codecs : la forme brute des réponses d'un modèle (ADR-021)
+
+Un provider parle le dialecte HTTP d'une API ; il rend, pour chaque message, ce que l'API a rendu — une enveloppe protocolaire quand l'API respecte ADR-004, sinon une forme **brute** : du texte où le JSON du message est entouré de prose ou de clôtures Markdown, un objet *chat completion* dont un chemin porte ce texte, un appel d'outil dont les `arguments` sont le message. Le **codec** (`MessageCodec`, pur : ni I/O ni horloge) fait la conversion dans les deux sens : `decode_inbound(éléments bruts) -> enveloppes` et `encode_outbound(enveloppe) -> ce que le transport poste`. Il est choisi par `transport.codec` (mêmes mécanismes que le provider : nom enregistré, `paquet.module:Classe`, entry point `agentic_local_app.codecs` ; `transport.codec_options` validées par son `options_model`) et appliqué par le décorateur `CodecTransport`, lui-même `TransportGateway` : l'orchestrateur, la rotation et la reprise ne voient qu'un transport. Le codec `passthrough` (défaut) laisse le transport nu.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant O as ProtocolOrchestrator
+    participant C as CodecTransport
+    participant K as MessageCodec (json_text)
+    participant P as Provider (templated_http)
+    participant M as Modele
+    O->>C: post_message(remote, enveloppe)
+    C->>K: encode_outbound(enveloppe)
+    K-->>C: texte canonical_json (outbound = text)
+    C->>P: post_message(remote, texte)
+    P->>M: POST body { messages: [{ content: texte }] }
+    M-->>P: 200 (sans message_id)
+    P-->>C: PostAck(message_id = "")
+    C-->>O: PostAck(message_id = enveloppe.message_id)
+    O->>C: wait_for_reply(remote, after)
+    C->>P: wait_for_reply(remote, after)
+    P->>M: GET ... polling
+    M-->>P: { data: [ { choices: [ { message: { content: "prose ```json {...} ```" } } ] } ] }
+    P-->>C: GetResult(messages = [objet brut], cursor)
+    C->>K: decode_inbound([objet brut])
+    alt JSON trouve
+        K-->>C: [enveloppe]
+        C-->>O: GetResult([enveloppe], cursor ou message_id decode)
+        O->>O: ProtocolAdapter.parse_inbound(...)
+    else illisible
+        K-->>C: CodecError UNPARSEABLE_REPLY (codec, index, excerpt, reason)
+        C-->>O: TransportError MODEL_PROTOCOL_ERROR estampillee operation / http_status
+        O->>O: FailureManager : fail (rotation si WARNING)
+    end
+```
+
+| Codec | Options | Rôle |
+|---|---|---|
+| `passthrough` (défaut) | aucune | identité ; le transport n'est pas enveloppé |
+| `json_text` | `content_path`, `strip_code_fences`, `extract_first_json_object`, `id_path`, `conversation_id_fallback`, `outbound` (`object` / `text`) | chaîne (ou objet lu à `content_path`) → première clôture, premier objet ou tableau JSON équilibré (chaînes et échappements respectés) → une ou plusieurs enveloppes ; `message_id` synthétisé depuis `id_path` s'il manque ; en sortie l'enveloppe ou son JSON canonique |
+| `tool_call` | `arguments_path`, `name_path` + `tool_name`, `id_path`, `conversation_id_fallback`, `outbound` | les `arguments` d'un appel d'outil (JSON strict en chaîne, ou objet) → enveloppe(s) ; un autre outil que `tool_name` est refusé |
+| chemin d'import / entry point | son `options_model` | extension sans modification du dépôt (ADR-021 §8) |
+
+Règles du décorateur : l'accusé d'un POST dont le provider n'a pas lu de `message_id` (il a posté du texte) reprend celui de l'enveloppe ; le curseur du provider est gardé sauf s'il n'a pas avancé (`None` ou égal à `after`), auquel cas il devient le `message_id` de la dernière enveloppe décodée ; un codec n'invente jamais de `conversation_id` (une enveloppe qui n'en a pas va à l'adaptateur, qui la rejette en `SCHEMA_INVALID`, sauf `conversation_id_fallback = false`). Une forme illisible est une `CodecError` : `TransportError(MODEL_PROTOCOL_ERROR, UNPARSEABLE_REPLY)`, non rejouable, `details` = `codec`, `index`, `excerpt` (≤ 500 caractères de la forme brute), `reason` (`path_not_found`, `unexpected_type`, `no_json_found`, `json_unbalanced`, `json_invalid`, `missing_conversation_id`, `unexpected_tool`, `no_envelope` quand la réponse attendue ne porte aucune enveloppe), `operation`, `http_status`. Elle suit la politique du §4 : `fail` (aucun retry, disjoncteur non nourri), `FailureRecord` + `failure.recorded`, session `FAILED` — ou une rotation en `WARNING` (ADR-019 §2) ; rien n'est persisté comme message entrant, l'`excerpt` garde la trace pour la politique de correction à venir. Erreurs de configuration : `CODEC_UNKNOWN`, `CODEC_INVALID`, `CODEC_OPTIONS_INVALID`. CLI : `agentic-app codec list` / `codec show` ; `transport show` affiche aussi le codec effectif.
 
 ## 2. Classification HTTP → taxonomie (ADR-004)
 
@@ -352,6 +398,8 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 | `[transport]` | `provider` | `generic_http` | implémentation du transport : nom enregistré, `paquet.module:Classe` ou entry point `agentic_local_app.transports` | ADR-020 |
 | `[transport]` | `close_method` | `POST` | méthode HTTP de `close_url` pour `generic_http` (`POST` ou `DELETE`) | ADR-020 |
 | `[transport.options]` | (sous-table) | `{}` | options propres au provider, validées par son `options_model` (`templated_http` : `headers`, `init`, `post`, `get`, `close`) | ADR-020 |
+| `[transport]` | `codec` | `passthrough` | codec de messages : nom enregistré (`passthrough`, `json_text`, `tool_call`), `paquet.module:Classe` ou entry point `agentic_local_app.codecs` ; `passthrough` = transport nu | ADR-021 |
+| `[transport.codec_options]` | (sous-table) | `{}` | options propres au codec, validées par son `options_model` (`json_text` : `content_path`, `strip_code_fences`, `extract_first_json_object`, `id_path`, `conversation_id_fallback`, `outbound`) | ADR-021 |
 | `[retry]` | `max_attempts` | 4 | tentatives au total, retries compris | §7.3 |
 | `[retry]` | `base_delay_ms` | 500 | base du backoff | ADR-017 |
 | `[retry]` | `max_delay_ms` | 8 000 | plafond d'un délai | ADR-017 |
@@ -369,6 +417,7 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 | Backoff et bornes | `given_default_retry_config_when_delays_computed_then_500_1000_2000`, `given_attempt_equal_to_max_when_can_retry_then_false`, `given_retry_after_header_when_delay_computed_then_at_least_retry_after` |
 | Disjoncteur | `given_five_consecutive_failures_when_recorded_then_breaker_open`, `given_open_breaker_when_open_duration_elapsed_then_half_open`, `given_half_open_breaker_when_probe_succeeds_then_closed`, `given_half_open_breaker_when_probe_fails_then_open_again` |
 | Persistance des décisions | `given_retry_decided_when_persisted_then_retry_decision_record_matches_delay_sequence` |
+| Codecs (ADR-021) | `tests/unit/test_phase7_codecs.py` : extraction JSON (prose, clôtures, tableaux, accolades dans les chaînes), `content_path` / `id_path`, `UNPARSEABLE_REPLY` avec `excerpt` tronqué, décorateur (encode / décode / délégation / propagation), registre (builtins, chemin pointé, entry point, `CODEC_*`), câblage, CLI, exemple chat-completions ; `tests/integration/test_phase9_orchestration_codec.py` : boucle complète en texte clôturé, échec `UNPARSEABLE_REPLY` épinglé, rotation en `WARNING` |
 
 ## 11. Points ouverts
 
@@ -379,3 +428,4 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 5. **`PERSISTENCE_ERROR` transitoire.** §7.2 exclut les erreurs de persistance *persistantes* ; le store SQLite marque `transient = true` quand la base est verrouillée ou occupée, mais la politique de phase 7 ne rejoue que `NETWORK`, `TIMEOUT`, `RATE_LIMIT` et `SYSTEM` transitoire : une erreur de persistance transitoire échoue donc au premier coup. Un retry court (même `RetryController`) serait cohérent avec §7.1 ; aucun ADR ne le décrit.
 6. **Point de contrôle `max_cycles`.** ADR-012 §2 incrémente `consumed_cycles` à l'ouverture d'un cycle et §3 vérifie « avant de traiter un message entrant ». Lecture retenue : le contrôle `consumed_cycles ≥ max_cycles` a lieu **avant d'ouvrir** un nouveau cycle (donc avant de persister le message sortant suivant), ce qui revient à refuser de traiter le tour suivant ; à confirmer en phase 9.
 7. **Le disjoncteur n'est consulté qu'au retry.** Le `TransportGateway` de phase 7 n'appelle pas `allow()` avant un appel ; seul le `FailureManager` le consulte pour décider un retry. Un premier appel d'une nouvelle opération pendant l'ouverture est donc tenté (et échouera probablement, nourrissant le compteur). §7.4 « stop remote calls temporarily » serait mieux servi par un `allow()` dans l'orchestrateur avant chaque opération ; à décider en phase 9.
+8. **Octets de contexte et codecs (ADR-021).** La fenêtre compte les enveloppes décodées, pas la forme brute (prose, clôtures) réellement produite par le modèle ; approximation acceptée, un codec pourrait exposer la taille brute si l'écart devenait significatif. `templated_http` exige des objets dans `messages_path` : une API rendant des chaînes nues demanderait une option de relâchement du provider.

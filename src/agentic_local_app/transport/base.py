@@ -27,6 +27,7 @@ __all__ = [
     "OP_GET",
     "OP_INIT",
     "OP_POST",
+    "OPTIONS_INVALID_CODE",
     "GetResult",
     "InFlightGuard",
     "PostAck",
@@ -136,24 +137,35 @@ class TransportGateway(ABC):
         """Cancel every in-flight call (they raise ``INTERRUPTED / ABANDONED``); reset afterwards."""
 
 
-def validate_options(provider: type[Any], options: Mapping[str, Any]) -> BaseModel | None:
+#: ``ConfigError`` code of invalid ``transport.options`` (ADR-020).
+OPTIONS_INVALID_CODE = "TRANSPORT_OPTIONS_INVALID"
+
+
+def validate_options(
+    provider: type[Any],
+    options: Mapping[str, Any],
+    *,
+    code: str = OPTIONS_INVALID_CODE,
+    kind: str = "provider",
+) -> BaseModel | None:
     """Validate ``transport.options`` for ``provider`` against its ``options_model`` (ADR-020).
 
     Returns the validated model, or ``None`` when the provider declares no ``options_model`` — the
-    options must then be empty. Any problem is a ``ConfigError(TRANSPORT_OPTIONS_INVALID)`` whose
-    details name the provider and list the errors (``loc``, ``msg``, ``type``).
+    options must then be empty. Any problem is a ``ConfigError(code)`` whose details name the
+    plugin under the ``kind`` key (``provider`` by default; a message codec of ADR-021 uses
+    ``CODEC_OPTIONS_INVALID`` / ``codec``) and list the errors (``loc``, ``msg``, ``type``).
     """
     model: type[BaseModel] | None = getattr(provider, "options_model", None)
     name = provider.__name__
     if model is None:
         if options:
             raise ConfigError(
-                "TRANSPORT_OPTIONS_INVALID",
-                provider=name,
+                code,
+                **{kind: name},
                 errors=[
                     {
                         "loc": [key],
-                        "msg": "unknown option: this provider takes no options",
+                        "msg": f"unknown option: this {kind} takes no options",
                         "type": "extra_forbidden",
                     }
                     for key in sorted(options)
@@ -164,8 +176,8 @@ def validate_options(provider: type[Any], options: Mapping[str, Any]) -> BaseMod
         return model.model_validate(dict(options))
     except ValidationError as exc:
         raise ConfigError(
-            "TRANSPORT_OPTIONS_INVALID",
-            provider=name,
+            code,
+            **{kind: name},
             errors=[
                 {"loc": list(error["loc"]), "msg": error["msg"], "type": error["type"]}
                 for error in exc.errors(include_url=False)

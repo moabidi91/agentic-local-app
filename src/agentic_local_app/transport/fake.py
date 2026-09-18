@@ -4,16 +4,20 @@ No network, no waiting: every call returns immediately. The scenario is written 
 
 - ``init_conversation`` returns ``remote-0001``, ``remote-0002``, ... and records the init payload;
 - ``enqueue_messages(remote_id, messages)`` queues one reply batch; each ``get_messages`` /
-  ``wait_for_reply`` consumes **one** batch (the cursor is the ``message_id`` of its last message);
-  an empty queue gives an empty ``GetResult`` to ``get_messages`` and ``MODEL_GET_TIMEOUT`` to
-  ``wait_for_reply`` (when a ``FakeClock`` is injected it is advanced by ``reply_timeout_ms`` first, so
-  that budget deadlines observe the time a real polling would have consumed);
+  ``wait_for_reply`` consumes **one** batch (the cursor is the ``message_id`` of its last message
+  when it is an envelope; a batch may hold raw items — text, chat completions — for a gateway
+  wrapped by a ``CodecTransport`` (ADR-021), the cursor then stays ``after``); an empty queue gives
+  an empty ``GetResult`` to ``get_messages`` and ``MODEL_GET_TIMEOUT`` to ``wait_for_reply`` (when a
+  ``FakeClock`` is injected it is advanced by ``reply_timeout_ms`` first, so that budget deadlines
+  observe the time a real polling would have consumed);
 - ``enqueue_error(operation, error, times)`` makes the next ``times`` calls of that operation raise
   ``error`` before normal behaviour resumes;
 - ``hang_next(operation, times)`` makes the next call(s) block until ``abandon()`` cancels them,
   which raises ``TransportError(INTERRUPTED, "ABANDONED")`` exactly like the HTTP gateway (§2.9).
 
-Everything the orchestrator sent is recorded: ``inits``, ``posted``, ``get_calls``, ``closed``.
+Everything the orchestrator sent is recorded: ``inits``, ``posted`` (the payload as received — a
+protocol envelope, or the text form a codec produced: its acknowledgement then carries an empty
+``message_id``, restored by the decorator), ``get_calls``, ``closed``.
 
 ``FakeTransportProvider`` is the same double under the registry convention of ADR-020 (built from
 ``config.transport`` and a clock), selectable with ``transport.provider = "fake"`` for a run that
@@ -52,10 +56,10 @@ class FakeTransportGateway(TransportGateway):
         self.clock = clock
         self.reply_timeout_ms = reply_timeout_ms
         self.inits: list[dict[str, Any]] = []
-        self.posted: list[tuple[str, dict[str, Any]]] = []
+        self.posted: list[tuple[str, Any]] = []
         self.get_calls: list[tuple[str, str | None]] = []
         self.closed: list[str] = []
-        self._queues: defaultdict[str, deque[list[dict[str, Any]]]] = defaultdict(deque)
+        self._queues: defaultdict[str, deque[list[Any]]] = defaultdict(deque)
         self._errors: defaultdict[str, deque[TransportError]] = defaultdict(deque)
         self._hangs: defaultdict[str, int] = defaultdict(int)
         self._hanging = 0
@@ -64,8 +68,9 @@ class FakeTransportGateway(TransportGateway):
         self._guard = InFlightGuard()
 
     # ------------------------------------------------------------------ scripting ----------
-    def enqueue_messages(self, remote_conversation_id: str, messages: list[dict[str, Any]]) -> None:
-        """Queue one reply batch for ``remote_conversation_id`` (consumed by a single GET)."""
+    def enqueue_messages(self, remote_conversation_id: str, messages: list[Any]) -> None:
+        """Queue one reply batch for ``remote_conversation_id`` (consumed by a single GET): protocol
+        envelopes, or raw items when the gateway is wrapped by a codec (ADR-021)."""
         self._queues[remote_conversation_id].append(list(messages))
 
     def enqueue_error(self, operation: str, error: TransportError, times: int = 1) -> None:
@@ -128,7 +133,7 @@ class FakeTransportGateway(TransportGateway):
     async def _post(self, remote_conversation_id: str, payload: dict[str, Any]) -> PostAck:
         await self._before("post")
         self.posted.append((remote_conversation_id, payload))
-        message_id = payload.get("message_id")
+        message_id = payload.get("message_id") if isinstance(payload, dict) else None
         return PostAck(
             message_id=str(message_id) if message_id is not None else "",
             accepted=True,
@@ -144,7 +149,7 @@ class FakeTransportGateway(TransportGateway):
         if queue:
             messages = queue.popleft()
             cursor = after
-            if messages:
+            if messages and isinstance(messages[-1], dict):
                 last_id = messages[-1].get("message_id")
                 cursor = str(last_id) if last_id is not None else after
             return GetResult(messages=messages, cursor=cursor, http_status=200)

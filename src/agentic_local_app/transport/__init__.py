@@ -12,8 +12,13 @@ implementations are **providers** chosen by ``transport.provider`` through the
 - any ``package.module:ClassName`` or entry point of the ``agentic_local_app.transports`` group.
 
 HTTP providers share :class:`~agentic_local_app.transport.http_base.HttpProviderBase` (httpx
-client, gzip, polling GET, error table, in-flight abandonment). Importing this package registers
-the built-in providers.
+client, gzip, polling GET, error table, in-flight abandonment).
+
+A **message codec** (ADR-021, :mod:`~agentic_local_app.transport.codecs`) chosen by
+``transport.codec`` through the :class:`~agentic_local_app.transport.codecs.CodecRegistry`
+converts the raw shape of a model's replies (text, chat completion, tool call) into protocol
+envelopes and back; :class:`~agentic_local_app.transport.codecs.CodecTransport` applies it around
+any provider. Importing this package registers the built-in providers and codecs.
 """
 
 from agentic_local_app.transport.base import (
@@ -26,6 +31,16 @@ from agentic_local_app.transport.base import (
     PostAck,
     TransportGateway,
 )
+from agentic_local_app.transport.codecs import (
+    CodecError,
+    CodecRegistry,
+    CodecTransport,
+    JsonTextCodec,
+    MessageCodec,
+    PassthroughCodec,
+    ToolCallCodec,
+    apply_codec,
+)
 from agentic_local_app.transport.fake import FakeTransportGateway, FakeTransportProvider
 from agentic_local_app.transport.http_base import HttpCall, HttpProviderBase, InvalidResponseError
 from agentic_local_app.transport.providers.generic_http import (
@@ -33,13 +48,16 @@ from agentic_local_app.transport.providers.generic_http import (
     HttpTransportGateway,
 )
 from agentic_local_app.transport.providers.templated_http import TemplatedHttpProvider
-from agentic_local_app.transport.registry import ProviderInfo, TransportRegistry
+from agentic_local_app.transport.registry import PluginInfo, ProviderInfo, TransportRegistry
 
 __all__ = [
     "OP_CLOSE",
     "OP_GET",
     "OP_INIT",
     "OP_POST",
+    "CodecError",
+    "CodecRegistry",
+    "CodecTransport",
     "FakeTransportGateway",
     "FakeTransportProvider",
     "GenericHttpProvider",
@@ -49,9 +67,15 @@ __all__ = [
     "HttpTransportGateway",
     "InFlightGuard",
     "InvalidResponseError",
+    "JsonTextCodec",
+    "MessageCodec",
+    "PassthroughCodec",
+    "PluginInfo",
     "PostAck",
     "ProviderInfo",
     "TemplatedHttpProvider",
+    "ToolCallCodec",
     "TransportGateway",
     "TransportRegistry",
+    "apply_codec",
 ]

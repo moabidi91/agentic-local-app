@@ -1,6 +1,6 @@
 # ADR-020 — Transport enfichable : providers choisis par configuration
 
-**Statut** : accepté (2026-09-18) — amende [ADR-004](ADR-004-contrat-de-transport.md)
+**Statut** : accepté (2026-09-18) — amende [ADR-004](ADR-004-contrat-de-transport.md) ; complété par [ADR-021](ADR-021-codec-de-messages-par-modele.md) (codec de messages : la forme brute des réponses d'un modèle, orthogonale au provider)
 
 ## Contexte
 

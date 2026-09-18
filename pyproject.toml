@@ -36,6 +36,12 @@ generic_http = "agentic_local_app.transport.providers.generic_http:GenericHttpPr
 templated_http = "agentic_local_app.transport.providers.templated_http:TemplatedHttpProvider"
 fake = "agentic_local_app.transport.fake:FakeTransportProvider"
 
+# Message codecs (ADR-021): the same mechanism for the codec selected by transport.codec.
+[project.entry-points."agentic_local_app.codecs"]
+passthrough = "agentic_local_app.transport.codecs.passthrough:PassthroughCodec"
+json_text = "agentic_local_app.transport.codecs.json_text:JsonTextCodec"
+tool_call = "agentic_local_app.transport.codecs.tool_call:ToolCallCodec"
+
 [build-system]
 requires = ["hatchling>=1.24"]
 build-backend = "hatchling.build"

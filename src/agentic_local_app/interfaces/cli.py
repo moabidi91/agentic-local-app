@@ -3,7 +3,8 @@
 Commands: ``run`` (a session in-process, live display, **Ctrl-C = interruption**), ``serve`` (the
 HTTP API), ``status`` / ``sessions`` / ``interrupt`` / ``audit verify`` (clients of the API),
 ``config show`` / ``config validate``, ``transport list`` / ``transport show`` (the pluggable
-transport providers of ADR-020), ``mock-server`` (the scripted model), ``version``.
+transport providers of ADR-020; ``show`` also names the effective message codec), ``codec list`` /
+``codec show`` (the message codecs of ADR-021), ``mock-server`` (the scripted model), ``version``.
 
 Everything external is injectable through :class:`CliDependencies` (``ctx.obj``): the application
 factory (``orchestration.wiring.build_application``, imported lazily so that this module never
@@ -46,8 +47,8 @@ from agentic_local_app.domain.states import SessionState
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
 from agentic_local_app.testing.mock_model_server import run_mock_server
-from agentic_local_app.transport.base import validate_options
-from agentic_local_app.transport.registry import TransportRegistry
+from agentic_local_app.transport.codecs import CodecRegistry
+from agentic_local_app.transport.registry import PluginInfo, PluginRegistry, TransportRegistry
 
 __all__ = [
     "CLI_SUBSCRIBER_NAME",
@@ -103,11 +104,13 @@ app = typer.Typer(
 config_app = typer.Typer(help="Show or validate the effective configuration (config.toml).")
 audit_app = typer.Typer(help="Audit chain tools.")
 transport_app = typer.Typer(
-    help="Transport providers: list the available ones, show the effective one."
+    help="Transport providers: list the available ones, show the effective one (and its codec)."
 )
+codec_app = typer.Typer(help="Message codecs: list the available ones, show the effective one.")
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
 app.add_typer(transport_app, name="transport")
+app.add_typer(codec_app, name="codec")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", help="Path of config.toml (else AGENTIC_APP_CONFIG).")
@@ -771,14 +774,11 @@ def config_validate(ctx: typer.Context, config: ConfigOption = None) -> None:
 
 
 # ================================================================================================
-# transport list · transport show (ADR-020)
+# transport list · transport show (ADR-020) · codec list · codec show (ADR-021)
 # ================================================================================================
-@transport_app.command("list")
-def transport_list(json_output: JsonOption = False) -> None:
-    """List the selectable transport providers (name, class, origin)."""
+def _print_plugin_table(infos: list[PluginInfo], json_output: bool) -> None:
     rows = [
-        {"name": info.name, "class": info.qualified_name, "origin": info.origin}
-        for info in TransportRegistry.list_providers()
+        {"name": info.name, "class": info.qualified_name, "origin": info.origin} for info in infos
     ]
     if json_output:
         typer.echo(json.dumps(rows, indent=2, sort_keys=True))
@@ -790,33 +790,85 @@ def transport_list(json_output: JsonOption = False) -> None:
         typer.echo("  ".join(row[key].ljust(widths[key]) for key in columns).rstrip())
 
 
-@transport_app.command("show")
-def transport_show(
-    ctx: typer.Context, config: ConfigOption = None, json_output: JsonOption = False
-) -> None:
-    """Show the effective transport provider and its options (secrets masked)."""
-    cfg = _load(_config_path(ctx, config))
+def _describe_plugin(
+    registry: type[PluginRegistry[Any]], spec: str, options: dict[str, Any], masked: Any
+) -> dict[str, Any]:
+    """Resolve ``spec`` and validate ``options``; a ``ConfigError`` ends the command (exit 1)."""
     try:
-        info, provider = TransportRegistry.describe(cfg.transport.provider)
-        validate_options(provider, cfg.transport.options)
+        info, plugin = registry.describe(spec)
+        registry.validate(plugin, options)
     except ConfigError as exc:
         for line in _config_error_lines(exc):
             typer.echo(line, err=True)
         raise typer.Exit(EXIT_FAILED) from None
-    options_model = getattr(provider, "options_model", None)
-    masked = cfg.masked()["transport"]
-    document = {
-        "provider": cfg.transport.provider,
+    options_model = getattr(plugin, "options_model", None)
+    return {
         "class": info.qualified_name,
         "origin": info.origin,
         "options_model": options_model.__name__ if options_model is not None else None,
-        "options": masked["options"],
+        "options": masked,
+    }
+
+
+def _codec_document(cfg: AppConfig) -> dict[str, Any]:
+    masked = cfg.masked()["transport"]["codec_options"]
+    codec = cfg.transport.codec
+    return {
+        "codec": codec,
+        **_describe_plugin(CodecRegistry, codec, cfg.transport.codec_options, masked),
+    }
+
+
+@transport_app.command("list")
+def transport_list(json_output: JsonOption = False) -> None:
+    """List the selectable transport providers (name, class, origin)."""
+    _print_plugin_table(TransportRegistry.list_providers(), json_output)
+
+
+@transport_app.command("show")
+def transport_show(
+    ctx: typer.Context, config: ConfigOption = None, json_output: JsonOption = False
+) -> None:
+    """Show the effective transport provider, its options (secrets masked) and its codec."""
+    cfg = _load(_config_path(ctx, config))
+    masked = cfg.masked()["transport"]
+    provider = cfg.transport.provider
+    document: dict[str, Any] = {
+        "provider": provider,
+        **_describe_plugin(TransportRegistry, provider, cfg.transport.options, masked["options"]),
+        "codec": _codec_document(cfg),
         "transport": masked,
     }
     if json_output:
         typer.echo(json.dumps(document, indent=2, sort_keys=True, default=str))
         return
     for key in ("provider", "class", "origin", "options_model"):
+        typer.echo(f"{key}: {_value(document[key])}")
+    typer.echo(f"options: {json.dumps(document['options'], indent=2, sort_keys=True)}")
+    codec = document["codec"]
+    for key in ("codec", "class", "origin", "options_model"):
+        label = "codec" if key == "codec" else f"codec_{key}"
+        typer.echo(f"{label}: {_value(codec[key])}")
+    typer.echo(f"codec_options: {json.dumps(codec['options'], indent=2, sort_keys=True)}")
+
+
+@codec_app.command("list")
+def codec_list(json_output: JsonOption = False) -> None:
+    """List the selectable message codecs (name, class, origin)."""
+    _print_plugin_table(CodecRegistry.list_codecs(), json_output)
+
+
+@codec_app.command("show")
+def codec_show(
+    ctx: typer.Context, config: ConfigOption = None, json_output: JsonOption = False
+) -> None:
+    """Show the effective message codec and its options (secrets masked)."""
+    cfg = _load(_config_path(ctx, config))
+    document = _codec_document(cfg)
+    if json_output:
+        typer.echo(json.dumps(document, indent=2, sort_keys=True, default=str))
+        return
+    for key in ("codec", "class", "origin", "options_model"):
         typer.echo(f"{key}: {_value(document[key])}")
     typer.echo(f"options: {json.dumps(document['options'], indent=2, sort_keys=True)}")
 

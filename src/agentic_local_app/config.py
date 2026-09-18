@@ -27,6 +27,8 @@ ENV_PREFIX = "AGENTIC__"
 DEFAULT_CONFIG_FILENAME = "config.toml"
 #: The default transport provider (ADR-020): the ADR-004 contract over httpx.
 DEFAULT_TRANSPORT_PROVIDER = "generic_http"
+#: The default message codec (ADR-021): identity, the transport already yields protocol envelopes.
+DEFAULT_CODEC = "passthrough"
 #: Marker of an environment reference inside a provider option (``${env:VAR}``, ADR-020).
 ENV_REFERENCE_MARKER = "${env:"
 #: Option keys whose values are always masked by :meth:`AppConfig.masked` (substring match).
@@ -46,14 +48,18 @@ class AppSection(_Section):
 
 
 class TransportSection(_Section):
-    """ADR-004 (endpoints, token, user id, timeouts) and ADR-020 (pluggable provider).
+    """ADR-004 (endpoints, token, user id, timeouts), ADR-020 (pluggable provider) and ADR-021
+    (message codec per model).
 
     URL templates accept ``{conversation_id}`` and ``{after}`` placeholders. ``provider`` selects
     the implementation by configuration only: a registered name (``generic_http``,
     ``templated_http``, ``fake``), an entry point of the ``agentic_local_app.transports`` group or
     an import path ``package.module:ClassName``. ``options`` is the provider-specific sub-table,
     validated by the provider itself (``options_model``); ``close_method`` is the HTTP method of
-    ``close_url`` for ``generic_http``.
+    ``close_url`` for ``generic_http``. ``codec`` selects, the same way (registered name,
+    ``agentic_local_app.codecs`` entry point, import path), the codec converting the raw shape of
+    the model's replies into protocol envelopes and back (``passthrough`` = identity, the
+    transport is used bare); ``codec_options`` is its own sub-table.
     """
 
     init_url: str = "http://127.0.0.1:9000/v1/conversations"
@@ -71,6 +77,9 @@ class TransportSection(_Section):
     provider: str = DEFAULT_TRANSPORT_PROVIDER
     close_method: Literal["POST", "DELETE"] = "POST"
     options: dict[str, Any] = Field(default_factory=dict)
+    # ADR-021
+    codec: str = DEFAULT_CODEC
+    codec_options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("provider")
     @classmethod
@@ -78,6 +87,14 @@ class TransportSection(_Section):
         value = value.strip()
         if not value:
             raise ValueError("must name a transport provider")
+        return value
+
+    @field_validator("codec")
+    @classmethod
+    def _codec_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must name a message codec")
         return value
 
     @field_validator("post_url", "get_url")
@@ -209,13 +226,15 @@ class AppConfig(BaseModel):
     def masked(self) -> dict[str, Any]:
         """Effective configuration as a dict with the token masked (for ``config show`` / ``/config``).
 
-        Provider options (ADR-020) are masked with a simple guard: any value containing an
-        environment reference (``${env:...}``) and any value under a key that looks secret
-        (``*key*``, ``*token*``, ``*secret*``, ``*password*``, ``*authorization*``) becomes ``***``.
+        Provider options (ADR-020) and codec options (ADR-021) are masked with a simple guard:
+        any value containing an environment reference (``${env:...}``) and any value under a key
+        that looks secret (``*key*``, ``*token*``, ``*secret*``, ``*password*``,
+        ``*authorization*``) becomes ``***``.
         """
         data = self.model_dump()
         data["transport"]["token"] = MASK if self.transport.token else None
         data["transport"]["options"] = mask_options(self.transport.options)
+        data["transport"]["codec_options"] = mask_options(self.transport.codec_options)
         return data
 
 

@@ -36,6 +36,9 @@ A body leaf whose whole value is ``"{message_json}"`` or ``"{metadata_json}"``
 receives the object itself; inside a longer string these two become canonical JSON text. Only
 string leaves are substituted, other leaves pass through. A placeholder used by an operation that
 does not provide it is rejected when the options are validated (``TRANSPORT_OPTIONS_INVALID``).
+When a message codec (ADR-021) posts the **text** form of a message, ``{message_json}`` receives
+that text, ``{message_id}`` and ``{message_type}`` are empty, and the acknowledgement's
+``message_id`` comes from ``message_id_path`` or is restored by the codec decorator.
 
 **Environment** — ``${env:VAR}`` anywhere (URL, headers, body leaves) is replaced by the variable
 at call time (never stored); a missing variable is ``ConfigError(TRANSPORT_ENV_MISSING)``, as is
@@ -412,15 +415,15 @@ class TemplatedHttpProvider(HttpProviderBase):
             {
                 P_CONVERSATION_ID: remote_conversation_id,
                 P_MESSAGE_JSON: payload,
-                P_MESSAGE_ID: payload.get("message_id"),
-                P_MESSAGE_TYPE: payload.get("type"),
+                P_MESSAGE_ID: _payload_field(payload, "message_id"),
+                P_MESSAGE_TYPE: _payload_field(payload, "type"),
             },
             parse_json=template.accepted_path is not None or template.message_id_path is not None,
         )
 
     def parse_post(self, status: int, body: Any, *, payload: dict[str, Any]) -> PostAck:
         template = self._templates.post
-        sent_id = payload.get("message_id")
+        sent_id = _payload_field(payload, "message_id")
         if template.accepted_path is not None:
             accepted = extract_path(body, template.accepted_path)
             if not isinstance(accepted, bool):
@@ -520,6 +523,12 @@ class TemplatedHttpProvider(HttpProviderBase):
             frozenset(template.expected_statuses),
             parse_json=parse_json,
         )
+
+
+def _payload_field(payload: Any, key: str) -> Any:
+    """A field of the posted payload when it is the protocol envelope; ``None`` when a codec
+    (ADR-021, ``outbound = "text"``) handed over another form, such as canonical JSON text."""
+    return payload.get(key) if isinstance(payload, Mapping) else None
 
 
 def _as_identifier(value: Any, path: str) -> str:

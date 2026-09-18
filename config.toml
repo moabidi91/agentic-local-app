@@ -16,7 +16,7 @@ log_level = "INFO"
 env_file = ".env"            # chargé au démarrage, sans écraser les variables déjà définies
 
 # --------------------------------------------------------------------------------------------
-# Transport vers le modèle distant (ADR-004, ADR-020). Placeholders : {conversation_id}, {after}
+# Transport vers le modèle distant (ADR-004, ADR-020, ADR-021). Placeholders : {conversation_id}, {after}
 # --------------------------------------------------------------------------------------------
 [transport]
 provider  = "generic_http"              # implémentation (ADR-020) : generic_http (contrat ADR-004),
@@ -24,6 +24,13 @@ provider  = "generic_http"              # implémentation (ADR-020) : generic_ht
                                         # fake (double scripté, aucun réseau), un entry point du
                                         # groupe agentic_local_app.transports, ou "paquet.module:Classe"
                                         # (`agentic-app transport list` / `transport show`)
+codec     = "passthrough"               # codec de messages (ADR-021) : forme brute des réponses du
+                                        # modèle -> enveloppes protocolaires, et inversement en sortie.
+                                        # passthrough (identité : le transport rend déjà des enveloppes),
+                                        # json_text (texte contenant le JSON du message, prose et
+                                        # clôtures Markdown tolérées), tool_call (arguments d'un appel
+                                        # d'outil), un entry point du groupe agentic_local_app.codecs,
+                                        # ou "paquet.module:Classe" (`agentic-app codec list` / `codec show`)
 init_url  = "http://127.0.0.1:9000/v1/conversations"
 post_url  = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages"
 get_url   = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages?after={after}"
@@ -70,6 +77,42 @@ verify_tls = true
 # [transport.options.close]                                 # optionnel : absent => fermeture locale seulement
 # method = "DELETE"
 # url = "https://api.example.com/v1/threads/{conversation_id}"
+
+# Options propres au codec (ADR-021) : aucune pour passthrough. Exemple complet pour une API de
+# type chat-completions : le modèle répond par du texte (JSON du message entouré de prose ou de
+# clôtures ```json), lu au chemin content_path de chaque élément rendu par le transport ; les
+# messages sortants lui sont envoyés en texte (JSON canonique) dans le corps du POST.
+#
+# [transport]
+# provider = "templated_http"
+# codec = "json_text"
+# [transport.codec_options]
+# content_path = "choices[0].message.content"   # élément brut = objet ; absent => chaînes nues
+# strip_code_fences = true                       # première clôture ```json ... ``` (ou ``` ... ```)
+# extract_first_json_object = true               # premier objet/tableau JSON équilibré ; false = tout le texte
+# id_path = "id"                                 # optionnel : message_id pris là s'il manque à l'enveloppe
+# conversation_id_fallback = true                # false : conversation_id manquant refusé par le codec
+# outbound = "text"                              # "object" (défaut) | "text" = canonical_json(message)
+# [transport.options]
+# headers = { "Authorization" = "Bearer ${env:MY_MODEL_KEY}" }
+# [transport.options.init]
+# url = "https://api.example.com/v1/threads"
+# body = { instructions = "{instructions}", user = "{user_id}" }
+# conversation_id_path = "id"
+# [transport.options.post]
+# url = "https://api.example.com/v1/threads/{conversation_id}/chat/completions"
+# body = { messages = [{ role = "user", content = "{message_json}" }] }   # content reçoit le texte
+# [transport.options.get]
+# url = "https://api.example.com/v1/threads/{conversation_id}/completions?since={after}"
+# messages_path = "data"                         # chaque élément est l'objet chat-completion brut
+# cursor_path = "next_cursor"
+#
+# Codec tool_call (le modèle répond par un appel d'outil dont les arguments sont le message) :
+# [transport.codec_options]
+# arguments_path = "choices[0].message.tool_calls[0].function.arguments"   # défaut : "arguments"
+# name_path = "choices[0].message.tool_calls[0].function.name"             # optionnel
+# tool_name = "send_message"                     # optionnel : tout autre outil est refusé
+# id_path = "choices[0].message.tool_calls[0].id"
 
 # --------------------------------------------------------------------------------------------
 # Exécution des commandes (ADR-003, ADR-008, ADR-018)

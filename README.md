@@ -181,6 +181,10 @@ uv run agentic-app config show
 # 5. choisir l'implémentation du transport (ADR-020) : lister les providers, voir l'effectif
 uv run agentic-app transport list
 uv run agentic-app transport show
+
+# 6. choisir le codec de messages (ADR-021) : lister les codecs, voir l'effectif
+uv run agentic-app codec list
+uv run agentic-app codec show
 ```
 
 Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence.
@@ -213,6 +217,29 @@ messages_path = "items"
 
 `agentic-app transport show` affiche le provider effectif, sa classe et ses options avec les secrets masqués ; un provider inconnu ou des options invalides sont refusés au démarrage avec un message explicite.
 
+**Choisir un codec.** Le provider parle l'API ; le **codec** parle le modèle ([ADR-021](docs/adr/ADR-021-codec-de-messages-par-modele.md)). Un modèle réel ne rend pas ses réponses sous forme d'enveloppes protocolaires : il rend du texte où le JSON du message est entouré de prose ou de clôtures ```` ```json ````, un objet *chat completion*, ou un appel d'outil. `transport.codec` désigne la conversion appliquée autour du transport, dans les deux sens, sans rien changer à l'orchestration :
+
+| `transport.codec` | Quand | `[transport.codec_options]` |
+|---|---|---|
+| `passthrough` (défaut) | le transport rend déjà des enveloppes (contrat ADR-004, ou `templated_http` avec `message_path`) | aucune ; le transport n'est pas enveloppé |
+| `json_text` | le modèle répond par du texte contenant le JSON du message | `content_path` (le texte dans un objet, ex. `choices[0].message.content` ; absent = chaînes nues), `strip_code_fences`, `extract_first_json_object`, `id_path` (`message_id` s'il manque), `conversation_id_fallback`, `outbound = "object"` ou `"text"` (le message part en JSON canonique) |
+| `tool_call` | le modèle répond par un appel d'outil dont les arguments sont le message | `arguments_path`, `name_path` + `tool_name`, `id_path`, `conversation_id_fallback`, `outbound` |
+| `paquet.module:Classe` ou un entry point `agentic_local_app.codecs` | un codec écrit en dehors du dépôt (classe concrète de `MessageCodec`) | ses propres options, validées par son `options_model` |
+
+```toml
+[transport]
+provider = "templated_http"
+codec = "json_text"
+[transport.codec_options]
+content_path = "choices[0].message.content"
+outbound = "text"
+[transport.options.post]
+url = "https://api.example.com/v1/threads/{conversation_id}/chat/completions"
+body = { messages = [{ role = "user", content = "{message_json}" }] }   # content reçoit le texte
+```
+
+Une réponse que le codec ne sait pas lire (pas de JSON, JSON invalide, chemin absent) est un échec `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY`, jamais rejoué, dont le `FailureRecord` garde un extrait de la forme brute (`excerpt`) et la raison ; `agentic-app codec show` affiche le codec effectif et ses options. L'exemple complet (init, post, get, options du codec) est commenté dans `config.toml`.
+
 Les routes de l'API sont listées dans [docs/phases/phase-09-interfaces.md](docs/phases/phase-09-interfaces.md) et [ADR-018](docs/adr/ADR-018-api-pour-un-front-et-flux-live.md).
 
 ## 8. Feuille de route (ordre imposé par la spec §20)
@@ -230,7 +257,7 @@ flowchart LR
     P10 --> P9[Phase 9<br/>Orchestration complète]
 ```
 
-Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md). **État : les 10 phases sont livrées et vertes** (2 317 tests, couverture 97 %, Python 3.11/3.12, Linux + Windows).
+Chaque phase a une **gate** : sa suite de tests doit être entièrement verte avant d'ouvrir la suivante. L'état d'avancement est tenu dans [`docs/phases/README.md`](docs/phases/README.md). **État : les 10 phases sont livrées et vertes** (2 450 tests, couverture 97 %, Python 3.11/3.12, Linux + Windows).
 
 ## 9. Périmètre de la v1 — à lire avant de lancer l'application sur une vraie machine
 

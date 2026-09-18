@@ -35,15 +35,22 @@ src/agentic_local_app/
 │   └── plan_runner.py             PlanRunner : DAG, locks, workers, stop conditions, drain     [phase 5]
 ├── interruption/
 │   └── handler.py                 InterruptionHandler (jeton = CancellationToken par session)   [phase 6]
-├── transport/                     ADR-020 : providers choisis par configuration
-│   ├── base.py                    TransportGateway (ABC), PostAck, GetResult, InFlightGuard, OP_*  [phase 7]
+├── transport/                     ADR-020 : providers choisis par configuration ; ADR-021 : codecs
+│   ├── base.py                    TransportGateway (ABC), PostAck, GetResult, InFlightGuard, OP_*, validate_options  [phase 7]
 │   ├── http_base.py               HttpProviderBase (template method httpx), HttpCall, InvalidResponseError
-│   ├── registry.py                TransportRegistry : register / names / resolve / create, entry points
+│   ├── registry.py                PluginRegistry (base générique) + TransportRegistry : register / names / resolve / create, entry points
 │   ├── providers/
 │   │   ├── generic_http.py        GenericHttpProvider = HttpTransportGateway (contrat ADR-004)
 │   │   └── templated_http.py      TemplatedHttpProvider + TemplatedOptions (API décrite par options)
+│   ├── codecs/                    ADR-021 : forme brute des réponses d'un modèle <-> enveloppes protocolaires
+│   │   ├── base.py                MessageCodec (ABC), CodecError (UNPARSEABLE_REPLY), excerpt_of
+│   │   ├── registry.py            CodecRegistry (PluginRegistry) : entry points agentic_local_app.codecs, CODEC_*
+│   │   ├── decorator.py           CodecTransport (TransportGateway décoré), apply_codec
+│   │   ├── passthrough.py         PassthroughCodec (« passthrough », identité, défaut)
+│   │   ├── json_text.py           JsonTextCodec + JsonTextOptions (texte, prose, clôtures Markdown), extraction JSON
+│   │   └── tool_call.py           ToolCallCodec + ToolCallOptions (arguments d'un appel d'outil)
 │   ├── gateway.py                 façade de compatibilité : réexporte base.* et HttpTransportGateway
-│   └── fake.py                    FakeTransportGateway (scénarios scriptés), FakeTransportProvider (« fake »)
+│   └── fake.py                    FakeTransportGateway (scénarios scriptés, éléments bruts admis), FakeTransportProvider (« fake »)
 ├── resilience/
 │   ├── failure_manager.py         FailureManager : classify(), decide()                         [phase 7]
 │   ├── retry_controller.py        RetryController : backoff borné déterministe
@@ -63,7 +70,7 @@ src/agentic_local_app/
 │   ├── recovery.py                RecoveryCoordinator + RecoveryReport
 │   └── wiring.py                  build_application(config) : assemble tout (injection)
 ├── interfaces/
-│   ├── cli.py                     typer : run / serve / status / config / transport / mock-server [phase 9]
+│   ├── cli.py                     typer : run / serve / status / config / transport / codec / mock-server [phase 9]
 │   └── http_api.py                FastAPI : REST + SSE (ADR-018)
 └── testing/
     ├── fake_executor.py           FakeCommandExecutor (sorties, délais, annulation simulés)     [phase 4]
@@ -80,10 +87,12 @@ tests/
 │   ├── test_phase6_interruption.py
 │   ├── test_phase7_transport_failures.py
 │   ├── test_phase7_providers.py   registre, HttpProviderBase, generic_http, templated_http, câblage (ADR-020)
+│   ├── test_phase7_codecs.py      codecs, extraction JSON, CodecTransport, CodecRegistry, câblage, CLI (ADR-021)
 │   ├── test_phase8_context_rotation.py
 │   └── test_phase10_observability.py
 └── integration/
-    └── test_phase9_orchestration.py
+    ├── test_phase9_orchestration.py
+    └── test_phase9_orchestration_codec.py   la boucle à travers un codec : texte clôturé, UNPARSEABLE_REPLY, rotation
 ```
 
 Un fichier de tests par phase peut être découpé en plusieurs (`test_phase7_transport.py`, `test_phase7_resilience.py`…) tant que le préfixe `test_phaseN_` et le marqueur `@pytest.mark.phaseN` sont conservés.
@@ -104,7 +113,7 @@ flowchart TB
 
 1. `domain` ne dépend de rien d'autre que pydantic et la bibliothèque standard.
 2. Personne n'importe `interfaces` ni `orchestration` en dehors d'eux-mêmes.
-3. `persistence`, `execution.executor`, `transport` sont des **frontières** : une ABC + une implémentation réelle + un double. Le reste du code ne connaît que l'ABC. Pour `transport`, l'implémentation réelle est le **provider** choisi par `transport.provider` (ADR-020) : les providers dérivent de l'ABC (le plus souvent via `HttpProviderBase`), sont résolus par `TransportRegistry` (nom enregistré, `paquet.module:Classe`, entry point `agentic_local_app.transports`) et instanciés par `build_application` ; ajouter un provider ne modifie ni l'ABC ni les providers existants.
+3. `persistence`, `execution.executor`, `transport` sont des **frontières** : une ABC + une implémentation réelle + un double. Le reste du code ne connaît que l'ABC. Pour `transport`, l'implémentation réelle est le **provider** choisi par `transport.provider` (ADR-020) : les providers dérivent de l'ABC (le plus souvent via `HttpProviderBase`), sont résolus par `TransportRegistry` (nom enregistré, `paquet.module:Classe`, entry point `agentic_local_app.transports`) et instanciés par `build_application` ; ajouter un provider ne modifie ni l'ABC ni les providers existants. Le **codec** choisi par `transport.codec` (ADR-021) est orthogonal au provider : `build_application` enveloppe le transport dans `CodecTransport` (lui-même `TransportGateway`) sauf pour `passthrough` ; un codec est pur et ne connaît ni le provider ni l'orchestrateur, qui ne le connaissent pas non plus.
 4. Aucune horloge (`datetime.now`, `time.*`) ni aléa (`uuid4`, `random`) en dehors de `domain/clock.py`, `domain/ids.py` et du `jitter` optionnel de `RetryController` (test d'inspection en phase 10).
 5. Toute transition d'état passe par `domain.transitions.assert_transition` puis est **persistée avant publication** (ADR-015).
 
@@ -125,7 +134,11 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | `HttpTransportGateway(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` (= `GenericHttpProvider`, ADR-020) | `async init_conversation(instructions, metadata) -> str` · `async post_message(remote_conversation_id, payload) -> PostAck` · `async get_messages(remote_conversation_id, after) -> GetResult` · `async wait_for_reply(remote_conversation_id, after) -> GetResult` (polling borné, `MODEL_GET_TIMEOUT`) · `async close_conversation(remote_conversation_id)` · `abandon()` |
 | `HttpProviderBase(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` (ABC, ADR-020) | toute l'ABC `TransportGateway` + points d'extension : `headers(operation) -> dict` · `build_init(instructions, metadata) -> HttpCall` · `parse_init(status, body) -> str` · `build_post(remote_conversation_id, payload) -> HttpCall` · `parse_post(status, body, *, payload) -> PostAck` · `build_get(remote_conversation_id, after) -> HttpCall` · `parse_get(status, body) -> GetResult` · `build_close(remote_conversation_id) -> HttpCall \| None` · `classify_error(operation, status, body, headers) -> TransportError` · `redact_url(url) -> str` · attribut de classe `options_model` |
 | `TemplatedHttpProvider(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` | `HttpProviderBase` piloté par `TemplatedOptions` (`options_model`) : `headers` communs, `init` / `post` / `get` / `close` (`method`, `url`, `headers`, `body`, `expected_statuses`, `conversation_id_path`, `accepted_path`, `message_id_path`, `messages_path`, `message_path`, `cursor_path`) |
-| `TransportRegistry` (classe, état de processus) | `register(name)` (décorateur de classe) · `names() -> list[str]` · `list_providers() -> list[ProviderInfo]` · `resolve(spec) -> type[TransportGateway]` · `describe(spec) -> (ProviderInfo, type)` · `create(config, *, clock, **kwargs) -> TransportGateway` |
+| `TransportRegistry` (classe, état de processus ; `PluginRegistry[TransportGateway]`) | `register(name)` (décorateur de classe) · `names() -> list[str]` · `list_providers() -> list[PluginInfo]` · `resolve(spec) -> type[TransportGateway]` · `describe(spec) -> (PluginInfo, type)` · `validate(provider, options) -> BaseModel \| None` · `create(config, *, clock, **kwargs) -> TransportGateway` |
+| `MessageCodec(options=None)` (ABC, ADR-021) | `decode_inbound(raw_messages: list[Any]) -> list[dict]` · `encode_outbound(payload: dict) -> Any` (défaut : identité) · `error(index, raw, reason, **details) -> CodecError` · attributs de classe `options_model`, `name` ; `CodecError(*, codec, index, excerpt, reason, **details)` = `TransportError(MODEL_PROTOCOL_ERROR, UNPARSEABLE_REPLY)` · `with_details(**more)` |
+| `PassthroughCodec()` · `JsonTextCodec(JsonTextOptions)` · `ToolCallCodec(ToolCallOptions)` | les codecs intégrés (`passthrough`, `json_text`, `tool_call`) ; `json_text.py` expose aussi `find_json_spans(text)`, `extract_first_json(text)`, `strip_code_fence(text)`, `envelopes_of(...)`, `complete_envelope(...)` |
+| `CodecTransport(inner: TransportGateway, codec: MessageCodec)` | toute l'ABC `TransportGateway` (encode au POST, décode au GET, délègue le reste) · `aclose()` · propriétés `inner`, `codec` ; `apply_codec(transport, codec) -> TransportGateway` (nu pour `passthrough`) |
+| `CodecRegistry` (classe ; `PluginRegistry[MessageCodec]`) | `register(name)` · `names()` · `list_codecs() -> list[PluginInfo]` · `resolve(spec)` · `describe(spec)` · `validate(codec, options)` · `create(config) -> MessageCodec` |
 | `FailureManager(config, store, bus, clock, ids, retry=None, breaker=None)` | `classify(exc) -> NormalizedError` · `decide(error, attempt, *, operation) -> Decision(kind: retry \| abort \| rotate \| fail, delay_ms, reason)` · `record(error, *, session_id, conversation_id=None, plan_id=None, task_id=None) -> FailureRecord` · `record_decision(...) -> RetryDecisionRecord` · `handle(exc, attempt, *, operation, session_id, ...) -> (NormalizedError, Decision)` · `note_success()` |
 | `RetryController(config.retry)` | `delay_ms(attempt) -> int` · `can_retry(attempt) -> bool` |
 | `CircuitBreaker(config.circuit_breaker, clock, bus)` | `allow() -> bool` · `record_success()` · `record_failure()` · `state` |
@@ -144,7 +157,7 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | Frontière | Double | Où |
 |---|---|---|
 | shell | `FakeCommandExecutor` : sorties configurables par `cmd` ou par `task_id`, délai simulé (avec `FakeClock`), échec de spawn, blocage jusqu'à annulation, tranches de sortie live | `testing/fake_executor.py` |
-| réseau | `FakeTransportGateway` : file de réponses scriptées par conversation, erreurs injectables (type, code, HTTP), latence, `init` retournant un id déterministe ; `FakeTransportProvider` la rend sélectionnable par `transport.provider = "fake"` | `transport/fake.py` |
+| réseau | `FakeTransportGateway` : file de réponses scriptées par conversation (enveloppes, ou éléments bruts pour un transport décoré par un codec), erreurs injectables (type, code, HTTP), latence, `init` retournant un id déterministe ; `FakeTransportProvider` la rend sélectionnable par `transport.provider = "fake"` | `transport/fake.py` |
 | base | `InMemoryConversationStore` (+ `fail_next_write`) | `persistence/memory.py` |
 | temps / ids | `FakeClock`, `SequentialIdGenerator` | `domain/` |
 | bus | `RecordingSubscriber` | `observability/event_bus.py` |

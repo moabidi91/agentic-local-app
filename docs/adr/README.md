@@ -26,6 +26,7 @@ Format : **Contexte** (ce que dit la spec, où ça coince) · **Décision** · *
 | [ADR-018](ADR-018-api-pour-un-front-et-flux-live.md) | API pour un front à venir : flux live SSE, lecture rapide de l'état, `config.toml` global | §3.1, §4, §3.19 | accepté |
 | [ADR-019](ADR-019-consolidation-vague-1.md) | Arbitrages de consolidation après la vague 1 (chunk ref, rotation en WARNING, transitions, bornes, coût de rotation, disjoncteur, noms, lancement, SQLite FULL, savepoints) | ADR-003/004/005/007/008/010/011/012/013/014 | accepté |
 | [ADR-020](ADR-020-transport-enfichable.md) | Transport enfichable : providers choisis par configuration (registre, base template method, `templated_http`) | §3.12, ADR-004 | accepté |
+| [ADR-021](ADR-021-codec-de-messages-par-modele.md) | Codec de messages par modèle : forme brute des réponses (texte, chat completion, appel d'outil) convertie par configuration, décorateur transparent, `UNPARSEABLE_REPLY` | §3.12, §3.5, ADR-004, ADR-020 | accepté |
 
 ## Comment contester un ADR
 
