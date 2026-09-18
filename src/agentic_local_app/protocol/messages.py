@@ -176,7 +176,8 @@ class ContextResumeRequestContent(ProtocolModel):
     original_conversation_id: str
     goal: str
     context_summary: dict[str, Any]
-    pending_message_type: str
+    # ADR-014: optional so that the §12.8 example validates; the application always sets it
+    pending_message_type: str | None = None
 
 
 class ContextResumeAckContent(ProtocolModel):
