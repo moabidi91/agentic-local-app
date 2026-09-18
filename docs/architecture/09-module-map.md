@@ -44,7 +44,8 @@ src/agentic_local_app/
 │   └── circuit_breaker.py         CircuitBreaker : CLOSED / OPEN / HALF_OPEN
 ├── context/
 │   ├── window.py                  ContextWindowMonitor (octets, seuils, erreurs)                [phase 8]
-│   └── reducer.py                 ContextReducer : build(), réduction par paliers
+│   ├── reducer.py                 ContextReducer : compose()/persist()/build(), paliers
+│   └── rotation.py                RotationCoordinator : séquence ADR-014, PendingOutbound
 ├── observability/
 │   ├── event_bus.py               EventBus, RecordingSubscriber
 │   ├── audit_log.py               AuditLog (chaîne sha256), verify()                            [phase 10]
@@ -111,14 +112,15 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | `CommandExecutor` (ABC) | `async execute(spec: CommandSpec, *, cancel: CancellationToken, on_output=None) -> RawExecution` |
 | `PayloadGuard(config.payload)` | `apply(stdout: bytes, stderr: bytes, budget: int) -> TruncatedOutput` · `fit_message(result: ExecutionResultContent, max_message_bytes) -> ExecutionResultContent` · `serve_chunk(store, session_id, ref_task_id, stream, offset, max_bytes) -> ChunkResult` · `effective_budget(task, plan_default) -> int` |
 | `ResultCollector()` | `build(plan: PlanRecord, tasks: list[TaskRecord], task_outputs: dict[str, TruncatedOutput], chunk_results: dict[str, ChunkResult]) -> ExecutionResultContent` |
-| `PlanRunner(store, bus, executor, payload_guard, clock, config, interrupt_signal)` | `async run(plan: PlanRecord, tasks: list[TaskRecord], session: SessionRecord) -> PlanOutcome` |
+| `PlanRunner(store, bus, executor, payload_guard, clock, ids, config, *, failure_manager=None)` | `async run(plan: PlanRecord, tasks: list[TaskRecord], session: SessionRecord, *, interrupt: CancellationToken) -> PlanOutcome(plan, tasks, execution_result \| None, interrupted, budget_exceeded, stop_reason)` |
 | `InterruptionHandler(store, bus, lifecycle, clock, config)` | `async interrupt(session_id) -> InterruptionReport` (borné par `interrupt_drain_timeout_ms`) · `signal: InterruptSignal` |
 | `HttpTransportGateway(config.transport, clock, *, transport=None, sleep=asyncio.sleep)` | `async init_conversation(instructions, metadata) -> str` · `async post_message(remote_conversation_id, payload) -> PostAck` · `async get_messages(remote_conversation_id, after) -> GetResult` · `async wait_for_reply(remote_conversation_id, after) -> GetResult` (polling borné, `MODEL_GET_TIMEOUT`) · `async close_conversation(remote_conversation_id)` · `abandon()` |
 | `FailureManager(config, store, bus, clock, ids, retry=None, breaker=None)` | `classify(exc) -> NormalizedError` · `decide(error, attempt, *, operation) -> Decision(kind: retry \| abort \| rotate \| fail, delay_ms, reason)` · `record(error, *, session_id, conversation_id=None, plan_id=None, task_id=None) -> FailureRecord` · `record_decision(...) -> RetryDecisionRecord` · `handle(exc, attempt, *, operation, session_id, ...) -> (NormalizedError, Decision)` · `note_success()` |
 | `RetryController(config.retry)` | `delay_ms(attempt) -> int` · `can_retry(attempt) -> bool` |
 | `CircuitBreaker(config.circuit_breaker, clock, bus)` | `allow() -> bool` · `record_success()` · `record_failure()` · `state` |
-| `ContextWindowMonitor(config.context)` | `evaluate(conversation, *, projected_outbound_bytes=0, error=None) -> ContextWindowState` |
-| `ContextReducer(config, store, clock, ids)` | `build(session, source_conversation, pending_message_type) -> ContextSummaryRecord` (lève `RotationFailedError`) |
+| `ContextWindowMonitor(config.context)` | `evaluate(conversation, *, projected_outbound_bytes=0, error=None) -> ContextWindowState` (monotone) · `should_rotate_on_unusable_reply(conversation, error) -> bool` (ADR-019 §2) · `thresholds()` · `account(conversation_bytes, message_bytes)` |
+| `ContextReducer(config, store, clock, ids)` | `compose(session, source, *, pending_message_type, target_conversation_id) -> (payload, size, step)` (pur, lève `RotationFailedError`) · `persist(...) -> ContextSummaryRecord` · `build(...) -> ContextSummaryRecord` |
+| `RotationCoordinator(config, store, bus, clock, ids, lifecycle, adapter, transport, reducer, monitor, instructions)` | `async rotate(session, source, pending: PendingOutbound(message_type, original_message_id, build)) -> RotationResult(child, source, summary, resume_cycle, retransmitted_message_id, ack_message_id)` |
 | `AuditLog(store, clock, ids)` | `handle(event) -> AuditEvent \| None` (abonné critique via `subscribe(bus)`) · `verify(session_id, *, page_size=…) -> AuditVerification` · `recompute_hash(event)` · `last(session_id)` |
 | `ExecutionTracker(store, clock)` | `handle(event)` · `subscribe(bus)` · `snapshot(session_id) -> RuntimeSnapshot` · `rebuild(session_id) -> RuntimeSnapshot` |
 | `TelemetryService(clock)` | `handle(event)` · `subscribe(bus)` · `render_text() -> str` · `metrics() -> dict` · `reset()` |
