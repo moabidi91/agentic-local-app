@@ -1979,9 +1979,25 @@ async def given_ack_not_acknowledged_when_rotation_awaits_ack_then_protocol_erro
         + resume.size_bytes
         + size_bytes(refused)  # counted even though rejected (ADR-013)
     )
-    assert [m.message_type for m in store.list_messages(child.conversation_id)] == [
-        MessageType.CONTEXT_RESUME_REQUEST
+    # the refused reply is persisted like every other protocol rejection: it is the only trace of
+    # what the model answered, and what a correction policy would quote back
+    stored = store.list_messages(child.conversation_id)
+    assert [m.message_type for m in stored] == [
+        MessageType.CONTEXT_RESUME_REQUEST,
+        MessageType.CONTEXT_RESUME_ACK,
     ]
+    assert stored[1].validation_status == "invalid"
+    assert stored[1].payload == refused
+    assert stored[1].direction is MessageDirection.INBOUND
+    assert child.last_inbound_message_id == stored[1].message_id
+    # the resume cycle never stays RUNNING behind a rotation that stops here
+    resume_cycle = store.get_cycle(child.current_cycle_id or "")
+    assert resume_cycle is not None
+    assert resume_cycle.status is CycleState.FAILED
+    assert resume_cycle.inbound_message_id == stored[1].message_id
+    ended = _only(recorder, EventType.CYCLE_ENDED)
+    assert ended.payload["status"] == "FAILED"
+    assert ended.payload["error_code"] == "ACK_NOT_ACKNOWLEDGED"
     rejected = _only(recorder, EventType.MESSAGE_REJECTED)
     assert rejected.conversation_id == child.conversation_id
     assert rejected.cycle_id == child.current_cycle_id
@@ -1993,7 +2009,6 @@ async def given_ack_not_acknowledged_when_rotation_awaits_ack_then_protocol_erro
         "error_code": "ACK_NOT_ACKNOWLEDGED",
         "size_bytes": size_bytes(refused),
     }
-    assert recorder.events[-1] is rejected
     assert recorder.of_type(EventType.MESSAGE_INBOUND) == []
     assert recorder.of_type(EventType.ROTATION_COMPLETED) == []
     assert len(transport.posted) == 1

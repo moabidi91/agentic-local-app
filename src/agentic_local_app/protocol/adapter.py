@@ -82,6 +82,8 @@ __all__ = [
     "OutboundSituation",
     "ProtocolAdapter",
     "expected_inbound_for",
+    "peek_field",
+    "rejected_payload",
     "render_instructions",
     "situation_for",
 ]
@@ -269,6 +271,36 @@ def render_instructions(config: AppConfig) -> str:
 # ------------------------------------------------------------------------------------------------
 
 
+def peek_field(raw: Any, key: str) -> Any:
+    """Best-effort read of an envelope field from an **unvalidated** reply item.
+
+    A model that answers with something other than a JSON object (a bare string, a number, a
+    list) is exactly the case the callers of this helper have to survive, so anything that is not
+    a mapping simply yields ``None``, and a non-scalar value is rendered as text (the result goes
+    into event payloads and error details, which must stay JSON-serialisable).
+    """
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get(key)
+    return value if isinstance(value, str | int | float | bool) or value is None else str(value)
+
+
+def rejected_payload(raw_messages: Sequence[Any]) -> dict[str, Any]:
+    """What is persisted as the payload of a rejected reply (``validation_status = "invalid"``).
+
+    The stored record must keep what the model actually sent — it is the only trace of the fault
+    and what a correction policy would quote back. A single JSON object is stored as is; anything
+    else (no message at all, several messages, a list, a bare string, a number) is wrapped so that
+    the record stays an object without losing the raw form.
+    """
+    if len(raw_messages) == 1:
+        single = raw_messages[0]
+        if isinstance(single, Mapping):
+            return dict(single)
+        return {"raw": single}
+    return {"messages": list(raw_messages)}
+
+
 def _remote_id(conversation: ConversationRecord) -> str:
     """The conversation id known to the model (falls back to the local id before init)."""
     return conversation.remote_conversation_id or conversation.conversation_id
@@ -423,13 +455,16 @@ class ProtocolAdapter:
     ) -> InboundMessage:
         """Validate the messages read by one GET. Exactly one is allowed per turn (ADR-007).
 
-        Raises ``ValueError`` on an empty list (the caller must not call), :class:`ProtocolError`
-        for every protocol violation. Checks run in a fixed order: count, envelope schema,
-        conversation, message id, direction, expectation, content schema, then the semantic rules
-        of the message type (plan rules of ADR-007, ack rules of ADR-014, body bound of ADR-022).
+        Every violation is a :class:`ProtocolError`, an **empty** list included: ``wait_for_reply``
+        promises at least one message, so a reply carrying none breaks the transport contract (a
+        provider whose long poll returns an empty page, ADR-020) and is handled like any other
+        unusable reply (``EMPTY_REPLY``) instead of crashing the loop. Checks run in a fixed order:
+        count, envelope schema, conversation, message id, direction, expectation, content schema,
+        then the semantic rules of the message type (plan rules of ADR-007, ack rules of ADR-014,
+        body bound of ADR-022).
         """
         if not raw_messages:
-            raise ValueError("parse_inbound requires at least one message")
+            raise ProtocolError("EMPTY_REPLY", expected=1, received=0)
         if len(raw_messages) > 1:
             raise ProtocolError(
                 "UNEXPECTED_EXTRA_MESSAGE",
@@ -517,12 +552,7 @@ class ProtocolAdapter:
     @staticmethod
     def _peek(raw: Any, key: str) -> Any:
         """Best-effort read of an envelope field from an unvalidated message (for error details)."""
-        if isinstance(raw, Mapping):
-            value = raw.get(key)
-            return (
-                value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
-            )
-        return None
+        return peek_field(raw, key)
 
     @staticmethod
     def _validate_content(envelope: Envelope, model: type[ContentT]) -> ContentT:

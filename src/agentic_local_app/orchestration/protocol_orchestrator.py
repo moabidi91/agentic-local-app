@@ -113,7 +113,13 @@ from agentic_local_app.interruption.handler import CYCLE_ENTITY, InterruptionHan
 from agentic_local_app.lifecycle.conversation_lifecycle import ConversationLifecycleManager
 from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.persistence.interface import ConversationStore
-from agentic_local_app.protocol.adapter import InboundMessage, OutboundMessage, ProtocolAdapter
+from agentic_local_app.protocol.adapter import (
+    InboundMessage,
+    OutboundMessage,
+    ProtocolAdapter,
+    peek_field,
+    rejected_payload,
+)
 from agentic_local_app.protocol.messages import (
     ExecutionResultContent,
     UserRequestContent,
@@ -738,9 +744,11 @@ class _SessionRun:
         context — it is in the model's context (ADR-013) — then ``message.rejected``."""
         o = self._o
         conv = self._conversation()
-        first: dict[str, Any] = dict(reply.messages[0]) if reply.messages else {}
-        raw_type = first.get("type")
-        raw_id = first.get("message_id")
+        # the reply may be anything the model sent: an object, a list, a bare string, nothing at
+        # all — the record must keep it without ever assuming a shape (peek_field / rejected_payload)
+        first = reply.messages[0] if reply.messages else None
+        raw_type = peek_field(first, "type")
+        raw_id = peek_field(first, "message_id")
         type_str = raw_type if isinstance(raw_type, str) else None
         id_str = raw_id if isinstance(raw_id, str) and raw_id else None
         try:
@@ -752,7 +760,7 @@ class _SessionRun:
         message_id = id_str if id_str is not None and o.store.get_message(id_str) is None else None
         if message_id is None:
             message_id = o.ids.message_id()
-        payload = first if len(reply.messages) == 1 else {"messages": list(reply.messages)}
+        payload = rejected_payload(reply.messages)
         now = o.clock.now()
         record = MessageRecord(
             message_id=message_id,

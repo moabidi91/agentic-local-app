@@ -59,7 +59,7 @@ of the rows above.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -101,7 +101,13 @@ from agentic_local_app.lifecycle.conversation_lifecycle import (
 )
 from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.persistence.interface import ConversationStore
-from agentic_local_app.protocol.adapter import InboundMessage, OutboundMessage, ProtocolAdapter
+from agentic_local_app.protocol.adapter import (
+    InboundMessage,
+    OutboundMessage,
+    ProtocolAdapter,
+    peek_field,
+    rejected_payload,
+)
 from agentic_local_app.transport.gateway import GetResult, TransportGateway
 
 __all__ = [
@@ -519,28 +525,7 @@ class RotationCoordinator:
                 expected_original_conversation_id=parent_remote,
             )
         except ProtocolError as exc:
-            child = self._lifecycle.update_conversation(
-                child.conversation_id,
-                context_bytes=self._monitor.account(child.context_bytes, received_bytes),
-                protocol_error_count=child.protocol_error_count + 1,
-                get_cursor=reply.cursor,
-                last_model_response_state=_RECEIVED_INVALID,
-            )
-            first = reply.messages[0] if reply.messages else {}
-            self._publish(
-                EventType.MESSAGE_REJECTED,
-                session_id=child.session_id,
-                conversation_id=child.conversation_id,
-                cycle_id=cycle.cycle_id,
-                payload={
-                    "message_type": _peek_str(first, "type"),
-                    "message_id": _peek_str(first, "message_id"),
-                    "get_status": reply.http_status,
-                    "validation_status": "invalid",
-                    "error_code": exc.error.error_code,
-                    "size_bytes": received_bytes,
-                },
-            )
+            self._reject_ack(reply, child, cycle, exc, received_bytes)
             raise
         now = self._clock.now()
         record = MessageRecord(
@@ -579,6 +564,97 @@ class RotationCoordinator:
             },
         )
         return ack, child
+
+    def _reject_ack(
+        self,
+        reply: GetResult,
+        child: ConversationRecord,
+        cycle: CycleRecord,
+        exc: ProtocolError,
+        received_bytes: int,
+    ) -> None:
+        """A reply that is not the expected ack: persisted, counted, published, and the resume
+        cycle closed as ``FAILED``.
+
+        The trail is the one of every other protocol rejection (orchestrator ``_persist_rejected``):
+        the faulty reply is stored with ``validation_status = "invalid"`` — it is the only trace of
+        what the model answered, and a correction policy will quote it — and the cycle opened for
+        the resume never stays ``RUNNING`` behind a session that stops here.
+        """
+        first = reply.messages[0] if reply.messages else None
+        raw_type = peek_field(first, "type")
+        raw_id = peek_field(first, "message_id")
+        type_str = raw_type if isinstance(raw_type, str) else None
+        id_str = raw_id if isinstance(raw_id, str) and raw_id else None
+        try:
+            message_type = (
+                MessageType(type_str) if type_str is not None else MessageType.SYSTEM_ERROR
+            )
+        except ValueError:
+            message_type = MessageType.SYSTEM_ERROR
+        message_id = (
+            id_str if id_str is not None and self._store.get_message(id_str) is None else None
+        )
+        if message_id is None:
+            message_id = self._ids.message_id()
+        now = self._clock.now()
+        record = MessageRecord(
+            message_id=message_id,
+            session_id=child.session_id,
+            conversation_id=child.conversation_id,
+            direction=MessageDirection.INBOUND,
+            message_type=message_type,
+            payload=rejected_payload(reply.messages),
+            size_bytes=received_bytes,
+            cycle_id=cycle.cycle_id,
+            received_at=now,
+            validation_status="invalid",
+            created_at=now,
+        )
+        failed = cycle.model_copy(
+            update={
+                "status": CycleState.FAILED,
+                "ended_at": now,
+                "inbound_message_id": record.message_id,
+            }
+        )
+        with self._store.transaction():
+            self._store.save_message(record)
+            self._store.save_cycle(failed)
+            self._lifecycle.update_conversation(
+                child.conversation_id,
+                context_bytes=self._monitor.account(child.context_bytes, received_bytes),
+                protocol_error_count=child.protocol_error_count + 1,
+                get_cursor=reply.cursor,
+                last_inbound_message_id=record.message_id,
+                last_model_response_state=_RECEIVED_INVALID,
+            )
+        self._publish(
+            EventType.MESSAGE_REJECTED,
+            session_id=child.session_id,
+            conversation_id=child.conversation_id,
+            cycle_id=cycle.cycle_id,
+            payload={
+                "message_type": type_str,
+                "message_id": id_str,
+                "get_status": reply.http_status,
+                "validation_status": "invalid",
+                "error_code": exc.error.error_code,
+                "size_bytes": received_bytes,
+            },
+        )
+        self._publish(
+            EventType.CYCLE_ENDED,
+            session_id=child.session_id,
+            conversation_id=child.conversation_id,
+            cycle_id=cycle.cycle_id,
+            payload={
+                "status": failed.status.value,
+                "duration_ms": max(0, (now - cycle.started_at) // _ONE_MS),
+                "retry_count": failed.retry_count,
+                "error_code": exc.error.error_code,
+            },
+        )
 
     def _complete_resume_cycle(self, cycle: CycleRecord, ack: InboundMessage) -> CycleRecord:
         """Step 7: the resume cycle ends when the ack is processed (ADR-007)."""
@@ -682,9 +758,3 @@ class RotationCoordinator:
                 payload=payload,
             )
         )
-
-
-def _peek_str(raw: Mapping[str, Any], key: str) -> str | None:
-    """A string field of an unvalidated message, or ``None`` (``message.rejected`` contract)."""
-    value = raw.get(key)
-    return value if isinstance(value, str) else None

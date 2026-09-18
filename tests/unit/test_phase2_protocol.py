@@ -807,11 +807,13 @@ def given_plan_with_adr_extensions_when_parsed_then_timeout_stream_default_and_s
 # =============================================================================================
 
 
-def given_no_message_when_parsed_then_value_error_not_protocol_error(
+def given_no_message_when_parsed_then_empty_reply_protocol_error(
     adapter: ProtocolAdapter,
 ) -> None:
-    with pytest.raises(ValueError):
-        _parse(adapter)
+    """``wait_for_reply`` promises at least one message: a reply carrying none is an unusable
+    reply like any other, not a crash of the loop (conformance case ``env-empty-batch``)."""
+    details = _protocol_error(lambda: _parse(adapter), "EMPTY_REPLY")
+    assert details == {"expected": 1, "received": 0}
 
 
 def given_two_messages_in_one_turn_when_parsed_then_unexpected_extra_message(
