@@ -47,10 +47,10 @@ Vagues d'exécution :
 | 3 — Persistance | [phase-03](phase-03-persistence.md) | `SqliteConversationStore`, blobs, audit append-only | `pytest -m phase3` | ✅ vert — 405 tests |
 | 4 — Exécution de tâche | [phase-04](phase-04-task-execution.md) | `CommandExecutor`, `PayloadGuard`, `ResultCollector` | `pytest -m phase4` | ✅ vert — 151 tests |
 | 5 — Exécution de plan | [phase-05](phase-05-plan-execution.md) | `PlanRunner` | `pytest -m phase5` | ✅ vert — 107 tests |
-| 6 — Interruption | [phase-06](phase-06-interruption.md) | `InterruptionHandler` | `pytest -m phase6` | ⏳ en cours |
+| 6 — Interruption | [phase-06](phase-06-interruption.md) | `InterruptionHandler` | `pytest -m phase6` | ✅ vert — 48 tests |
 | 7 — Transport & échecs | [phase-07](phase-07-transport-failures.md) | `TransportGateway`, `FailureManager`, `RetryController`, `CircuitBreaker`, serveur mock | `pytest -m phase7` | ✅ vert — 325 tests |
 | 8 — Rotation de contexte | [phase-08](phase-08-context-rotation.md) | `ContextWindowMonitor`, `ContextReducer`, `RotationCoordinator` | `pytest -m phase8` | ✅ vert — 78 tests |
-| 9 — Orchestration | [phase-09](phase-09-orchestration.md) | `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, API, CLI | `pytest -m phase9` | ⬜ à venir |
+| 9 — Orchestration | [phase-09](phase-09-orchestration.md) | `ProtocolOrchestrator`, `ConversationManager`, `RecoveryCoordinator`, API, CLI | `pytest -m phase9` | ⏳ en cours |
 | 10 — Audit & observabilité | [phase-10](phase-10-observability.md) | `AuditLog`, `ExecutionTracker`, `TelemetryService` | `pytest -m phase10` | ✅ vert — 73 tests |
 
 ## Discipline TDD appliquée à chaque phase
