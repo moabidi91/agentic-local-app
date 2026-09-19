@@ -22,6 +22,14 @@ exhausted, POSTs are still accepted but the model stays silent (the application 
 ``{conversation_id}`` replaced in every string and ``"message_id": "auto"`` replaced by
 ``mock-msg-0001``, ``mock-msg-0002``...; they become visible to GET after ``delay_ms``.
 
+**Scripting a model that gets it wrong.** ``protocol_correction_request`` is POSTed like any other
+message (ADR-023), so a step keyed on it answers the application's request for a fix. A model that
+replies wrongly ``N`` times and then correctly is therefore ``N`` steps producing the unusable
+reply — the first keyed on what it answers, the others on ``protocol_correction_request`` — then
+one last step keyed on ``protocol_correction_request`` producing the valid message;
+:func:`wrong_then_right` builds exactly that, and :func:`default_correction_scenario` (selectable
+as ``--scenario-name correction``) runs the whole loop end to end.
+
 A :class:`Fault` on a step applies ``times`` times, then normal behaviour resumes: ``on_operation``
 ``"post"`` faults the POST that would consume the step (the message is not recorded, so a retry is
 processed normally); ``"init"`` faults the init performed while the step is pending; ``"get"`` /
@@ -58,9 +66,11 @@ __all__ = [
     "Step",
     "create_mock_app",
     "default_analysis_scenario",
+    "default_correction_scenario",
     "default_java_debug_scenario",
     "load_scenario",
     "run_mock_server",
+    "wrong_then_right",
 ]
 
 OperationName = Literal["init", "post", "get", "close"]
@@ -68,6 +78,8 @@ Reply = tuple[int, dict[str, Any]]
 
 CONVERSATION_ID_PLACEHOLDER = "{conversation_id}"
 AUTO_MESSAGE_ID = "auto"
+#: The type the application POSTs to ask for a fix (ADR-023); a step keyed on it answers it.
+CORRECTION_REQUEST_TYPE = "protocol_correction_request"
 
 
 # ------------------------------------------------------------------------------------------------
@@ -542,9 +554,57 @@ def default_analysis_scenario() -> Scenario:
     return Scenario(steps=[Step(on="user_request", respond=[user_response])])
 
 
+# ------------------------------------------------------------------------------------------------
+# correction scenario: the model gets it wrong N times, then fixes itself (ADR-023)
+# ------------------------------------------------------------------------------------------------
+def wrong_then_right(
+    on: str, wrong: dict[str, Any], right: list[dict[str, Any]], *, times: int = 1
+) -> list[Step]:
+    """The steps of a model that answers ``wrong`` ``times`` times, then answers ``right``.
+
+    ADR-023: the application answers an unusable reply with a ``protocol_correction_request`` and
+    reads again, so a wrong turn is followed by a step keyed on that type. The first wrong reply
+    answers the message of type ``on`` (``user_request``, ``execution_result``...), every
+    subsequent one answers the correction request that refused the previous one, and the last step
+    finally publishes ``right``.
+
+    ``times`` is the number of **unusable** replies, so ``times = max_correction_attempts + 1``
+    scripts a model that exhausts the policy and ends the session.
+    """
+    if times < 1:
+        raise ValueError("wrong_then_right needs times >= 1")
+    steps = [Step(on=on, respond=[dict(wrong)])]
+    steps += [Step(on=CORRECTION_REQUEST_TYPE, respond=[dict(wrong)]) for _ in range(times - 1)]
+    return [*steps, Step(on=CORRECTION_REQUEST_TYPE, respond=[dict(message) for message in right])]
+
+
+def default_correction_scenario() -> Scenario:
+    """``user_request -> execution_plan`` (out of grammar: §14 expects a ``discovery_plan``) ``->
+    protocol_correction_request -> discovery_plan`` (§12.2) ``-> ... -> final_answer`` (§12.7).
+
+    The §12 loop of :func:`default_java_debug_scenario`, with one wrong turn at the start: the
+    model replies to the first ``user_request`` with an ``execution_plan``, which the row of
+    ADR-007 does not accept there. The application persists the rejection, POSTs a
+    ``protocol_correction_request`` (ADR-023) and reads again; the model then sends the
+    ``discovery_plan`` that was expected and the session completes normally — one rejected reply,
+    one correction, no cycle and no plan spent on the fault.
+    """
+    java = default_java_debug_scenario()
+    discovery_step, *rest = java.steps
+    # the execution_plan of §12.3, one turn too early: valid content, wrong type for this turn
+    out_of_grammar = rest[0].respond[0]
+    return Scenario(
+        steps=[
+            *wrong_then_right("user_request", out_of_grammar, list(discovery_step.respond)),
+            *rest,
+        ]
+    )
+
+
 #: The scenarios selectable by name (``agentic-app mock-server --scenario-name``).
 BUILTIN_SCENARIOS: Mapping[str, Callable[[], Scenario]] = {
     "java": default_java_debug_scenario,
     "analysis": default_analysis_scenario,
+    "correction": default_correction_scenario,
 }
 DEFAULT_SCENARIO_NAME = "java"

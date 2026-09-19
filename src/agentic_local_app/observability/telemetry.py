@@ -13,7 +13,8 @@ Metrics (labels in braces):
   (``rotation.completed`` / ``rotation.failed``), ``interruptions_total``
   (``interruption.requested``), ``breaker_transitions_total{to}``, ``messages_total{direction}``
   (outbound: ``message.outbound`` + ``message.retransmitted``; inbound: ``message.inbound`` +
-  ``message.rejected``), ``messages_rejected_total``, ``context_saturations_total``
+  ``message.rejected``), ``messages_rejected_total``, ``corrections_total{error_code}``
+  (``correction.requested``, ADR-023), ``context_saturations_total``
   (``context.window_state_changed`` to ``SATURATED``), ``budget_exceeded_total``;
 - histograms (fixed buckets, count, sum, min, max) — ``task_duration_ms``
   (``task.state_changed`` payload ``duration_ms``), ``cycle_duration_ms`` (``cycle.ended`` payload
@@ -209,6 +210,9 @@ class TelemetryService:
             "breaker_transitions_total": _Counter("Circuit breaker transitions, by target", "to"),
             "messages_total": _Counter("Protocol messages exchanged, by direction", "direction"),
             "messages_rejected_total": _Counter("Inbound messages rejected by the protocol"),
+            "corrections_total": _Counter(
+                "Protocol correction requests sent to the model, by refusal code", "error_code"
+            ),
             "context_saturations_total": _Counter("Context windows that became SATURATED"),
             "budget_exceeded_total": _Counter("Sessions that exceeded their budget"),
         }
@@ -269,6 +273,10 @@ class TelemetryService:
             if event_type is EventType.MESSAGE_REJECTED:
                 self._inc("messages_rejected_total")
             self._observe("message_size_bytes", payload.get("size_bytes"))
+        elif event_type is EventType.CORRECTION_REQUESTED:
+            self._inc(
+                "corrections_total", error_code=_label_value(payload.get("error_code")) or "unknown"
+            )
         elif event_type is EventType.CONTEXT_WINDOW_STATE_CHANGED:
             if target == ContextWindowState.SATURATED.value:
                 self._inc("context_saturations_total")

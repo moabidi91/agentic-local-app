@@ -6,8 +6,8 @@ conversation through the ``ConversationLifecycleManager``, hands the loop to the
 ``ProtocolOrchestrator`` as a background ``asyncio.Task``, forwards interruptions to the
 ``InterruptionHandler`` at once, and exposes the reads the API and the CLI need (records, the
 ``ExecutionTracker`` snapshot, the final answer, the model's direct responses and the last reply
-of either kind (ADR-022, read back from the messages table), the running tasks, the recovery
-report).
+of either kind (ADR-022, read back from the messages table), the correction requests sent to the
+model (ADR-023, same source), the running tasks, the recovery report).
 
 Loops are tracked per session (``loop_task``); their exceptions are never lost: the orchestrator
 reflects them in the persisted state (session ``FAILED``), the manager logs them, and ``wait``
@@ -57,7 +57,10 @@ from agentic_local_app.orchestration.protocol_orchestrator import (
 )
 from agentic_local_app.orchestration.recovery import RecoveryReport
 from agentic_local_app.persistence.interface import ConversationStore
-from agentic_local_app.protocol.messages import UserResponseContent
+from agentic_local_app.protocol.messages import (
+    ProtocolCorrectionRequestContent,
+    UserResponseContent,
+)
 
 __all__ = ["SHUTDOWN_REASON", "ConversationManager"]
 
@@ -306,6 +309,36 @@ class ConversationManager:
             **self._reply_head(last),
             "content": dict(last.payload.get("content", {})),
         }
+
+    def corrections(self, session_id: str) -> list[dict[str, Any]]:
+        """ADR-023: every ``protocol_correction_request`` of the session, oldest first, across all
+        its conversations, read back from the messages table (no dedicated column, the schema is
+        version 1). Each item: ``message_id``, ``conversation_id``, ``cycle_id``, ``created_at``,
+        ``posted_at``, ``size_bytes`` and the content fields (``error_code``, ``errors``,
+        ``expected_types``, ``reminder``, ``example``, ``attempt``, ``max_attempts``…). Empty for
+        an unknown session, or for a session where the model never had to be corrected."""
+        items: list[dict[str, Any]] = []
+        for conversation in self._store.list_conversations(session_id):
+            for message in self._store.list_messages(
+                conversation.conversation_id, direction=MessageDirection.OUTBOUND
+            ):
+                if message.message_type is not MessageType.PROTOCOL_CORRECTION_REQUEST:
+                    continue
+                dumped = message.model_dump(mode="json")
+                items.append(
+                    {
+                        "message_id": message.message_id,
+                        "conversation_id": message.conversation_id,
+                        "cycle_id": message.cycle_id,
+                        "created_at": dumped["created_at"],
+                        "posted_at": dumped["posted_at"],
+                        "size_bytes": message.size_bytes,
+                        **ProtocolCorrectionRequestContent.model_validate(
+                            message.payload["content"]
+                        ).model_dump(mode="json"),
+                    }
+                )
+        return items
 
     def _concluding_messages(self, session_id: str) -> list[MessageRecord]:
         """Valid inbound ``final_answer`` / ``user_response`` records, oldest first."""

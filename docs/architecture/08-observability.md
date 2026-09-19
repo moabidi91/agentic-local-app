@@ -38,7 +38,7 @@ Ordre d'inscription fixé au démarrage par `wiring.build_application` : `AuditL
 
 ## 2. Catalogue des événements (`EventType`)
 
-Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté sur le record par le propriétaire), `session_id` (toujours), `conversation_id`, `cycle_id`, `plan_id`, `task_id` (selon l'entité), `payload` (JSON, jamais d'octets bruts). Tous les payloads `*.state_changed` sont `state_change_payload(from, to, reason)` — `reason` absent quand non fourni. Les 31 types de [`domain/events.py`](../../src/agentic_local_app/domain/events.py) :
+Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté sur le record par le propriétaire), `session_id` (toujours), `conversation_id`, `cycle_id`, `plan_id`, `task_id` (selon l'entité), `payload` (JSON, jamais d'octets bruts). Tous les payloads `*.state_changed` sont `state_change_payload(from, to, reason)` — `reason` absent quand non fourni. Les 32 types de [`domain/events.py`](../../src/agentic_local_app/domain/events.py) :
 
 | `event_type` | Émetteur | Moment | Identifiants portés | Payload (contrat) | Audité |
 |---|---|---|---|---|---|
@@ -52,6 +52,7 @@ Enveloppe commune (`Event`) : `event_type`, `timestamp` (= horodatage persisté 
 | `message.inbound` | ProtocolOrchestrator | message reçu **et** validé | + `cycle_id` | `{message_type, message_id, size_bytes, get_status, polls, validation_status: "valid"}` | oui |
 | `message.rejected` | ProtocolOrchestrator (via ProtocolAdapter) | message reçu et refusé | + `cycle_id` | `{message_type?, message_id?, size_bytes, get_status, validation_status: "invalid", error_code, details}` | oui |
 | `message.retransmitted` | ProtocolOrchestrator | retransmission persistée après une rotation (ADR-014) | + `cycle_id` (nouveau) | `{original_message_id, new_message_id, message_type, reason: "rotation"}` | oui |
+| `correction.requested` | ProtocolOrchestrator | `protocol_correction_request` persisté **et** POSTé après une réponse inutilisable (ADR-023) | + `cycle_id` (celui du message corrigé : la correction n'en ouvre pas) | `{message_id, error_code, attempt, max_attempts, expected_types: [message_type], rejected_message_id?}` — jamais le rappel ni l'exemple, qui se relisent dans la table des messages | oui |
 | `plan.received` | ProtocolOrchestrator | plan + tâches persistés `PENDING` | + `cycle_id`, `plan_id` | `{plan_type, objective, execution_policy, max_parallel_workers, task_count, consumed_plans, contradictory_flags: [task_id]}` | oui |
 | `plan.state_changed` | PlanRunner · InterruptionHandler · RecoveryCoordinator | après chaque transition de plan | + `cycle_id`, `plan_id` | `{from, to, reason?, stop_reason?, counters: {completed, failed, skipped, cancelled, interrupted}, duration_ms?}` | oui |
 | `task.state_changed` | PlanRunner · InterruptionHandler · RecoveryCoordinator | après chaque transition de tâche | + `cycle_id`, `plan_id`, `task_id` | `{from, to, reason?}` + selon l'état : `RUNNING` → `{pid, timeout_ms_applied}` ; terminal → `{exit_code, duration_ms, timed_out, truncated, original_size_bytes}` | oui |
@@ -141,12 +142,13 @@ Structure complète (deux niveaux, ADR-006 ; les champs de §4.1 sont tous prés
   "running_task_ids": [ "t7" ],
   "model_interaction": {
     "last_outbound_message_type": "execution_result", "last_inbound_message_type": "execution_plan",
-    "last_post_status": 202, "last_get_status": 200, "last_protocol_validation_status": "valid"
+    "last_post_status": 202, "last_get_status": 200, "last_protocol_validation_status": "valid",
+    "correction_attempt": 0, "correction_max_attempts": 0
   }
 }
 ```
 
-Conventions : `session.session_budget` porte limites **et** consommés (`BudgetView`, ADR-012 §5, critère 12) ; `conversation.session_budget` reprend la même vue (§4.1 place le budget au niveau conversation) ; `conversation.last_model_response_state` est une chaîne dérivée (valeurs proposées : `none`, `awaiting`, `received_valid`, `received_invalid`, `timeout`, `transport_error`, `abandoned` — écrite par l'abonné « store dérivé », ADR-015 §3 ; la spec ne fixe pas ces valeurs) ; `tasks[]` dans l'ordre du plan, `TaskView` ajoute `timed_out` (ADR-008) et `reason` (ADR-009) ; `interrupted_at` figure aux deux niveaux ; `context_window_state`, `context_bytes` et `rotations_count` sont présents (ADR-013). Compléments **hors** snapshot : `context_budget_bytes` (configuration, `/config`), état du disjoncteur (`CircuitBreaker.degraded`, `/health`), `RecoveryReport` (`/health`), retry en attente (`retry.scheduled` dans le flux) — voir *Points ouverts* n°7.
+Conventions : `session.session_budget` porte limites **et** consommés (`BudgetView`, ADR-012 §5, critère 12) ; `conversation.session_budget` reprend la même vue (§4.1 place le budget au niveau conversation) ; `conversation.last_model_response_state` est une chaîne dérivée (valeurs proposées : `none`, `awaiting`, `received_valid`, `received_invalid`, `timeout`, `transport_error`, `abandoned` — écrite par l'abonné « store dérivé », ADR-015 §3 ; la spec ne fixe pas ces valeurs) ; `model_interaction.correction_attempt` / `correction_max_attempts` ne sont non nuls que tant qu'une correction est **en vol** (dernier sortant = `protocol_correction_request`, aucune réponse valide derrière) : ils disent qu'une boucle attend une correction, pas qu'elle est bloquée, et sont dérivés des messages persistés (ADR-023) ; `tasks[]` dans l'ordre du plan, `TaskView` ajoute `timed_out` (ADR-008) et `reason` (ADR-009) ; `interrupted_at` figure aux deux niveaux ; `context_window_state`, `context_bytes` et `rotations_count` sont présents (ADR-013). Compléments **hors** snapshot : `context_budget_bytes` (configuration, `/config`), état du disjoncteur (`CircuitBreaker.degraded`, `/health`), `RecoveryReport` (`/health`), retry en attente (`retry.scheduled` dans le flux) — voir *Points ouverts* n°7.
 
 ## 5. TelemetryService (§3.17)
 
@@ -163,6 +165,7 @@ Compteurs et histogrammes en mémoire, alimentés par les événements ; `render
 | saturation | `context_window_transitions_total`, `rotations_total` | compteurs | `to` / `outcome` (completed, failed) | `context.window_state_changed`, `rotation.*` |
 | échecs | `failures_total` | compteur | `error_type`, `error_code`, `origin` | `failure.recorded` |
 | échecs | `protocol_errors_total` | compteur | `error_code` | `message.rejected` |
+| échecs | `corrections_total` | compteur | `error_code` (le code du refus, `unknown` à défaut) | `correction.requested` (ADR-023) — rapporté à `messages_rejected_total`, il dit si les corrections servent à quelque chose |
 | échecs | `breaker_state` (0 fermé, 1 demi-ouvert, 2 ouvert), `breaker_transitions_total` | jauge, compteur | — | `breaker.state_changed` |
 | interruption | `interruptions_total`, `interruption_duration_ms`, `interruption_within_timeout_total` | compteur, histogramme, compteur | `source` | `interruption.*` |
 | débit | `messages_total` | compteur | `direction`, `message_type` | `message.outbound`, `message.inbound` |
@@ -195,6 +198,7 @@ Base `http://{api.host}:{api.port}/api/v1` (défaut `127.0.0.1:8765`). Aucun ét
 | GET | `/tasks/{tid}/output?stream=stdout&offset=0&max_bytes=65536` | lecture par plage de la sortie brute (même moteur que `chunk_request`) | octets + en-têtes `X-Range`, `X-Total`, `X-Eof` |
 | GET | `/sessions/{sid}/messages?direction=in,out` | messages protocolaires échangés (debug) | `[MessageRecord]` |
 | GET | `/sessions/{sid}/failures` | `FailureRecord` (le `system_error` interne) | `[FailureRecord]` |
+| GET | `/sessions/{sid}/corrections` | les `protocol_correction_request` envoyés au modèle, du plus ancien au plus récent, toutes conversations confondues (ADR-023) | `[{message_id, conversation_id, cycle_id, created_at, posted_at, size_bytes, error_code, errors, expected_types, reminder, example, attempt, max_attempts, …}]` |
 | GET | `/sessions/{sid}/audit?after=&limit=` · `/sessions/{sid}/audit/verify` | chaîne d'audit paginée ; vérification | `[AuditEvent]` · `AuditVerification` |
 | GET | `/sessions/{sid}/events` **(SSE)** | flux live d'une session, reprise `Last-Event-ID` | `text/event-stream` |
 | GET | `/events` **(SSE)** | flux live toutes sessions (tableau de bord) | `text/event-stream` |

@@ -313,6 +313,16 @@ def render_snapshot(
             f"{_value(interaction.get('last_protocol_validation_status'))})",
         )
     )
+    attempt = interaction.get("correction_attempt") or 0
+    if attempt:
+        # ADR-023: a correction is in flight — the loop is waiting for a corrected reply, not stuck
+        header.add_row(
+            *_row(
+                "Correction",
+                f"waiting for a corrected reply  attempt {attempt}",
+                f"/{_value(interaction.get('correction_max_attempts'))}",
+            )
+        )
     header.add_row(
         *_row(
             "Last event",
@@ -388,7 +398,18 @@ class _EventTail:
         summary = ", ".join(
             f"{key}={value}"
             for key, value in event.payload.items()
-            if key in ("from", "to", "reason", "message_type", "plan_type", "status", "limit")
+            if key
+            in (
+                "from",
+                "to",
+                "reason",
+                "message_type",
+                "plan_type",
+                "status",
+                "limit",
+                "error_code",
+                "attempt",
+            )
         )
         target = event.task_id or event.plan_id or event.cycle_id or event.conversation_id or ""
         self.events.append(f"{event.event_type.value} {target} {summary}".rstrip())

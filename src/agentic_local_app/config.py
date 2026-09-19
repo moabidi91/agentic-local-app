@@ -141,16 +141,23 @@ class PayloadSection(_Section):
 
 
 class ProtocolSection(_Section):
-    """ADR-022: the model's direct answers to the user.
+    """ADR-022 (the model's direct answers to the user) and ADR-023 (the correction policy).
 
     ``allow_direct_response`` lets the model answer the **initial** ``user_request`` of a
     conversation with a ``user_response`` (an analysis, an explanation or a question that needs no
     command) instead of the mandatory ``discovery_plan`` of spec §14; after an ``execution_result``
     or a follow-up ``user_request`` a ``user_response`` is always accepted. ``false`` keeps the
-    strict grammar of the specification. The correction policy of ADR-023 will live here too.
+    strict grammar of the specification.
+
+    ``max_correction_attempts`` bounds the correction policy of ADR-023: on an unusable reply the
+    application sends a ``protocol_correction_request`` and reads again, at most that many times in
+    a row for one conversation, before applying the previous policy (rotation in ``WARNING``,
+    otherwise session ``FAILED``). ``0`` disables the policy and restores the behaviour that
+    predates ADR-023: the first unusable reply ends the session.
     """
 
     allow_direct_response: bool = True
+    max_correction_attempts: int = Field(default=5, ge=0)
 
 
 class ContextSection(_Section):

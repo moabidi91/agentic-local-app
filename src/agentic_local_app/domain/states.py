@@ -32,6 +32,7 @@ __all__ = [
     "MessageDirection",
     "PLAN_MESSAGE_TYPES",
     "OUTBOUND_MESSAGE_TYPES",
+    "SUBSTANTIVE_OUTBOUND_MESSAGE_TYPES",
     "INBOUND_MESSAGE_TYPES",
     "CONCLUDING_MESSAGE_TYPES",
     "plan_type_for_message",
@@ -154,7 +155,9 @@ class CircuitState(StrEnum):
 class MessageType(StrEnum):
     """Protocol message types (§3.5). ``chunk_request`` is kept for completeness but is a task type
     in practice (§12.6, ADR-007); ``system_error`` is internal and never sent to the model;
-    ``user_response`` is the model's direct, opaque answer to the user (ADR-022)."""
+    ``user_response`` is the model's direct, opaque answer to the user (ADR-022);
+    ``protocol_correction_request`` is the application asking the model to fix an unusable reply
+    (ADR-023), outbound only like ``user_request``."""
 
     USER_REQUEST = "user_request"
     DISCOVERY_PLAN = "discovery_plan"
@@ -165,6 +168,7 @@ class MessageType(StrEnum):
     USER_RESPONSE = "user_response"
     CONTEXT_RESUME_REQUEST = "context_resume_request"
     CONTEXT_RESUME_ACK = "context_resume_ack"
+    PROTOCOL_CORRECTION_REQUEST = "protocol_correction_request"
     CHUNK_REQUEST = "chunk_request"
     SYSTEM_ERROR = "system_error"
 
@@ -173,9 +177,16 @@ PLAN_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
     {MessageType.DISCOVERY_PLAN, MessageType.EXECUTION_PLAN, MessageType.PRIORITY_CLARIFICATION}
 )
 
-OUTBOUND_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
+#: The outbound types that set the expectation of the next inbound message (ADR-007 rows).
+#: ``protocol_correction_request`` is deliberately **not** one of them: it is transparent for the
+#: expectation table (ADR-023) — it asks again for the reply the last substantive message expects.
+SUBSTANTIVE_OUTBOUND_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
     {MessageType.USER_REQUEST, MessageType.EXECUTION_RESULT, MessageType.CONTEXT_RESUME_REQUEST}
 )
+
+OUTBOUND_MESSAGE_TYPES: frozenset[MessageType] = SUBSTANTIVE_OUTBOUND_MESSAGE_TYPES | {
+    MessageType.PROTOCOL_CORRECTION_REQUEST
+}
 
 INBOUND_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
     PLAN_MESSAGE_TYPES

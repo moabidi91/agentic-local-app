@@ -51,6 +51,7 @@ from agentic_local_app.domain.states import (
     TaskState,
 )
 from agentic_local_app.protocol.messages import StateSummary
+from conformance.harness import make_config, make_rig
 from conformance.registry import case
 from integration.phase9_rig import (
     OUT_POM,
@@ -63,8 +64,6 @@ from integration.phase9_rig import (
     discovery_plan,
     execution_plan,
     final_answer,
-    make_config,
-    make_rig,
     resume_ack,
     user_response,
 )

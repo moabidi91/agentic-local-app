@@ -43,6 +43,7 @@ from agentic_local_app.domain.events import Event, EventType
 from agentic_local_app.domain.models import (
     ConversationRecord,
     CycleRecord,
+    MessageRecord,
     PlanRecord,
     SessionRecord,
     TaskRecord,
@@ -54,6 +55,7 @@ from agentic_local_app.domain.states import (
     CycleType,
     ExecutionPolicy,
     MessageDirection,
+    MessageType,
     PlanState,
     PlanType,
     SessionState,
@@ -235,13 +237,20 @@ class TaskView(_View):
 
 
 class ModelInteractionView(_View):
-    """Model interaction level of §4.1, per session, fed by the ``message.*`` events."""
+    """Model interaction level of §4.1, per session, fed by the ``message.*`` events.
+
+    ``correction_attempt`` / ``correction_max_attempts`` say whether a correction is **in flight**
+    (ADR-023): non-zero while the application is waiting for a corrected reply, back to zero as
+    soon as a valid message comes in. They are derived, never persisted.
+    """
 
     last_outbound_message_type: str | None = None
     last_inbound_message_type: str | None = None
     last_post_status: int | None = None
     last_get_status: int | None = None
     last_protocol_validation_status: str | None = None
+    correction_attempt: int = 0
+    correction_max_attempts: int = 0
 
 
 class RuntimeSnapshot(_View):
@@ -328,7 +337,9 @@ class ExecutionTracker:
         tracked.events_seen += 1
         tracked.last_event_type = event.event_type.value
         tracked.last_event_sequence = self._sequence_of(event, tracked)
-        if event.event_type in _OUTBOUND_MESSAGE_EVENTS | _INBOUND_MESSAGE_EVENTS:
+        if event.event_type in _OUTBOUND_MESSAGE_EVENTS | _INBOUND_MESSAGE_EVENTS | {
+            EventType.CORRECTION_REQUESTED
+        }:
             tracked.interaction = _apply_message(tracked.interaction, event)
         self._tracked[session_id] = tracked
 
@@ -429,10 +440,13 @@ class ExecutionTracker:
         messages = self._store.list_messages(conversation.conversation_id)
         outbound = [m for m in messages if m.direction is MessageDirection.OUTBOUND]
         inbound = [m for m in messages if m.direction is MessageDirection.INBOUND]
+        attempt, max_attempts = _correction_in_flight(messages)
         return ModelInteractionView(
             last_outbound_message_type=outbound[-1].message_type.value if outbound else None,
             last_inbound_message_type=inbound[-1].message_type.value if inbound else None,
             last_protocol_validation_status=inbound[-1].validation_status if inbound else None,
+            correction_attempt=attempt,
+            correction_max_attempts=max_attempts,
         )
 
     def _sequence_of(self, event: Event, tracked: _Tracked) -> int:
@@ -524,9 +538,41 @@ def _pointers(conversation: ConversationRecord | None) -> tuple[str | None, str 
     )
 
 
+def _correction_in_flight(messages: list[MessageRecord]) -> tuple[int, int]:
+    """``(attempt, max_attempts)`` of the correction the conversation is waiting on, or ``(0, 0)``.
+
+    Derived from the persisted messages (ADR-023 keeps no column): a correction is in flight when
+    the last outbound message is a ``protocol_correction_request`` and no valid reply followed it.
+    """
+    for record in reversed(messages):
+        if record.direction is MessageDirection.INBOUND:
+            if record.validation_status != "invalid":
+                return 0, 0
+            continue
+        if record.message_type is not MessageType.PROTOCOL_CORRECTION_REQUEST:
+            return 0, 0
+        content = record.payload.get("content", {})
+        if not isinstance(content, dict):
+            return 0, 0
+        return _int_or_none(content.get("attempt")) or 0, (
+            _int_or_none(content.get("max_attempts")) or 0
+        )
+    return 0, 0
+
+
 def _apply_message(view: ModelInteractionView, event: Event) -> ModelInteractionView:
     payload = event.payload
     message_type = _str_or_none(payload.get("message_type"))
+    if event.event_type is EventType.CORRECTION_REQUESTED:
+        # ADR-023: a correction is in flight until a valid message comes back
+        return view.model_copy(
+            update={
+                "correction_attempt": _int_or_none(payload.get("attempt")) or 0,
+                "correction_max_attempts": _int_or_none(payload.get("max_attempts")) or 0,
+            }
+        )
+    if event.event_type is EventType.MESSAGE_INBOUND:
+        view = view.model_copy(update={"correction_attempt": 0, "correction_max_attempts": 0})
     if event.event_type in _OUTBOUND_MESSAGE_EVENTS:
         return view.model_copy(
             update={

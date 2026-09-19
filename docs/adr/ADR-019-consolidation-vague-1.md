@@ -1,6 +1,6 @@
 # ADR-019 — Arbitrages de consolidation après la vague 1 (phases 1, 2, 3, 4, 7, 10)
 
-**Statut** : accepté (2026-09-18) — amende ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012, ADR-013, ADR-014
+**Statut** : accepté (2026-09-18) — amende ADR-003, ADR-004, ADR-005, ADR-007, ADR-008, ADR-010, ADR-011, ADR-012, ADR-013, ADR-014 ; §2 amendé par [ADR-023](ADR-023-politique-de-correction.md) (la rotation sur réponse inutilisable devient le repli, après les corrections)
 
 ## Contexte
 
@@ -17,6 +17,8 @@ La mise en œuvre parallèle des phases 1, 2, 3, 4, 7 et 10 et la rédaction des
 ### 2. Réponses inutilisables et rotation (ADR-013 §3 vs §7.2 / §14)
 
 La règle « `SATURATED` après N erreurs de protocole » est **retirée** : §14 impose l'arrêt dès la première `MODEL_PROTOCOL_ERROR`, et le `FailureManager` décide `fail`. Elle est remplacée par une règle déterministe qui réalise le « replies missing or unusable due to context accumulation » de §10 : **si la fenêtre de contexte est en `WARNING` (≥ 70 % du budget) au moment où survient une `MODEL_PROTOCOL_ERROR` ou l'épuisement des retries d'un `MODEL_GET_TIMEOUT`, l'orchestrateur rotate une fois au lieu d'échouer** ; en `HEALTHY`, la politique de §7 s'applique telle quelle. Clé de configuration : `context.rotate_on_unusable_reply_in_warning` (défaut `true`), qui remplace `protocol_errors_before_rotation`. `ConversationRecord.protocol_error_count` reste tenu pour l'observabilité.
+
+**Amendé par [ADR-023](ADR-023-politique-de-correction.md)** : cette règle n'est plus la première réaction à une réponse inutilisable, c'est le **repli**. Tant que la fenêtre n'est pas `SATURATED`, l'application envoie d'abord un `protocol_correction_request` et relit contre la même attente, au plus `protocol.max_correction_attempts` fois d'affilée ; la rotation décrite ici ne s'applique qu'une fois ce budget épuisé (et une fenêtre déjà saturée l'emporte tout de suite, une correction ne pouvant pas tenir dans un contexte plein). L'épuisement des retries d'un `MODEL_GET_TIMEOUT`, qui n'est pas une faute du modèle, garde la règle telle quelle, sans correction.
 
 ### 3. Machines à états : deux transitions supplémentaires (ADR-007)
 

@@ -28,6 +28,7 @@ class EventType(StrEnum):
     MESSAGE_INBOUND = "message.inbound"
     MESSAGE_REJECTED = "message.rejected"
     MESSAGE_RETRANSMITTED = "message.retransmitted"
+    CORRECTION_REQUESTED = "correction.requested"
     PLAN_RECEIVED = "plan.received"
     PLAN_STATE_CHANGED = "plan.state_changed"
     TASK_STATE_CHANGED = "task.state_changed"

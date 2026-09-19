@@ -2,7 +2,7 @@
 
 **Ce que dit la spec.** Le modèle n'est joignable que par `POST message` / `GET messages` ([§2.1](../spec/SPEC-v1.1.md#21-conversation-model)) à travers le `TransportGateway` (§3.12 : gzip optionnel, erreurs normalisées, abandon des appels en vol). Toute défaillance est classée dans la taxonomie fermée de [§6](../spec/SPEC-v1.1.md#6-error-taxonomy) et traitée par la politique déterministe de [§7](../spec/SPEC-v1.1.md#7-deterministic-failure-policy) : retry borné sur les seuls types rejouables (§7.1), aucun retry sur les autres (§7.2), backoff exponentiel borné et décisions persistées (§7.3), disjoncteur (§7.4). `FailureManager` classe et décide (§3.13), `RetryController` calcule (§3.14), `CircuitBreaker` protège (§3.15).
 
-**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-020](../adr/ADR-020-transport-enfichable.md) : plusieurs implémentations (*providers*) du même contrat, choisies par `transport.provider` (registre, base « template method », provider `templated_http` décrit par configuration) ; [ADR-021](../adr/ADR-021-codec-de-messages-par-modele.md) : un *codec* optionnel, choisi par `transport.codec`, convertit la forme brute des réponses d'un modèle (texte, chat completion, appel d'outil) en enveloppes protocolaires et inversement, appliqué par un décorateur transparent (`UNPARSEABLE_REPLY` quand la réponse est illisible) ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED`.
+**Ce que précisent les ADR.** [ADR-004](../adr/ADR-004-contrat-de-transport.md) : endpoints configurables (`init`, `post`, `get`, `close`), jeton et `user_id`, GET en polling avec curseur, POST idempotent par `message_id`, mapping HTTP → §6, serveur mock à scénarios ; [ADR-020](../adr/ADR-020-transport-enfichable.md) : plusieurs implémentations (*providers*) du même contrat, choisies par `transport.provider` (registre, base « template method », provider `templated_http` décrit par configuration) ; [ADR-021](../adr/ADR-021-codec-de-messages-par-modele.md) : un *codec* optionnel, choisi par `transport.codec`, convertit la forme brute des réponses d'un modèle (texte, chat completion, appel d'outil) en enveloppes protocolaires et inversement, appliqué par un décorateur transparent (`UNPARSEABLE_REPLY` quand la réponse est illisible) ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : le jeton vient de la variable nommée par `transport.token_env` ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : backoff `min(base × 2^attempt, cap)` sans gigue par défaut, `message_id` généré et persisté avant le POST ; [ADR-013](../adr/ADR-013-metrique-de-saturation.md) : `MODEL_CONTEXT_WINDOW_ERROR` et erreurs de protocole répétées déclenchent la rotation (décision `rotate`) ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : la retryabilité ne concerne que le transport, jamais une commande ; [ADR-006](../adr/ADR-006-interruption-nouvelle-conversation.md) / [ADR-012](../adr/ADR-012-budget-de-session.md) : fermeture distante en *best effort*, rien n'est envoyé au modèle sur `BUDGET_EXCEEDED` ; [ADR-023](../adr/ADR-023-politique-de-correction.md) : une réponse inutilisable est d'abord **corrigée** — l'application renvoie au modèle la faute exacte et relit — la rotation d'ADR-019 §2 devenant le repli et l'échec de session le dernier mot.
 
 Code : [`domain/errors.py`](../../src/agentic_local_app/domain/errors.py) (`ErrorType`, `NormalizedError`, `TransportError`…), [`config.py`](../../src/agentic_local_app/config.py) (`TransportSection`, `RetrySection`, `CircuitBreakerSection`), `transport/base.py` (contrat), `transport/http_base.py`, `transport/registry.py`, `transport/providers/*`, `transport/fake.py`, `transport/gateway.py` (façade de compatibilité), `resilience/*`, `testing/mock_model_server.py` (phase 7). La machine à états du disjoncteur est dans [01](01-state-machines.md#9-disjoncteur-74).
 
@@ -186,7 +186,8 @@ sequenceDiagram
     else illisible
         K-->>C: CodecError UNPARSEABLE_REPLY (codec, index, excerpt, reason)
         C-->>O: TransportError MODEL_PROTOCOL_ERROR estampillee operation / http_status
-        O->>O: FailureManager : fail (rotation si WARNING)
+        O->>O: MessageRecord invalid (raw, reason), message.rejected, FailureRecord
+        O->>M: POST protocol_correction_request puis relecture (ADR-023)
     end
 ```
 
@@ -197,7 +198,7 @@ sequenceDiagram
 | `tool_call` | `arguments_path`, `name_path` + `tool_name`, `id_path`, `conversation_id_fallback`, `outbound` | les `arguments` d'un appel d'outil (JSON strict en chaîne, ou objet) → enveloppe(s) ; un autre outil que `tool_name` est refusé |
 | chemin d'import / entry point | son `options_model` | extension sans modification du dépôt (ADR-021 §8) |
 
-Règles du décorateur : l'accusé d'un POST dont le provider n'a pas lu de `message_id` (il a posté du texte) reprend celui de l'enveloppe ; le curseur du provider est gardé sauf s'il n'a pas avancé (`None` ou égal à `after`), auquel cas il devient le `message_id` de la dernière enveloppe décodée ; un codec n'invente jamais de `conversation_id` (une enveloppe qui n'en a pas va à l'adaptateur, qui la rejette en `SCHEMA_INVALID`, sauf `conversation_id_fallback = false`). Une forme illisible est une `CodecError` : `TransportError(MODEL_PROTOCOL_ERROR, UNPARSEABLE_REPLY)`, non rejouable, `details` = `codec`, `index`, `excerpt` (≤ 500 caractères de la forme brute), `reason` (`path_not_found`, `unexpected_type`, `no_json_found`, `json_unbalanced`, `json_invalid`, `missing_conversation_id`, `unexpected_tool`, `no_envelope` quand la réponse attendue ne porte aucune enveloppe), `operation`, `http_status`. Elle suit la politique du §4 : `fail` (aucun retry, disjoncteur non nourri), `FailureRecord` + `failure.recorded`, session `FAILED` — ou une rotation en `WARNING` (ADR-019 §2) ; rien n'est persisté comme message entrant, l'`excerpt` garde la trace pour la politique de correction à venir. Erreurs de configuration : `CODEC_UNKNOWN`, `CODEC_INVALID`, `CODEC_OPTIONS_INVALID`. CLI : `agentic-app codec list` / `codec show` ; `transport show` affiche aussi le codec effectif.
+Règles du décorateur : l'accusé d'un POST dont le provider n'a pas lu de `message_id` (il a posté du texte) reprend celui de l'enveloppe ; le curseur du provider est gardé sauf s'il n'a pas avancé (`None` ou égal à `after`), auquel cas il devient le `message_id` de la dernière enveloppe décodée ; un codec n'invente jamais de `conversation_id` (une enveloppe qui n'en a pas va à l'adaptateur, qui la rejette en `SCHEMA_INVALID`, sauf `conversation_id_fallback = false`). Une forme illisible est une `CodecError` : `TransportError(MODEL_PROTOCOL_ERROR, UNPARSEABLE_REPLY)`, non rejouable, `details` = `codec`, `index`, `excerpt` (≤ 500 caractères de la forme brute), `reason` (`path_not_found`, `unexpected_type`, `no_json_found`, `json_unbalanced`, `json_invalid`, `missing_conversation_id`, `unexpected_tool`, `no_envelope` quand la réponse attendue ne porte aucune enveloppe), `operation`, `http_status`. Aucun retry (rejouer ne changerait rien), le disjoncteur n'est pas nourri, et la réponse suit la politique du §4 comme n'importe quelle réponse inutilisable : elle est persistée — ADR-023 amende ADR-021 §2 sur ce point, il n'y a toujours pas d'enveloppe mais le `MessageRecord` entrant garde ce que le codec a pu citer (`{"raw": <extrait>, "reason": <pourquoi>}`, type interne `system_error`, `validation_status = invalid`) —, publiée (`message.rejected`, `protocol_error_count + 1`), enregistrée en `FailureRecord`, puis **corrigée** avant tout échec. Erreurs de configuration : `CODEC_UNKNOWN`, `CODEC_INVALID`, `CODEC_OPTIONS_INVALID`. CLI : `agentic-app codec list` / `codec show` ; `transport show` affiche aussi le codec effectif.
 
 ## 2. Classification HTTP → taxonomie (ADR-004)
 
@@ -232,7 +233,7 @@ Le disjoncteur n'est **pas** une erreur de transport : c'est le `FailureManager`
 | `NETWORK_ERROR` | connexion, 502, 503 | oui | oui | `retry` borné (si le disjoncteur autorise), puis `fail` | §7.1 |
 | `TIMEOUT_ERROR` | 408, 504, délai client, `MODEL_GET_TIMEOUT` | oui | oui | `retry` borné, puis `fail` | §7.1 |
 | `RATE_LIMIT_ERROR` | 429 | oui | oui | `retry` (délai ≥ `Retry-After`), puis `fail` | §7.1 |
-| `MODEL_PROTOCOL_ERROR` | `ProtocolAdapter` (catalogue [02 §5.3](02-protocol.md#53-catalogue-des-codes-protocolerror)), corps de réponse invalide | non | non | `fail` (§7.2) — sauf si la fenêtre de contexte est en `WARNING` : l'orchestrateur rotate une fois (ADR-019 §2) | §7.2, ADR-013 |
+| `MODEL_PROTOCOL_ERROR` | `ProtocolAdapter` (catalogue [02 §5.3](02-protocol.md#53-catalogue-des-codes-protocolerror)), réponse illisible par le codec, corps de réponse invalide | non | non | `fail` (§7.2), mais l'orchestrateur **corrige d'abord** (§4.1, ADR-023) : au plus `protocol.max_correction_attempts` réponses inutilisables d'affilée, puis rotation si la fenêtre n'est pas `HEALTHY` (ADR-019 §2), sinon échec | §7.2, ADR-013, ADR-023 |
 | `MODEL_CONTEXT_WINDOW_ERROR` | 413, `context_window_exceeded` | non | oui | `rotate` ; l'orchestrateur transforme en `ROTATION_FAILED` si `max_rotations_per_session` est atteint | §10, ADR-013 |
 | `TASK_EXECUTION_ERROR` | `CommandExecutor` : `SPAWN_FAILED` | non (non transitoire) | oui | aucune décision de boucle : tâche `FAILED`, `FailureRecord`, le plan suit ses drapeaux | ADR-008 §4 |
 | `PERSISTENCE_ERROR` | store : `SQLITE_ERROR` (transitoire quand la base est verrouillée ou occupée), `AUDIT_APPEND_ONLY_VIOLATION`, `BLOB_NOT_FOUND`… | transitoire seulement | transitoire seulement | `fail` par la politique de phase 7 (non listée comme rejouable) ; un retry court des seules erreurs transitoires est proposé en *Points ouverts* n°5 | §7.2 |
@@ -251,21 +252,27 @@ Attributs normalisés (`NormalizedError`) : `error_type`, `error_code`, `severit
 flowchart TD
     E["Exception ou erreur normalisee"] --> CL["classify : NormalizedError (transport deja classe,<br/>httpx/OSError => NETWORK_FAILURE, autre => UNHANDLED_EXCEPTION)"]
     CL --> REC["record : FailureRecord persiste, failure.recorded publie"]
-    REC --> PRE{"Orchestrateur : réponse inutilisable<br/>et fenêtre en WARNING ? (ADR-019)"}
-    PRE -- oui --> ROT
-    PRE -- non --> T{"decide : error_type ?"}
+    REC --> T{"decide : error_type ?"}
     T -- "MODEL_CONTEXT_WINDOW_ERROR" --> ROT{"Orchestrateur : rotations_count < max_rotations_per_session ?"}
     ROT -- oui --> DR["rotate : fenetre SATURATED, rotation avec le message en attente (06)"]
     ROT -- non --> DF1["fail : ROTATION_FAILED / MAX_ROTATIONS_REACHED"]
     T -- "NETWORK, TIMEOUT, RATE_LIMIT,<br/>SYSTEM transitoire" --> ATT{"retry.can_retry(attempt) ?"}
-    ATT -- non --> DF2["fail : max_attempts_exhausted"]
     ATT -- oui --> BRK{"breaker.allow() ?"}
     BRK -- non --> DF4["fail : circuit_open"]
     BRK -- oui --> DELAY["delay = max(retry.delay_ms(attempt), retry_after_ms)"]
     DELAY --> DRT["retry : record_decision, retry.scheduled,<br/>cycle.retry_count + 1, attente interruptible"]
+    ATT -- non --> EXH{"GET epuise sur MODEL_GET_TIMEOUT ?"}
+    EXH -- non --> DF2["fail : max_attempts_exhausted"]
+    EXH -- "oui : le modele n'a rien dit,<br/>jamais de correction (ADR-023)" --> PRE
+    T -- "MODEL_PROTOCOL_ERROR : enveloppe refusee<br/>ou reponse illisible par le codec" --> UNU["Orchestrateur : reponse inutilisable persistee (invalid),<br/>message.rejected, protocol_error_count + 1, unusable_replies + 1"]
+    UNU --> COR{"max_correction_attempts > 0, budget non epuise<br/>et fenetre non SATURATED ? (ADR-023)"}
+    COR -- oui --> DC["correction : POST protocol_correction_request,<br/>correction.requested, relecture contre la MEME attente<br/>- ni cycle, ni plan"]
+    COR -- non --> PRE{"Fenetre non HEALTHY et<br/>rotate_on_unusable_reply_in_warning ? (ADR-019)"}
+    PRE -- oui --> ROTU["rotate : fenetre SATURATED (unusable_reply), rotation avec<br/>le message en attente, budget de corrections neuf dans l'enfant"]
+    PRE -- non --> DF3["fail : sur la derniere erreur,<br/>details.corrections_attempted"]
     T -- "INTERRUPTED" --> DA["abort : la boucle s'arrete sans echec,<br/>InterruptionHandler prend la main"]
-    T -- "MODEL_PROTOCOL_ERROR, AUTHN, AUTHZ, BUDGET_EXCEEDED,<br/>ROTATION_FAILED, TASK_EXECUTION, PERSISTENCE,<br/>SYSTEM non transitoire" --> DF3["fail : non_retryable:<error_type>"]
-    DF1 & DF2 & DF3 & DF4 --> FAIL["Cycle FAILED, conversation FAILED, session FAILED,<br/>last_failure_id, fermeture distante best effort"]
+    T -- "AUTHN, AUTHZ, BUDGET_EXCEEDED, ROTATION_FAILED,<br/>TASK_EXECUTION, PERSISTENCE, SYSTEM non transitoire" --> DF5["fail : non_retryable:<error_type>"]
+    DF1 & DF2 & DF3 & DF4 & DF5 --> FAIL["Cycle FAILED, conversation FAILED, session FAILED,<br/>last_failure_id, fermeture distante best effort"]
 ```
 
 Sémantique des quatre décisions :
@@ -276,6 +283,20 @@ Sémantique des quatre décisions :
 | `abort` | `interrupted` | `RUNNING → INTERRUPTED` (par l'`InterruptionHandler`) | interruption en cours (ADR-006) | aucune : le nettoyage appartient à l'`InterruptionHandler` ([07](07-interruption-and-recovery.md)) |
 | `rotate` | `context_window_exceeded` (ou seuil d'erreurs de protocole, évalué par l'orchestrateur) | `RUNNING → FAILED` (`reason = rotation`) | conversation `→ ROTATING` | séquence de [06](06-context-rotation.md#3-séquence-complète-de-rotation-adr-014) |
 | `fail` | `max_attempts_exhausted`, `circuit_open`, `non_retryable:<type>` | `RUNNING → FAILED` | conversation `→ FAILED`, session `→ FAILED` | `close_url` en *best effort* ; l'API et la CLI exposent le `FailureRecord` |
+
+Ces quatre décisions restent celles du `FailureManager`. La correction d'ADR-023 n'en est pas une cinquième : c'est ce que l'orchestrateur fait d'une décision `fail` portant sur une réponse inutilisable, **avant** de la transformer en échec de session.
+
+### 4.1 La correction avant l'échec (ADR-023)
+
+Une réponse inutilisable — enveloppe malformée, message hors de la grammaire d'ADR-007, contenu qui viole son schéma ou une règle sémantique, ou réponse brute que le codec ne sait pas lire — ne termine plus la session sur-le-champ. Elle reste persistée (`validation_status = invalid`), publiée (`message.rejected`, `protocol_error_count + 1`) et enregistrée en `FailureRecord` ; puis l'application POSTe un `protocol_correction_request` qui cite au modèle les erreurs de validation exactes, les types valides à cet instant, un rappel de leur forme engendré depuis les modèles de contenu et un exemple minimal valide, et **relit contre la même attente** (la ligne d'ADR-007 qui était pendante, [02 §4](02-protocol.md#4-table-des-messages-attendus-adr-007)). Une correction n'ouvre pas de cycle et ne consomme pas de plan : c'est le même tour redemandé, seul le budget de durée continue de courir.
+
+L'ordre entre correction et rotation est tranché par ADR-023 §3 :
+
+1. une fenêtre **`SATURATED`** ne corrige pas : elle passe directement au repli du point 3, c'est-à-dire à la rotation — une correction envoyée dans un contexte plein ne peut pas recevoir de réponse. L'état lu est celui **évalué** après avoir compté les octets de la réponse fautive, si bien qu'une fenêtre que le rejet lui-même fait basculer est vue comme saturée ;
+2. une fenêtre `HEALTHY` ou `WARNING` **corrige d'abord**, au plus `protocol.max_correction_attempts` réponses inutilisables d'affilée (défaut 5, `[protocol]`) ; toute réponse valide remet le compteur à zéro. La règle d'ADR-019 §2 — en `WARNING`, une réponse inutilisable est lue comme un signe d'accumulation — devient le repli et non le premier réflexe : une rotation coûte une conversation, un résumé, une retransmission et un cycle, un rappel de protocole coûte un message ;
+3. le repli — atteint dès le point 1 quand la fenêtre est saturée, sinon une fois le budget de corrections épuisé — est la politique d'avant ADR-023, telle quelle : rotation si la fenêtre n'est pas `HEALTHY` **et** que `context.rotate_on_unusable_reply_in_warning` est vrai, sinon échec de session sur la **dernière** erreur. Ce drapeau commande donc tout le repli, saturation comprise : à `false`, une fenêtre saturée ne corrige pas et ne rotate pas non plus, elle échoue.
+
+Avec `max_correction_attempts = N`, l'application envoie au plus `N` corrections consécutives et termine sur la `N + 1`-ième réponse inutilisable d'affilée ; l'enfant d'une rotation repart avec un budget de corrections neuf. Tant que la politique est active, les `details` de chaque erreur de protocole portent `unusable_replies`, `corrections_attempted` et `max_correction_attempts` — le `FailureRecord` et l'événement `failure.recorded` disent donc si l'on a vu un modèle fautif une fois ou un modèle incapable de se corriger cinq fois de suite. Un `MODEL_GET_TIMEOUT` épuisé n'est pas une faute de protocole (le modèle n'a rien dit) : aucune correction ne lui est envoyée, il garde exactement la politique d'ADR-019 §2. `max_correction_attempts = 0` désactive la politique et rétablit le comportement d'avant ADR-023 — la première réponse inutilisable termine la session —, à une chose près, qui est une règle de persistance et non une politique : la réponse illisible reste persistée comme enregistrement entrant invalide (ADR-015, ADR-021 §2 amendé).
 
 ## 5. Backoff déterministe (§7.3, ADR-017)
 
@@ -400,6 +421,7 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 | `[transport.options]` | (sous-table) | `{}` | options propres au provider, validées par son `options_model` (`templated_http` : `headers`, `init`, `post`, `get`, `close`) | ADR-020 |
 | `[transport]` | `codec` | `passthrough` | codec de messages : nom enregistré (`passthrough`, `json_text`, `tool_call`), `paquet.module:Classe` ou entry point `agentic_local_app.codecs` ; `passthrough` = transport nu | ADR-021 |
 | `[transport.codec_options]` | (sous-table) | `{}` | options propres au codec, validées par son `options_model` (`json_text` : `content_path`, `strip_code_fences`, `extract_first_json_object`, `id_path`, `conversation_id_fallback`, `outbound`) | ADR-021 |
+| `[protocol]` | `max_correction_attempts` | 5 | réponses inutilisables consécutives tolérées : au-delà, rotation ou échec (§4.1) ; `0` désactive la correction | ADR-023 |
 | `[retry]` | `max_attempts` | 4 | tentatives au total, retries compris | §7.3 |
 | `[retry]` | `base_delay_ms` | 500 | base du backoff | ADR-017 |
 | `[retry]` | `max_delay_ms` | 8 000 | plafond d'un délai | ADR-017 |
@@ -421,7 +443,7 @@ Le mock renseigne lui-même `conversation_id` et `message_id` des réponses (ide
 
 ## 11. Points ouverts
 
-1. **Erreurs de protocole répétées vs « aucun retry » (§7.2 / ADR-013).** ADR-013 déclenche la rotation à la deuxième erreur de protocole de la même conversation ; le `FailureManager` de phase 7 décide `fail` dès la première (lecture littérale de §7.2). Avec le défaut `protocol_errors_before_rotation = 2`, la branche « rotation » n'est donc atteignable que si l'orchestrateur re-sollicite le modèle après la première erreur (retransmission du message en attente dans un nouveau cycle, bornée par `max_cycles`), ce que §7.2 peut être lu comme interdisant. Un ADR devrait trancher entre cette re-sollicitation, un seuil à 1, ou l'abandon de la règle.
+1. **Erreurs de protocole répétées vs « aucun retry » (§7.2 / ADR-013) — tranché par ADR-023.** La question était de savoir si l'orchestrateur pouvait re-solliciter le modèle après une première erreur de protocole, ADR-013 ne déclenchant la rotation qu'à la deuxième alors que le `FailureManager` décide `fail` dès la première (lecture littérale de §7.2). ADR-023 répond oui, et sans contredire §7.2 : rien n'est **rejoué** — la re-sollicitation est un message neuf, le `protocol_correction_request`, qui cite la faute, n'ouvre aucun cycle et ne refait aucun appel de transport (§4.1). Le seuil `protocol_errors_before_rotation` d'ADR-013 est remplacé par `protocol.max_correction_attempts` et par l'ordre correction → rotation → échec.
 2. **Codes HTTP 4xx hors table.** ADR-004 ne classe ni 400, ni 404, ni 409. Ce document les range en `SYSTEM_ERROR` non transitoire (`fail`) ; un 404 sur `post_url` (conversation distante disparue) pourrait mériter une rotation plutôt qu'un échec. À décider.
 3. **Idempotence de l'`init`.** Le contrat ne fournit pas de clé d'idempotence pour l'`init` ; un retry après coupure réseau peut créer une conversation distante orpheline, inoffensive mais non fermée. Proposer un en-tête `Idempotency-Key = <conversation_id local>` dans le contrat.
 4. **`token` vs `token_env`, `close_url: null` vs `""`.** Le YAML d'ADR-004 montre `token:` et `close_url: null` ; ADR-018 et `config.py` retiennent `token_env` et une chaîne vide. ADR-018 étant postérieur, c'est lui qui fait foi ; ADR-004 devrait être annoté.

@@ -107,9 +107,15 @@ class AcmeThreadsApi:
         return httpx.Response(404, json={"error": {"code": "not_found", "path": path}})
 
 
-def build(api: AcmeThreadsApi) -> tuple[Application, RecordingSubscriber, FakeCommandExecutor]:
-    """The production wiring over the example configuration; only the network is a double."""
-    config = load_config(EXAMPLE_CONFIG, environ=dict(ENV), load_env_file=False)
+def build(
+    api: AcmeThreadsApi, **env: str
+) -> tuple[Application, RecordingSubscriber, FakeCommandExecutor]:
+    """The production wiring over the example configuration; only the network is a double.
+
+    ``env`` adds ``AGENTIC__SECTION__KEY`` overrides on top of :data:`ENV`, the way an operator
+    would (used to pin the behaviour that predates the correction policy of ADR-023).
+    """
+    config = load_config(EXAMPLE_CONFIG, environ={**ENV, **env}, load_env_file=False)
     clock = FakeClock()
     sleep = advancing_sleep(clock)  # the polling of the provider moves the fake clock, never waits
     provider = TransportRegistry.create(
@@ -181,7 +187,8 @@ async def given_example_plugin_when_model_streams_no_json_then_unparseable_reply
     api = AcmeThreadsApi(
         {"user_request": {"chunks": [{"delta": "I cannot "}, {"delta": "help with that."}]}}
     )
-    app, recorder, _ = build(api)
+    # the classification of an undecodable reply, without the correction loop of ADR-023
+    app, recorder, _ = build(api, AGENTIC__PROTOCOL__MAX_CORRECTION_ATTEMPTS="0")
     session = await app.manager.start_session(goal=GOAL, user_message=USER_MESSAGE)
     session = await app.manager.wait(session.session_id, timeout_ms=10_000)
 

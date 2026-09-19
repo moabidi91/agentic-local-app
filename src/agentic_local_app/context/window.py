@@ -106,15 +106,33 @@ class ContextWindowMonitor:
     def should_rotate_on_unusable_reply(
         self, conversation: ConversationRecord, error: NormalizedError
     ) -> bool:
-        """ADR-019 §2: a protocol error or an exhausted GET timeout **while WARNING** rotates once
-        instead of failing, when ``rotate_on_unusable_reply_in_warning`` is on."""
+        """ADR-019 §2, extended by ADR-023: a protocol error or an exhausted GET timeout rotates
+        instead of failing when the window is **not** ``HEALTHY`` and
+        ``rotate_on_unusable_reply_in_warning`` is on.
+
+        ``WARNING`` is the heuristic of ADR-019 §2 (the reply is read as a sign of accumulation);
+        ``SATURATED`` is the certainty — a conversation whose POST crossed the saturation threshold
+        without exceeding the budget waits for its reply with a full window, and neither a
+        correction (ADR-023) nor another reply can fit in it. The state is the **evaluated** one,
+        so the bytes of the reply just counted are taken into account.
+        """
         if not self._config.rotate_on_unusable_reply_in_warning:
             return False
-        if conversation.context_window_state is not ContextWindowState.WARNING:
+        if self.evaluate(conversation) is ContextWindowState.HEALTHY:
             return False
         if error.error_type is ErrorType.MODEL_PROTOCOL_ERROR:
             return True
         return error.error_type is ErrorType.TIMEOUT_ERROR and error.error_code == GET_TIMEOUT_CODE
+
+    def is_saturated(self, conversation: ConversationRecord) -> bool:
+        """The window of ``conversation`` as it stands right now (ADR-023 ordering rule).
+
+        Read between two messages — after an unusable reply has been counted, before anything is
+        sent — it answers "is there still room in this conversation?". The persisted
+        ``context_window_state`` may lag it by one message: the thresholds apply to the persisted
+        byte count, which is the metric (ADR-013 §1).
+        """
+        return self.evaluate(conversation) is ContextWindowState.SATURATED
 
     # ------------------------------------------------------------------ internals ----------
     def _compute(

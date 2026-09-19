@@ -423,7 +423,10 @@ async def given_statement_with_auto_close_when_received_then_conversation_closed
 async def given_direct_response_disabled_when_initial_request_answered_directly_then_rejected() -> (
     None
 ):
-    rig = make_rig(make_config(protocol={"allow_direct_response": False}))
+    # the classification of the fault, without the correction loop of ADR-023 on top of it
+    rig = make_rig(
+        make_config(protocol={"allow_direct_response": False, "max_correction_attempts": 0})
+    )
     rig.reply(REMOTE_1, user_response())
 
     session = await rig.run(goal=ANALYSIS_GOAL, user_message=ANALYSIS_REQUEST)
@@ -472,7 +475,7 @@ async def given_direct_response_disabled_when_user_response_follows_execution_re
 async def given_oversized_body_when_user_response_received_then_too_large_and_session_failed() -> (
     None
 ):
-    rig = make_rig()
+    rig = make_rig(make_config(protocol={"max_correction_attempts": 0}))
     limit = rig.config.payload.max_message_bytes
     rig.reply(REMOTE_1, user_response(body="x" * (limit + 1)))
 

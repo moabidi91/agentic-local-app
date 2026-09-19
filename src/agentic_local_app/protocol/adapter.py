@@ -3,11 +3,16 @@
 The adapter is **pure**: no I/O, no clock of its own (``plan_to_records`` receives the ``Clock``),
 no identifier generation (``message_id`` is passed in by the caller, ADR-017). It owns:
 
-- the construction of the three outbound types (§12.1, §12.5, §12.8 + ADR-014) as canonical JSON;
+- the construction of the four outbound types (§12.1, §12.5, §12.8 + ADR-014, and the
+  ``protocol_correction_request`` of ADR-023) as canonical JSON;
 - the **table of expected inbound messages** of ADR-007 (:data:`EXPECTED_INBOUND`), amended by
   ADR-022: ``user_response`` after an ``execution_result`` or a follow-up ``user_request``, and
   after the initial ``user_request`` only when ``protocol.allow_direct_response`` is set
-  (:func:`expected_inbound_for`);
+  (:func:`expected_inbound_for`); a correction request is **transparent** for that table
+  (:func:`last_substantive_outbound`) — it asks again for the reply that is still pending;
+- the composition of a correction request (:meth:`ProtocolAdapter.build_protocol_correction_request`):
+  the catalogue of minimal valid examples, the per-code hints and a reminder generated from the
+  content models, fitted under ``payload.max_message_bytes`` (ADR-023);
 - the structural validation of every inbound message: envelope, direction, expectation, content
   schema, then the semantic rules of ADR-007 (uniqueness, dependencies, chunk references,
   ``state_summary`` bound of ADR-005) and ADR-022 (``user_response`` body bound), each failure
@@ -25,7 +30,7 @@ than serialised as ``null`` (the model reads absence as "no stop reason").
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum, unique
@@ -39,7 +44,7 @@ from pydantic import BaseModel, ValidationError
 from agentic_local_app.config import AppConfig
 from agentic_local_app.domain.canonical import canonical_json, size_bytes
 from agentic_local_app.domain.clock import Clock
-from agentic_local_app.domain.errors import ProtocolError
+from agentic_local_app.domain.errors import NormalizedError, ProtocolError
 from agentic_local_app.domain.models import (
     ConversationRecord,
     MessageRecord,
@@ -51,6 +56,7 @@ from agentic_local_app.domain.models import (
 from agentic_local_app.domain.states import (
     INBOUND_MESSAGE_TYPES,
     PLAN_MESSAGE_TYPES,
+    SUBSTANTIVE_OUTBOUND_MESSAGE_TYPES,
     ExecutionPolicy,
     MessageDirection,
     MessageType,
@@ -67,6 +73,7 @@ from agentic_local_app.protocol.messages import (
     ExecutionResultContent,
     FinalAnswerContent,
     PlanContent,
+    ProtocolCorrectionRequestContent,
     SessionBudgetContent,
     TaskMessage,
     UserRequestContent,
@@ -74,6 +81,7 @@ from agentic_local_app.protocol.messages import (
 )
 
 __all__ = [
+    "CORRECTION_EXAMPLE_MESSAGE_ID",
     "EXPECTED_INBOUND",
     "INSTRUCTIONS_FILENAME",
     "InboundContent",
@@ -81,7 +89,9 @@ __all__ = [
     "OutboundMessage",
     "OutboundSituation",
     "ProtocolAdapter",
+    "example_envelope_for",
     "expected_inbound_for",
+    "last_substantive_outbound",
     "peek_field",
     "rejected_payload",
     "render_instructions",
@@ -182,14 +192,34 @@ def expected_inbound_for(
     return expected
 
 
+def last_substantive_outbound(messages: Sequence[MessageRecord]) -> MessageRecord | None:
+    """The last outbound message that **sets** the expectation, or ``None`` (ADR-007, ADR-023).
+
+    A ``protocol_correction_request`` is transparent here: it never opens a new row of
+    :data:`EXPECTED_INBOUND` — it asks again for the reply the last ``user_request`` /
+    ``execution_result`` / ``context_resume_request`` is still waiting for.
+    """
+    for message in reversed(messages):
+        if (
+            message.direction is MessageDirection.OUTBOUND
+            and message.message_type in SUBSTANTIVE_OUTBOUND_MESSAGE_TYPES
+        ):
+            return message
+    return None
+
+
 def situation_for(
     last_outbound: MessageRecord, conversation: ConversationRecord
 ) -> OutboundSituation:
-    """Classify the last outbound message into a row of :data:`EXPECTED_INBOUND`.
+    """Classify the last **substantive** outbound message into a row of :data:`EXPECTED_INBOUND`.
 
     ``conversation.final_answer_received`` means "the model concluded a turn in this conversation
     with a ``final_answer`` or a ``user_response``" (ADR-022): the next ``user_request`` is then a
     follow-up, whatever the type of that concluding message.
+
+    A ``protocol_correction_request`` is not a row of the table (ADR-023): it leaves the pending
+    expectation untouched, so the caller passes the message it corrects, never the correction
+    itself (:func:`last_substantive_outbound` finds it).
     """
     if last_outbound.direction is not MessageDirection.OUTBOUND:
         raise ValueError(f"{last_outbound.message_id} is not an outbound message")
@@ -202,6 +232,11 @@ def situation_for(
             return OutboundSituation.EXECUTION_RESULT
         case MessageType.CONTEXT_RESUME_REQUEST:
             return OutboundSituation.CONTEXT_RESUME_REQUEST
+        case MessageType.PROTOCOL_CORRECTION_REQUEST:
+            raise ValueError(
+                "protocol_correction_request sets no expectation (ADR-023): pass the substantive "
+                "outbound message it corrects"
+            )
         case other:
             raise ValueError(f"{other.value} is not an outbound message type")
 
@@ -238,11 +273,40 @@ _INITIAL_REPLY_RULE_STRICT = (
     "accepted after an `execution_result` or a follow-up `user_request`."
 )
 
+#: What a refused message means for the model (ADR-023), rendered from
+#: ``protocol.max_correction_attempts``: with the policy off the instructions must not promise a
+#: correction round that will never come.
+_REJECTION_RULE_CORRECTED = (
+    "A rejected message is **not** the end of the exchange: the application answers it with a "
+    "`protocol_correction_request` (section 10) telling you exactly what was wrong and what it "
+    "expects, and reads your next message against the same expectation. After "
+    "{max_correction_attempts} refused replies in a row the session stops, so read that message "
+    "carefully rather than resending."
+)
+_REJECTION_RULE_STRICT = (
+    "A rejected message ends the conversation: this deployment asks for no correction, so "
+    "re-read this table when in doubt — there is no second chance."
+)
+_CORRECTION_BUDGET_RULE_ON = (
+    "After **{max_correction_attempts}** refused replies in a row, the application stops asking "
+    "and the session ends in failure. `attempt` and `max_attempts` tell you where you stand. A "
+    "reply that is accepted resets the count to zero."
+)
+_CORRECTION_BUDGET_RULE_OFF = (
+    "The correction policy is **disabled** in this deployment "
+    "(`protocol.max_correction_attempts = 0`): you will never receive a "
+    "`protocol_correction_request`, and the first refused reply ends the session. This section is "
+    "kept so that the protocol text reads the same everywhere."
+)
+
 
 def render_instructions(config: AppConfig) -> str:
-    """The protocol text sent to the model at init, with the configured limits injected and the
-    first-message rule of ADR-022 rendered from ``protocol.allow_direct_response``."""
+    """The protocol text sent to the model at init, with the configured limits injected, the
+    first-message rule of ADR-022 rendered from ``protocol.allow_direct_response`` and the
+    correction policy of ADR-023 rendered from ``protocol.max_correction_attempts``."""
     direct = config.protocol.allow_direct_response
+    attempts = config.protocol.max_correction_attempts
+    corrects = attempts > 0
     values = {
         "default_max_output_bytes": config.payload.default_max_output_bytes,
         "hard_max_output_bytes": config.payload.hard_max_output_bytes,
@@ -255,6 +319,17 @@ def render_instructions(config: AppConfig) -> str:
         ),
         "initial_reply_grammar": "discovery_plan | user_response" if direct else "discovery_plan",
         "initial_reply_rule": _INITIAL_REPLY_RULE_DIRECT if direct else _INITIAL_REPLY_RULE_STRICT,
+        "max_correction_attempts": attempts,
+        "rejection_policy_rule": (
+            _REJECTION_RULE_CORRECTED.format(max_correction_attempts=attempts)
+            if corrects
+            else _REJECTION_RULE_STRICT
+        ),
+        "correction_budget_rule": (
+            _CORRECTION_BUDGET_RULE_ON.format(max_correction_attempts=attempts)
+            if corrects
+            else _CORRECTION_BUDGET_RULE_OFF
+        ),
     }
 
     def substitute(match: re.Match[str]) -> str:
@@ -264,6 +339,318 @@ def render_instructions(config: AppConfig) -> str:
         return str(values[name])
 
     return _PLACEHOLDER_RE.sub(substitute, _instructions_template())
+
+
+# ------------------------------------------------------------------------------------------------
+# Correction requests (ADR-023): minimal examples, per-code hints, generated reminder
+# ------------------------------------------------------------------------------------------------
+
+#: The ``message_id`` carried by the example of a correction request: a placeholder, never an id to
+#: reuse — the model must choose a new one, unique in the session (§3.5 of the instructions).
+CORRECTION_EXAMPLE_MESSAGE_ID = "<new-unique-message-id>"
+
+#: Minimal **valid** content per inbound message type, built from the content models themselves so
+#: that an example can never drift from the schema it illustrates (ADR-023).
+_EXAMPLE_CONTENT: Mapping[MessageType, BaseModel] = MappingProxyType(
+    {
+        MessageType.DISCOVERY_PLAN: PlanContent(
+            plan_id="<new-unique-plan-id>",
+            objective="Discover the execution environment",
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
+            tasks=[
+                TaskMessage(
+                    task_id="<new-unique-task-id>",
+                    type=TaskType.CMD,
+                    cmd="uname -a",
+                    continue_on_error=True,
+                )
+            ],
+        ),
+        MessageType.EXECUTION_PLAN: PlanContent(
+            plan_id="<new-unique-plan-id>",
+            objective="Confirm the hypothesis with one command",
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
+            tasks=[
+                TaskMessage(
+                    task_id="<new-unique-task-id>",
+                    type=TaskType.CMD,
+                    cmd="echo $JAVA_HOME",
+                    continue_on_error=True,
+                )
+            ],
+        ),
+        MessageType.PRIORITY_CLARIFICATION: PlanContent(
+            plan_id="<new-unique-plan-id>",
+            objective="Immediately confirm one fact before anything else",
+            execution_policy=ExecutionPolicy.SEQUENTIAL,
+            tasks=[
+                TaskMessage(
+                    task_id="<new-unique-task-id>",
+                    type=TaskType.CMD,
+                    cmd="mvn -version",
+                    critical=True,
+                )
+            ],
+        ),
+        MessageType.FINAL_ANSWER: FinalAnswerContent(
+            status="completed",
+            diagnosis="What you concluded, in plain language, for the user.",
+            evidence=["The task result that supports it"],
+            recommended_next_step="What the user should do now.",
+        ),
+        MessageType.USER_RESPONSE: UserResponseContent(
+            format="markdown",
+            body="What you want to tell the user, as text.",
+            status="completed",
+            expects_reply=False,
+        ),
+        MessageType.CONTEXT_RESUME_ACK: ContextResumeAckContent(
+            original_conversation_id="<the original_conversation_id you received>",
+            acknowledged=True,
+        ),
+    }
+)
+
+#: Order in which an expected type is picked to illustrate the reply, when several are valid.
+_EXAMPLE_PREFERENCE: tuple[MessageType, ...] = (
+    MessageType.CONTEXT_RESUME_ACK,
+    MessageType.DISCOVERY_PLAN,
+    MessageType.EXECUTION_PLAN,
+    MessageType.PRIORITY_CLARIFICATION,
+    MessageType.FINAL_ANSWER,
+    MessageType.USER_RESPONSE,
+)
+
+#: One short, targeted sentence per refusal code — what went wrong, in the model's terms.
+_CORRECTION_HINTS: Mapping[str, str] = MappingProxyType(
+    {
+        "SCHEMA_INVALID": "the message does not match the schema of its type",
+        "UNEXPECTED_MESSAGE_TYPE": "that type is not one of the types expected at this point",
+        "SYSTEM_ERROR_NOT_ALLOWED_INBOUND": (
+            "system_error is internal to the application and is never sent by you"
+        ),
+        "UNEXPECTED_EXTRA_MESSAGE": "one turn carries exactly one message, never two",
+        "EMPTY_REPLY": "the reply carried no message at all",
+        "CONVERSATION_MISMATCH": (
+            "conversation_id must repeat the id of the conversation you are in"
+        ),
+        "DUPLICATE_MESSAGE_ID": "message_id must be new: it is already taken in this session",
+        "DUPLICATE_PLAN_ID": "plan_id must be new: it is already taken in this session",
+        "DUPLICATE_TASK_ID": "task_id must be new: it is already taken in this session",
+        "SELF_DEPENDENCY": "a task cannot depend on itself",
+        "UNKNOWN_DEPENDENCY": "depends_on may only name tasks declared in the same plan",
+        "DEPENDENCY_CYCLE": "the dependencies of the plan form a cycle",
+        "FORWARD_DEPENDENCY_IN_SEQUENTIAL": (
+            "in sequential mode a task may only depend on tasks declared before it"
+        ),
+        "CHUNK_REF_UNKNOWN": (
+            "a chunk_request must name a task of this session whose output is stored"
+        ),
+        "STATE_SUMMARY_TOO_LARGE": "the state_summary is over its byte budget: make it denser",
+        "USER_RESPONSE_TOO_LARGE": "the body is over its byte budget: make it shorter",
+        "ACK_WRONG_ORIGINAL": (
+            "original_conversation_id must repeat the value of the resume request"
+        ),
+        "ACK_NOT_ACKNOWLEDGED": "the resume request must be acknowledged with acknowledged = true",
+        "UNPARSEABLE_REPLY": (
+            "no JSON message envelope could be read in the reply: answer with the envelope alone"
+        ),
+    }
+)
+
+_DEFAULT_HINT = "the reply could not be used as a protocol message"
+
+#: Details of a refusal that belong to the envelope of the correction request, not to ``errors``.
+_DETAIL_NOT_AN_ERROR: frozenset[str] = frozenset({"errors", "excerpt", "operation", "http_status"})
+
+#: Reductions applied in order until the correction request fits ``payload.max_message_bytes``.
+_SHRINK_EXCERPT_CHARS = 200
+_SHRINK_REMINDER_CHARS = 400
+
+
+def example_envelope_for(message_type: MessageType, conversation_id: str) -> dict[str, Any]:
+    """A minimal **valid** envelope of ``message_type`` for ``conversation_id`` (ADR-023).
+
+    The ``message_id`` is :data:`CORRECTION_EXAMPLE_MESSAGE_ID`, a placeholder: the example shows
+    the shape to copy, never an identifier to reuse. ``ValueError`` for a type with no example.
+    """
+    try:
+        content = _EXAMPLE_CONTENT[message_type]
+    except KeyError as exc:
+        raise ValueError(f"no minimal example for {message_type.value}") from exc
+    return {
+        "type": message_type.value,
+        "conversation_id": conversation_id,
+        "message_id": CORRECTION_EXAMPLE_MESSAGE_ID,
+        "content": content.model_dump(mode="json", exclude_none=True),
+    }
+
+
+def _resolve_schema(node: Mapping[str, Any], defs: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The schema node with a single ``$ref`` (or ``allOf`` of one) replaced by its definition."""
+    ref = node.get("$ref")
+    if ref is None and isinstance(node.get("allOf"), list) and len(node["allOf"]) == 1:
+        inner = node["allOf"][0]
+        ref = inner.get("$ref") if isinstance(inner, Mapping) else None
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        target = defs.get(ref.removeprefix("#/$defs/"))
+        if isinstance(target, Mapping):
+            return target
+    return node
+
+
+def _value_domain(node: Mapping[str, Any], defs: Mapping[str, Any]) -> str:
+    """The value domain of one JSON-schema node, as a short phrase the model can act on."""
+    node = _resolve_schema(node, defs)
+    enum = node.get("enum")
+    if isinstance(enum, list) and enum:
+        return "one of " + " | ".join(str(value) for value in enum)
+    options = node.get("anyOf")
+    if isinstance(options, list) and options:
+        rendered = {
+            _value_domain(option, defs): None for option in options if isinstance(option, Mapping)
+        }
+        return " or ".join(rendered)
+    kind = node.get("type")
+    if kind == "array":
+        items = node.get("items")
+        inner = _value_domain(items, defs) if isinstance(items, Mapping) else "value"
+        minimum = node.get("minItems")
+        bound = f", at least {minimum}" if isinstance(minimum, int) and minimum else ""
+        return f"array of {inner}{bound}"
+    if kind in ("integer", "number"):
+        if "exclusiveMinimum" in node:
+            return f"{kind} > {node['exclusiveMinimum']}"
+        if "minimum" in node:
+            return f"{kind} >= {node['minimum']}"
+        return str(kind)
+    if kind == "string":
+        return "non-empty string" if node.get("minLength") else "string"
+    if kind == "object" or "properties" in node:
+        return "object"
+    if kind is None:
+        return "value"
+    return str(kind)
+
+
+def _content_digest(model: type[BaseModel]) -> str:
+    """``field: domain (required)`` for every field of a content model, in declaration order."""
+    schema = model.model_json_schema()
+    defs = schema.get("$defs", {})
+    required = set(schema.get("required", ()))
+    fields = []
+    for name, node in schema.get("properties", {}).items():
+        if not isinstance(node, Mapping):
+            continue
+        suffix = " (required)" if name in required else ""
+        fields.append(f"{name}: {_value_domain(node, defs)}{suffix}")
+    return ", ".join(fields)
+
+
+def correction_reminder(
+    error_code: str, expected: frozenset[MessageType], conversation_id: str
+) -> str:
+    """The targeted reminder of a correction request: what was wrong, what is expected now, the
+    shape of each expected message and the rule to follow (ADR-023).
+
+    Everything but the per-code hint is **generated** from the content models, so the reminder
+    cannot describe a schema the application does not enforce.
+    """
+    hint = _CORRECTION_HINTS.get(error_code, _DEFAULT_HINT)
+    lines = [f"Your last reply was refused ({error_code}): {hint}."]
+    if not expected:
+        lines.append("Nothing is expected from you in this conversation.")
+        return "\n".join(lines)
+    names = ", ".join(f"`{message_type.value}`" for message_type in _ordered(expected))
+    lines.append(f"Send exactly one message, of one of these types: {names}.")
+    for message_type in _ordered(expected):
+        lines.append(
+            f"- {message_type.value}.content — {_content_digest(_content_model(message_type))}"
+        )
+    lines.append(
+        "The envelope is type, conversation_id, message_id, content. Use conversation_id "
+        f'"{conversation_id}" and a NEW message_id, unique in the session. Fix exactly what '
+        "`errors` lists; do not resend the refused message unchanged."
+    )
+    return "\n".join(lines)
+
+
+def _correction_errors(details: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The validation details of a refusal, **unchanged**, as a list of JSON objects (ADR-023).
+
+    A schema failure already carries a list of ``{loc, type, msg}``; every other code carries flat
+    details (``expected`` / ``received``, ``task_id`` / ``dependency``, ``size_bytes`` / ``max_bytes``…)
+    which become one entry, minus what the envelope of the correction already says.
+    """
+    listed = details.get("errors")
+    if isinstance(listed, list) and all(isinstance(item, Mapping) for item in listed):
+        return [dict(item) for item in listed]
+    entry = {
+        key: value
+        for key, value in details.items()
+        if key not in _DETAIL_NOT_AN_ERROR and value is not None
+    }
+    return [entry] if entry else []
+
+
+def _shrink_excerpt(fields: dict[str, Any]) -> None:
+    excerpt = fields.get("raw_excerpt")
+    fields["raw_excerpt"] = excerpt[:_SHRINK_EXCERPT_CHARS] if isinstance(excerpt, str) else None
+
+
+def _drop_excerpt(fields: dict[str, Any]) -> None:
+    fields["raw_excerpt"] = None
+
+
+def _shrink_errors(fields: dict[str, Any]) -> None:
+    fields["errors"] = list(fields.get("errors") or [])[:1]
+
+
+def _drop_errors(fields: dict[str, Any]) -> None:
+    fields["errors"] = []
+
+
+def _shrink_reminder(fields: dict[str, Any]) -> None:
+    reminder = fields.get("reminder")
+    fields["reminder"] = reminder[:_SHRINK_REMINDER_CHARS] if isinstance(reminder, str) else ""
+
+
+def _drop_example(fields: dict[str, Any]) -> None:
+    fields["example"] = {}
+
+
+def _drop_reminder(fields: dict[str, Any]) -> None:
+    fields["reminder"] = ""
+
+
+#: Applied in order until the correction request fits ``payload.max_message_bytes`` (ADR-010):
+#: the excerpt goes first (the model wrote it), the example last (it is what makes the correction
+#: actionable), and what is left — code, expected types, attempt — is always tiny.
+_CORRECTION_SHRINK_STEPS: tuple[Callable[[dict[str, Any]], None], ...] = (
+    _shrink_excerpt,
+    _drop_excerpt,
+    _shrink_errors,
+    _drop_errors,
+    _shrink_reminder,
+    _drop_example,
+    _drop_reminder,
+)
+
+
+def _ordered(expected: frozenset[MessageType]) -> list[MessageType]:
+    """The expected types in the stable order of :data:`_EXAMPLE_PREFERENCE`, then by value."""
+    order = {message_type: index for index, message_type in enumerate(_EXAMPLE_PREFERENCE)}
+    return sorted(expected, key=lambda m: (order.get(m, len(order)), m.value))
+
+
+def _content_model(message_type: MessageType) -> type[BaseModel]:
+    if message_type in PLAN_MESSAGE_TYPES:
+        return PlanContent
+    if message_type is MessageType.FINAL_ANSWER:
+        return FinalAnswerContent
+    if message_type is MessageType.USER_RESPONSE:
+        return UserResponseContent
+    return ContextResumeAckContent
 
 
 # ------------------------------------------------------------------------------------------------
@@ -426,6 +813,84 @@ class ProtocolAdapter:
             pending_message_type=pending_message_type.value,
         )
         return self._outbound(MessageType.CONTEXT_RESUME_REQUEST, conversation, message_id, content)
+
+    def build_protocol_correction_request(
+        self,
+        conversation: ConversationRecord,
+        message_id: str,
+        *,
+        error: NormalizedError,
+        expected: frozenset[MessageType],
+        rejected_message_id: str | None,
+        attempt: int,
+        max_attempts: int,
+    ) -> OutboundMessage:
+        """ADR-023 — ask the model to fix an unusable reply instead of ending the session.
+
+        The adapter owns the grammar, the schemas and the expectation table, so it is where the
+        correction is composed: the refusal code and its details **unchanged** (``errors``), the
+        types valid right now (``expected``, the ADR-007 row that was pending — a correction never
+        opens a new row), a ``reminder`` generated from the content models, a minimal valid
+        ``example`` of one of those types with the right ``conversation_id`` and a placeholder
+        ``message_id``, and the position in the correction budget. ``raw_excerpt`` carries the
+        excerpt of a reply the codec could not read (``UNPARSEABLE_REPLY``, ADR-021 §2).
+
+        The whole message is fitted under ``payload.max_message_bytes`` (ADR-010) by shrinking, in
+        order, the excerpt, the error list, the reminder and the example — never by exceeding it.
+        """
+        if attempt < 1 or max_attempts < 1:
+            raise ValueError("a correction request needs attempt >= 1 and max_attempts >= 1")
+        details = error.details
+        remote = _remote_id(conversation)
+        excerpt = details.get("excerpt")
+        fields: dict[str, Any] = {
+            "rejected_message_id": rejected_message_id,
+            "error_code": error.error_code,
+            "errors": _correction_errors(details),
+            "expected_types": sorted(message_type.value for message_type in expected),
+            "reminder": correction_reminder(error.error_code, expected, remote),
+            "example": self._correction_example(expected, details, remote),
+            "raw_excerpt": excerpt if isinstance(excerpt, str) else None,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        }
+        limit = self.config.payload.max_message_bytes
+        message = self._correction_message(conversation, message_id, fields)
+        for shrink in _CORRECTION_SHRINK_STEPS:
+            if message.size_bytes <= limit:
+                return message
+            shrink(fields)
+            message = self._correction_message(conversation, message_id, fields)
+        return message
+
+    def _correction_message(
+        self, conversation: ConversationRecord, message_id: str, fields: Mapping[str, Any]
+    ) -> OutboundMessage:
+        content = ProtocolCorrectionRequestContent.model_validate(dict(fields))
+        return self._outbound(
+            MessageType.PROTOCOL_CORRECTION_REQUEST, conversation, message_id, content
+        )
+
+    @staticmethod
+    def _correction_example(
+        expected: frozenset[MessageType], details: Mapping[str, Any], remote: str
+    ) -> dict[str, Any]:
+        """A minimal valid example of one expected type: the type the model attempted when it is
+        one of them (the shape it got wrong), otherwise the first of :data:`_EXAMPLE_PREFERENCE`."""
+        candidates = [
+            message_type for message_type in _ordered(expected) if message_type in _EXAMPLE_CONTENT
+        ]
+        if not candidates:
+            return {}
+        received = details.get("received")
+        if isinstance(received, str):
+            try:
+                attempted = MessageType(received)
+            except ValueError:
+                attempted = None
+            if attempted is not None and attempted in candidates:
+                return example_envelope_for(attempted, remote)
+        return example_envelope_for(candidates[0], remote)
 
     # -------------------------------------------------------------------------- expectation -
     def expected_inbound(

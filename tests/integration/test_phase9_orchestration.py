@@ -515,6 +515,8 @@ async def given_scripted_java_scenario_when_session_completes_then_snapshot_refl
         "last_post_status": 202,
         "last_get_status": 200,
         "last_protocol_validation_status": "valid",
+        "correction_attempt": 0,  # no correction was needed (ADR-023)
+        "correction_max_attempts": 0,
     }
     assert snapshot.last_event_type == "session.state_changed"
     assert snapshot.last_event_sequence == rig.store.count_audit_events(sid)
@@ -653,9 +655,11 @@ async def given_truncated_output_when_chunk_request_received_then_range_served_f
     assert rig.task(session.session_id, "t-chunk-1").status is TaskState.COMPLETED
 
 
-async def given_chunk_request_on_unknown_task_when_received_then_protocol_error_and_session_failed(
-    rig: Rig,
-) -> None:
+async def given_chunk_request_on_unknown_task_when_received_then_protocol_error_and_session_failed() -> (
+    None
+):
+    # the classification of the fault, without the correction loop of ADR-023 on top of it
+    rig = make_rig(make_config(protocol={"max_correction_attempts": 0}))
     rig.executor.script(task_id="t1", stdout=b"hello")
     rig.reply(
         REMOTE_1,
@@ -1280,9 +1284,12 @@ async def given_rotation_limit_reached_when_rotation_needed_then_session_failed_
 # ================================================================================================
 # 6. protocol errors (§3.5, §7.2 ; ADR-007, ADR-019 §2 ; criterion 4)
 # ================================================================================================
-async def given_unexpected_message_type_in_healthy_window_when_received_then_session_failed_with_protocol_error(
-    rig: Rig,
-) -> None:
+async def given_unexpected_message_type_in_healthy_window_when_received_then_session_failed_with_protocol_error() -> (
+    None
+):
+    """The whole trail of a protocol error, with the correction policy of ADR-023 off
+    (``max_correction_attempts = 0``): the loop applies the policy that predates it."""
+    rig = make_rig(make_config(protocol={"max_correction_attempts": 0}))
     rig.reply(REMOTE_1, final_answer())  # a final_answer cannot answer the first user_request
 
     session = await rig.run()
@@ -1337,9 +1344,12 @@ async def given_unexpected_message_type_in_healthy_window_when_received_then_ses
     assert snapshot.model_interaction.last_inbound_message_type == "final_answer"
 
 
-async def given_unexpected_message_in_warning_window_when_received_then_rotation_and_follow_up_retransmitted(
-    rig: Rig,
-) -> None:
+async def given_unexpected_message_in_warning_window_when_received_then_rotation_and_follow_up_retransmitted() -> (
+    None
+):
+    """ADR-019 §2 alone: the correction policy of ADR-023 is off, so the unusable reply rotates
+    straight away instead of being corrected first."""
+    rig = make_rig(make_config(protocol={"max_correction_attempts": 0}))
     rig.script_java_scenario()
     session = await rig.run()
     sid = session.session_id

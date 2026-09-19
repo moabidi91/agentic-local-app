@@ -44,6 +44,8 @@ flowchart LR
 
 Le modèle doit respecter une grammaire fermée. La première réponse est un `discovery_plan` (c'est ainsi que le modèle découvre l'OS, le shell, le répertoire courant, les versions installées — l'application n'injecte rien) — ou, quand la demande n'appelle aucune commande (une explication, une analyse, une question à poser à l'utilisateur), un `user_response` ([ADR-022](docs/adr/ADR-022-reponse-utilisateur.md) ; `protocol.allow_direct_response = false` rétablit la règle stricte de la spec). Un `user_response` conclut le tour comme un `final_answer` : son corps est opaque, borné, affiché tel quel ; `expects_reply = true` signifie que le modèle attend une réponse de l'utilisateur (`agentic-app reply <sid> "…"`).
 
+Une réponse hors de cette grammaire — enveloppe malformée, type inattendu, contenu qui viole son schéma ou une règle sémantique, ou texte que le codec ne sait même pas lire — **ne termine plus la session sur-le-champ** ([ADR-023](docs/adr/ADR-023-politique-de-correction.md)). Elle est persistée et comptée comme avant, puis l'application renvoie au modèle un `protocol_correction_request` : les erreurs de validation exactes, les types valides à cet instant, un rappel de leur forme et un exemple minimal valide — et elle relit, contre la **même** attente. Au plus `protocol.max_correction_attempts` réponses inutilisables d'affilée sont tolérées (5 par défaut) ; une correction ne consomme ni cycle ni plan, et toute réponse valide remet le compteur à zéro. Passé cette borne, la conduite d'avant reprend : rotation de conversation si la fenêtre de contexte n'est pas saine et que `context.rotate_on_unusable_reply_in_warning` est actif (défaut), sinon session `FAILED` — avec, dans les détails de l'échec, le nombre de corrections tentées. Une fenêtre déjà saturée, elle, ne corrige pas du tout et va droit à ce repli : un rappel envoyé dans un contexte plein ne peut pas recevoir de réponse.
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -82,6 +84,7 @@ sequenceDiagram
 | Boucles bornées | Budget de session (`max_cycles`, `max_plans`, `max_total_duration_ms`) | `ProtocolOrchestrator` |
 | Interruption | SIGTERM + drain, tout INTERRUPTED, READY en temps borné | `InterruptionHandler` |
 | Robustesse | Taxonomie d'erreurs fermée, retries bornés, circuit breaker | `FailureManager`, `RetryController`, `CircuitBreaker` |
+| Tolérance à un modèle imparfait | Réponse inutilisable citée au modèle et redemandée (`protocol_correction_request`), borne `max_correction_attempts`, puis rotation ou échec | `ProtocolAdapter`, `ProtocolOrchestrator` |
 | Restart-safe | Checkpoints + politique explicite de reprise | `RecoveryCoordinator` |
 | Auditabilité | Journal append-only chaîné par hash | `AuditLog` |
 | Observabilité | Snapshot cohérent à tout instant | `ExecutionTracker`, `TelemetryService` |
@@ -196,7 +199,7 @@ uv run agentic-app codec list
 uv run agentic-app codec show
 ```
 
-Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, réponse directe du modèle (`[protocol]`), budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
+Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, réponse directe du modèle et politique de correction (`[protocol]` : `allow_direct_response`, `max_correction_attempts`), budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
 
 **Choisir un provider de transport.** Le contrat `TransportGateway` est unique, mais son implémentation se choisit **par configuration** avec `transport.provider` ([ADR-020](docs/adr/ADR-020-transport-enfichable.md)) :
 
@@ -247,7 +250,7 @@ url = "https://api.example.com/v1/threads/{conversation_id}/chat/completions"
 body = { messages = [{ role = "user", content = "{message_json}" }] }   # content reçoit le texte
 ```
 
-Une réponse que le codec ne sait pas lire (pas de JSON, JSON invalide, chemin absent) est un échec `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY`, jamais rejoué, dont le `FailureRecord` garde un extrait de la forme brute (`excerpt`) et la raison ; `agentic-app codec show` affiche le codec effectif et ses options. L'exemple complet (init, post, get, options du codec) est commenté dans `config.toml`.
+Une réponse que le codec ne sait pas lire (pas de JSON, JSON invalide, chemin absent) est une `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY`, jamais rejouée, dont le `FailureRecord` garde un extrait de la forme brute (`excerpt`) et la raison ; elle est persistée comme message entrant invalide et suit la politique de correction du §2 avant tout échec (ADR-023). `agentic-app codec show` affiche le codec effectif et ses options. L'exemple complet (init, post, get, options du codec) est commenté dans `config.toml`.
 
 Les routes de l'API sont listées dans [docs/phases/phase-09-interfaces.md](docs/phases/phase-09-interfaces.md) et [ADR-018](docs/adr/ADR-018-api-pour-un-front-et-flux-live.md).
 

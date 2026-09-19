@@ -52,6 +52,7 @@ from agentic_local_app.protocol.adapter import render_instructions
 from agentic_local_app.testing.fake_executor import FakeCommandExecutor
 from agentic_local_app.transport.codecs import UNPARSEABLE_REPLY
 from agentic_local_app.transport.fake import FakeTransportGateway
+from conformance.harness import make_config, make_rig
 from conformance.registry import case
 from integration.phase9_rig import (
     REMOTE_1,
@@ -61,8 +62,6 @@ from integration.phase9_rig import (
     discovery_plan,
     execution_plan,
     final_answer,
-    make_config,
-    make_rig,
     resume_ack,
     user_response,
 )
@@ -205,14 +204,28 @@ async def run_undecodable(rig: Rig, raw: Any) -> Any:
     return failure
 
 
-def assert_nothing_persisted_inbound(rig: Rig) -> None:
-    """A reply the codec never decoded leaves no inbound message and no rejection (ADR-021)."""
-    assert inbound_records(rig) == []
-    assert rig.events(EventType.MESSAGE_REJECTED) == []
+def assert_raw_excerpt_persisted(rig: Rig, excerpt: str, reason: str) -> None:
+    """La trace d'une réponse que le codec n'a pas su lire (ADR-021 §2 amendé par ADR-023).
+
+    Il n'y a pas d'enveloppe à enregistrer, mais il y a une réponse : elle est persistée sous le
+    type interne `system_error` avec l'extrait brut et la raison du codec, comptée dans
+    `protocol_error_count` et publiée en `message.rejected`, exactement comme une enveloppe
+    refusée. Le curseur, lui, ne bouge pas : une réponse illisible n'a pas d'identifiant.
+    """
+    records = inbound_records(rig)
+    assert len(records) == 1
+    record = records[0]
+    assert record.message_type is MessageType.SYSTEM_ERROR
+    assert record.validation_status == "invalid"
+    assert record.payload == {"raw": excerpt, "reason": reason}
+    rejected = rig.events(EventType.MESSAGE_REJECTED)
+    assert len(rejected) == 1
+    assert rejected[0].payload["error_code"] == UNPARSEABLE_REPLY
+    assert rejected[0].payload["message_type"] is None
     conversation = rig.conversation(CONV)
-    assert conversation.protocol_error_count == 0
+    assert conversation.protocol_error_count == 1
     assert conversation.get_cursor is None
-    assert conversation.last_model_response_state == "awaiting"
+    assert conversation.last_model_response_state == "received_invalid"
 
 
 async def completed_then_warning(rig: Rig) -> str:
@@ -845,7 +858,11 @@ async def given_strict_direct_response_flag_when_model_answers_directly_then_une
 ):
     base = make_config()
     rig = make_rig(
-        base.model_copy(update={"protocol": ProtocolSection(allow_direct_response=False)})
+        base.model_copy(
+            update={
+                "protocol": ProtocolSection(allow_direct_response=False, max_correction_attempts=0)
+            }
+        )
     )
 
     await run_rejecting(rig, user_response())
@@ -1167,12 +1184,15 @@ PROSE = "I am unable to produce a plan right now, sorry."
     "raw-no-json",
     category=RAW,
     sends="de la prose sans le moindre JSON (codec json_text)",
-    expects="erreur de transport avec `reason = no_json_found` et l'extrait brut de la réponse",
+    expects=(
+        "erreur de transport avec `reason = no_json_found` ; l'extrait brut est persisté en "
+        "entrant sous `system_error` et compté (ADR-021 §2 amendé par ADR-023)"
+    ),
     code="UNPARSEABLE_REPLY",
-    policy="échec ; rien n'est persisté en entrant, seul un FailureRecord est écrit",
-    ref="§3.12 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-021 · ADR-023",
 )
-async def given_json_text_codec_when_reply_has_no_json_then_unparseable_reply_without_any_record() -> (
+async def given_json_text_codec_when_reply_has_no_json_then_unparseable_reply_with_raw_excerpt() -> (
     None
 ):
     rig = make_codec_rig()
@@ -1184,7 +1204,7 @@ async def given_json_text_codec_when_reply_has_no_json_then_unparseable_reply_wi
     assert failure.details["index"] == 0
     assert failure.details["excerpt"] == PROSE  # quotable back to the model
     assert failure.details["operation"] == "GET"
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, PROSE, "no_json_found")
 
 
 @case(
@@ -1193,8 +1213,8 @@ async def given_json_text_codec_when_reply_has_no_json_then_unparseable_reply_wi
     sends="un JSON tronqué (accolade jamais refermée)",
     expects="erreur de transport avec `reason = json_unbalanced`",
     code="UNPARSEABLE_REPLY",
-    policy="échec ; aucune enveloppe à persister",
-    ref="§3.12 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-021 · ADR-023",
 )
 async def given_json_text_codec_when_reply_is_truncated_then_json_unbalanced() -> None:
     rig = make_codec_rig()
@@ -1204,7 +1224,7 @@ async def given_json_text_codec_when_reply_is_truncated_then_json_unbalanced() -
 
     assert failure.details["reason"] == "json_unbalanced"
     assert failure.details["excerpt"] == truncated
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, truncated, "json_unbalanced")
 
 
 @case(
@@ -1213,17 +1233,18 @@ async def given_json_text_codec_when_reply_is_truncated_then_json_unbalanced() -
     sends="un bloc ```json``` dont le contenu n'est pas du JSON valide",
     expects="erreur de transport avec `reason = json_invalid` et l'erreur du parseur",
     code="UNPARSEABLE_REPLY",
-    policy="échec ; aucune enveloppe à persister",
-    ref="§3.12 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-021 · ADR-023",
 )
 async def given_json_text_codec_when_fenced_block_is_invalid_json_then_json_invalid() -> None:
     rig = make_codec_rig()
+    fenced = "```json\n{\"type\": 'discovery_plan',}\n```"
 
-    failure = await run_undecodable(rig, "```json\n{\"type\": 'discovery_plan',}\n```")
+    failure = await run_undecodable(rig, fenced)
 
     assert failure.details["reason"] == "json_invalid"
     assert "error" in failure.details
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, fenced, "json_invalid")
 
 
 @case(
@@ -1232,8 +1253,8 @@ async def given_json_text_codec_when_fenced_block_is_invalid_json_then_json_inva
     sends="une réponse dont le `content_path` configuré n'existe pas",
     expects="erreur de transport avec `reason = path_not_found` et le chemin cherché",
     code="UNPARSEABLE_REPLY",
-    policy="échec ; aucune enveloppe à persister",
-    ref="§3.12 · ADR-020 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-020 · ADR-021 · ADR-023",
 )
 async def given_json_text_codec_with_content_path_when_path_is_absent_then_path_not_found() -> None:
     rig = make_codec_rig({"content_path": "choices[0].message.content"})
@@ -1242,7 +1263,7 @@ async def given_json_text_codec_with_content_path_when_path_is_absent_then_path_
 
     assert failure.details["reason"] == "path_not_found"
     assert failure.details["path"] == "choices[0].message.content"
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, '{"choices":[]}', "path_not_found")
 
 
 @case(
@@ -1251,8 +1272,8 @@ async def given_json_text_codec_with_content_path_when_path_is_absent_then_path_
     sends="un objet brut alors que le codec attend du texte (aucun `content_path`)",
     expects="erreur de transport avec `reason = unexpected_type` et `expected = string`",
     code="UNPARSEABLE_REPLY",
-    policy="échec ; aucune enveloppe à persister",
-    ref="§3.12 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-021 · ADR-023",
 )
 async def given_json_text_codec_without_content_path_when_item_is_an_object_then_unexpected_type() -> (
     None
@@ -1263,7 +1284,7 @@ async def given_json_text_codec_without_content_path_when_item_is_an_object_then
 
     assert failure.details["reason"] == "unexpected_type"
     assert failure.details["expected"] == "string"
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, '{"message":"hello"}', "unexpected_type")
 
 
 @case(
@@ -1272,8 +1293,8 @@ async def given_json_text_codec_without_content_path_when_item_is_an_object_then
     sends="un texte dont le JSON décodé est un tableau vide",
     expects="le décorateur refuse la réponse : `reason = no_envelope`",
     code="UNPARSEABLE_REPLY",
-    policy="échec ; aucune enveloppe à persister",
-    ref="§3.12 · ADR-004 · ADR-021",
+    policy="échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer",
+    ref="§3.12 · ADR-004 · ADR-021 · ADR-023",
 )
 async def given_json_text_codec_when_decoded_document_is_empty_then_no_envelope() -> None:
     rig = make_codec_rig()
@@ -1282,7 +1303,7 @@ async def given_json_text_codec_when_decoded_document_is_empty_then_no_envelope(
 
     assert failure.details["reason"] == "no_envelope"
     assert failure.details["excerpt"] == "[]"
-    assert_nothing_persisted_inbound(rig)
+    assert_raw_excerpt_persisted(rig, "[]", "no_envelope")
 
 
 @case(

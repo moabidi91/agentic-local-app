@@ -25,9 +25,16 @@ The loop itself (§14 amended by the ADRs — see ``docs/phases/phase-09-orchest
    child (ADR-019 §5) and ``M`` is retransmitted there; otherwise the conversation goes
    ``WAITING_MODEL_RESPONSE`` and ``M`` is POSTed with the retry policy of §7;
 2. **receive**: GET (polling in the gateway) with the retry policy; ``MODEL_CONTEXT_WINDOW_ERROR``
-   rotates; an exhausted ``MODEL_GET_TIMEOUT`` or a protocol error rotates once when the window is
-   ``WARNING`` (ADR-019 §2) and fails otherwise; a valid message is persisted (``message.inbound``),
-   a rejected one too (``message.rejected``, ``protocol_error_count``);
+   rotates; a valid message is persisted (``message.inbound``), an unusable one too
+   (``message.rejected``, ``protocol_error_count``) — a rejected envelope with what the model sent,
+   a reply the codec could not read with its raw excerpt (ADR-021 §2 amended by ADR-023). An
+   unusable reply then goes through the **correction policy** of ADR-023
+   (:meth:`_SessionRun._after_unusable_reply`): a saturated window rotates at once, otherwise the
+   application POSTs a ``protocol_correction_request`` (``correction.requested``) and reads again
+   against the **same** expectation, up to ``protocol.max_correction_attempts`` replies in a row
+   — no cycle, no plan — and only then applies the previous policy (rotate in ``WARNING``,
+   ADR-019 §2, else fail). An exhausted ``MODEL_GET_TIMEOUT`` is not a protocol fault and keeps
+   that previous policy unchanged;
 3. **process**: a plan is persisted with its tasks (``plan.received``), ``max_plans`` and the
    duration are checked before it starts (plan ``PENDING → FAILED`` on excess), the ``PlanRunner``
    executes it, the ``execution_result`` is fitted under ``max_message_bytes`` (ADR-010) and becomes
@@ -50,7 +57,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, TypeVar
@@ -157,6 +164,7 @@ __all__ = [
     "WINDOW_REASON_UNUSABLE_REPLY",
     "ProtocolOrchestrator",
     "SleepFn",
+    "consecutive_unusable_replies",
     "pending_outbound_of",
 ]
 
@@ -204,23 +212,53 @@ _RESUMABLE_MESSAGE_TYPES: frozenset[MessageType] = frozenset(
 )
 _ONE_MS = timedelta(milliseconds=1)
 
+#: ``validation_status`` of an inbound record the application refused (ADR-015, ADR-023).
+_INVALID = "invalid"
+
 
 def pending_outbound_of(
     store: ConversationStore, conversation: ConversationRecord
 ) -> MessageRecord | None:
     """The unanswered ``user_request`` / ``execution_result`` a ``WAITING_MODEL_RESPONSE``
-    conversation waits on (its last message), or ``None`` (ADR-016 "POST sent, no GET")."""
+    conversation waits on, or ``None`` (ADR-016 "POST sent, no GET").
+
+    A correction exchange (ADR-023) is **transparent**: the trailing ``protocol_correction_request``
+    messages and the unusable replies they answer leave ``M`` pending, so a session that crashed in
+    the middle of a correction loop is resumable exactly like one that crashed waiting for a first
+    reply. A **valid** inbound record means the reply arrived and nothing is pending any more.
+    """
     if conversation.status is not ConversationState.WAITING_MODEL_RESPONSE:
         return None
-    messages = store.list_messages(conversation.conversation_id)
-    if not messages:
-        return None
-    last = messages[-1]
-    if last.direction is not MessageDirection.OUTBOUND:
-        return None
-    if last.message_type not in _RESUMABLE_MESSAGE_TYPES:
-        return None
-    return last
+    for record in reversed(store.list_messages(conversation.conversation_id)):
+        if record.direction is MessageDirection.INBOUND:
+            if record.validation_status != _INVALID:
+                return None
+            continue
+        if record.message_type is MessageType.PROTOCOL_CORRECTION_REQUEST:
+            continue
+        return record if record.message_type in _RESUMABLE_MESSAGE_TYPES else None
+    return None
+
+
+def consecutive_unusable_replies(store: ConversationStore, conversation: ConversationRecord) -> int:
+    """How many unusable replies in a row the conversation ends on (ADR-023 counter).
+
+    Derived, never persisted (the SQLite schema is version 1 and carries no correction column):
+    the trailing inbound records refused (``validation_status = "invalid"``) — an envelope rejected
+    by the adapter or a reply the codec could not read, both persisted the same way — with the
+    ``protocol_correction_request`` messages that answer them ignored. Any valid inbound message
+    ends the run, which is exactly the reset rule of the policy.
+    """
+    count = 0
+    for record in reversed(store.list_messages(conversation.conversation_id)):
+        if record.direction is MessageDirection.INBOUND:
+            if record.validation_status != _INVALID:
+                return count
+            count += 1
+            continue
+        if record.message_type is not MessageType.PROTOCOL_CORRECTION_REQUEST:
+            return count
+    return count
 
 
 # ------------------------------------------------------------------------------------------------
@@ -356,6 +394,10 @@ class _SessionRun:
         self._cycle: CycleRecord | None = None
         self._last_outbound: MessageRecord | None = None
         self._pending: _Pending | None = None
+        #: ADR-023: unusable replies in a row in the current conversation. In memory only — the
+        #: SQLite schema is version 1 with no migration, and :func:`consecutive_unusable_replies`
+        #: rebuilds the value from the persisted trail when a crashed session resumes.
+        self._unusable_replies = 0
 
     # ---- entry ---------------------------------------------------------------------------------
     async def run(self) -> SessionRecord:
@@ -469,6 +511,8 @@ class _SessionRun:
         self._cycle = cycle
         self._last_outbound = record
         self._pending = self._pending_from_record(record, conv)
+        # ADR-023: a session that crashed mid-correction resumes with the budget it had spent
+        self._unusable_replies = consecutive_unusable_replies(o.store, conv)
         if not record.post_confirmed:
             message = self._build(self._pending, conv, record.message_id)
             await self._post(message, record)
@@ -600,9 +644,16 @@ class _SessionRun:
         )
         self._publish_budget(updated)
 
-    async def _post(self, message: OutboundMessage, record: MessageRecord) -> None:
+    async def _post(
+        self, message: OutboundMessage, record: MessageRecord, *, track_pending: bool = True
+    ) -> None:
         """POST an already persisted outbound message (retries reuse the same ``message_id``),
-        confirm it, count its bytes, ``message.outbound``, re-evaluate the window."""
+        confirm it, count its bytes, ``message.outbound``, re-evaluate the window.
+
+        ``track_pending`` is ``False`` for a ``protocol_correction_request`` (ADR-023): it is not
+        the message the loop waits a reply to, so it must not become ``_last_outbound`` — the
+        expectation stays the one of the message it corrects.
+        """
         o = self._o
         remote = self._remote()
         ack, attempts = await self._call(
@@ -618,7 +669,8 @@ class _SessionRun:
                 context_bytes=o.monitor.account(conv.context_bytes, message.size_bytes),
                 last_model_response_state=_AWAITING,
             )
-        self._last_outbound = confirmed
+        if track_pending:
+            self._last_outbound = confirmed
         self._publish(
             EventType.MESSAGE_OUTBOUND,
             now,
@@ -649,6 +701,11 @@ class _SessionRun:
                 await self._rotate()
                 continue
             except _FailedError as failed:
+                if failed.error.error_type is ErrorType.MODEL_PROTOCOL_ERROR:
+                    # a reply the codec could not read (``UNPARSEABLE_REPLY``, ADR-021 §2 amended
+                    # by ADR-023): already persisted and counted by ``_note_unusable_reply``
+                    await self._after_unusable_reply(failed.error, rejected_message_id=None)
+                    continue
                 if o.monitor.should_rotate_on_unusable_reply(self._conversation(), failed.error):
                     self._apply_window(ContextWindowState.SATURATED, WINDOW_REASON_UNUSABLE_REPLY)
                     await self._rotate()
@@ -687,20 +744,19 @@ class _SessionRun:
                 stored_output_task_ids=task_ids,
             )
         except ProtocolError as exc:
-            self._persist_rejected(reply, exc, received_bytes)
+            rejected_message_id = self._persist_rejected(reply, exc, received_bytes)
+            self._unusable_replies += 1
             error, decision = o.failure_manager.handle(
-                exc,
+                ProtocolError(exc.error.error_code, **self._correction_details(exc.error.details)),
                 1,
                 operation=OP_GET,
                 session_id=self._sid,
                 conversation_id=conv.conversation_id,
                 cycle_id=self._cycle_id(),
             )
-            if o.monitor.should_rotate_on_unusable_reply(self._conversation(), error):
-                self._apply_window(ContextWindowState.SATURATED, WINDOW_REASON_UNUSABLE_REPLY)
-                await self._rotate()
-                return None
-            raise _FailedError(error, reason=REASON_FAILURE, recorded=True) from exc
+            await self._after_unusable_reply(error, rejected_message_id=rejected_message_id)
+            return None
+        self._unusable_replies = 0  # ADR-023: any valid reply resets the correction budget
         now = o.clock.now()
         record = MessageRecord(
             message_id=inbound.envelope.message_id,
@@ -739,9 +795,15 @@ class _SessionRun:
         self._apply_window(o.monitor.evaluate(self._conversation()), WINDOW_REASON_THRESHOLD)
         return inbound
 
-    def _persist_rejected(self, reply: GetResult, exc: ProtocolError, received_bytes: int) -> None:
+    def _persist_rejected(
+        self, reply: GetResult, exc: ProtocolError, received_bytes: int
+    ) -> str | None:
         """A rejected reply is persisted (``validation_status = invalid``) and counted in the
-        context — it is in the model's context (ADR-013) — then ``message.rejected``."""
+        context — it is in the model's context (ADR-013) — then ``message.rejected``.
+
+        Returns the ``message_id`` the model sent when it was readable (what a correction request
+        quotes back as ``rejected_message_id``, ADR-023), ``None`` otherwise.
+        """
         o = self._o
         conv = self._conversation()
         # the reply may be anything the model sent: an object, a list, a bare string, nothing at
@@ -797,6 +859,192 @@ class _SessionRun:
                 "error_code": exc.error.error_code,
                 "size_bytes": received_bytes,
                 "details": dict(exc.error.details),
+            },
+        )
+        return id_str
+
+    # ---- unusable replies and corrections (ADR-023) ---------------------------------------------
+    def _persist_unparseable(self, error: NormalizedError) -> None:
+        """A reply the **codec** could not read leaves the same trail as a rejected envelope.
+
+        ADR-021 §2 said "nothing is persisted as inbound: there is no envelope to record"; ADR-023
+        amends it, because the correction policy needs one uniform trail and one uniform counter.
+        There is still no envelope, so the record carries what the codec could quote —
+        ``{"raw": <excerpt>, "reason": <why>}`` — under the internal ``system_error`` type, exactly
+        as a reply with no readable ``type`` already does. The size counted in the window is the
+        size of that record: the raw form is only known through its excerpt.
+        """
+        o = self._o
+        conv = self._conversation()
+        excerpt = error.details.get("excerpt")
+        reason = error.details.get("reason")
+        payload: dict[str, Any] = {
+            "raw": excerpt if isinstance(excerpt, str) else None,
+            "reason": reason if isinstance(reason, str) else error.error_code,
+        }
+        recorded_bytes = size_bytes(payload)
+        now = o.clock.now()
+        record = MessageRecord(
+            message_id=o.ids.message_id(),
+            session_id=self._sid,
+            conversation_id=conv.conversation_id,
+            direction=MessageDirection.INBOUND,
+            message_type=MessageType.SYSTEM_ERROR,
+            payload=payload,
+            size_bytes=recorded_bytes,
+            cycle_id=self._cycle_id(),
+            received_at=now,
+            validation_status=_INVALID,
+            created_at=now,
+        )
+        with o.store.transaction():
+            o.store.save_message(record)
+            self._conv = o.lifecycle.update_conversation(
+                conv.conversation_id,
+                context_bytes=o.monitor.account(conv.context_bytes, recorded_bytes),
+                protocol_error_count=conv.protocol_error_count + 1,
+                last_inbound_message_id=record.message_id,
+                last_model_response_state=_RECEIVED_INVALID,
+            )
+        http_status = error.details.get("http_status")
+        self._publish(
+            EventType.MESSAGE_REJECTED,
+            now,
+            cycle_id=record.cycle_id,
+            payload={
+                "message_type": None,
+                "message_id": None,
+                "get_status": http_status if isinstance(http_status, int) else None,
+                "validation_status": _INVALID,
+                "error_code": error.error_code,
+                "size_bytes": recorded_bytes,
+                "details": dict(error.details),
+            },
+        )
+
+    def _note_unusable_reply(self, exc: TransportError, operation: str) -> TransportError:
+        """ADR-023: a GET that came back unreadable is persisted and counted **before** the
+        ``FailureManager`` records it, so the failure itself states where the correction budget
+        stands. Any other transport failure passes through untouched."""
+        if operation != OP_GET or exc.error_type is not ErrorType.MODEL_PROTOCOL_ERROR:
+            return exc
+        self._persist_unparseable(exc.error)
+        self._unusable_replies += 1
+        details = self._correction_details(exc.error.details)
+        return TransportError(
+            exc.error.error_type,
+            exc.error.error_code,
+            retryable=exc.error.retryable,
+            **details,
+        )
+
+    def _correction_details(self, details: Mapping[str, Any]) -> dict[str, Any]:
+        """``details`` plus where the correction budget stands, when the policy is on (ADR-023).
+
+        With ``protocol.max_correction_attempts = 0`` the policy does not exist and the details are
+        exactly those of the fault, as before ADR-023.
+        """
+        limit = self._o.config.protocol.max_correction_attempts
+        if limit <= 0:
+            return dict(details)
+        return {
+            **details,
+            "unusable_replies": self._unusable_replies,
+            "corrections_attempted": min(self._unusable_replies - 1, limit),
+            "max_correction_attempts": limit,
+        }
+
+    async def _after_unusable_reply(
+        self, error: NormalizedError, *, rejected_message_id: str | None
+    ) -> None:
+        """ADR-023 — what follows an unusable reply, once it is persisted, counted and recorded.
+
+        Order, decided in ADR-023 §Décision: a **saturated** window rotates at once (a correction
+        sent into a full context cannot be answered); a ``HEALTHY`` or ``WARNING`` window corrects
+        first, up to ``protocol.max_correction_attempts`` replies in a row; once they are spent the
+        policy that predates ADR-023 applies — rotate if the window is not ``HEALTHY`` and
+        ``context.rotate_on_unusable_reply_in_warning`` is on (ADR-019 §2), fail otherwise.
+
+        Returns when the loop must read again (a correction was sent, or the child conversation is
+        now current); raises :class:`_FailedError` when the session must end on ``error``.
+        """
+        o = self._o
+        limit = o.config.protocol.max_correction_attempts
+        conv = self._conversation()
+        if 0 < limit and self._unusable_replies <= limit and not o.monitor.is_saturated(conv):
+            await self._request_correction(
+                error,
+                rejected_message_id=rejected_message_id,
+                attempt=self._unusable_replies,
+                max_attempts=limit,
+            )
+            return
+        if o.monitor.should_rotate_on_unusable_reply(conv, error):
+            self._apply_window(ContextWindowState.SATURATED, WINDOW_REASON_UNUSABLE_REPLY)
+            await self._rotate()
+            # the child re-read the instructions and starts on a fresh context: its own budget
+            self._unusable_replies = 0
+            return
+        raise _FailedError(error, reason=REASON_FAILURE, recorded=True)
+
+    async def _request_correction(
+        self,
+        error: NormalizedError,
+        *,
+        rejected_message_id: str | None,
+        attempt: int,
+        max_attempts: int,
+    ) -> None:
+        """POST a ``protocol_correction_request`` and publish ``correction.requested`` (ADR-023).
+
+        It opens **no cycle** and consumes no plan: a correction is not a turn of the loop, it is
+        the same turn asked again. The expectation is therefore untouched — it is read from the
+        last substantive outbound message, which the correction does not replace — and the record
+        is persisted before the POST like every other outbound message (ADR-015).
+        """
+        o = self._o
+        self._check_interrupted()
+        conv = self._conversation()
+        assert self._last_outbound is not None
+        expected = o.adapter.expected_inbound(self._last_outbound, conv)
+        message = o.adapter.build_protocol_correction_request(
+            conv,
+            o.ids.message_id(),
+            error=error,
+            expected=expected,
+            rejected_message_id=rejected_message_id,
+            attempt=attempt,
+            max_attempts=max_attempts,
+        )
+        now = o.clock.now()
+        record = MessageRecord(
+            message_id=message.envelope.message_id,
+            session_id=self._sid,
+            conversation_id=conv.conversation_id,
+            direction=MessageDirection.OUTBOUND,
+            message_type=message.message_type,
+            payload=message.payload,
+            size_bytes=message.size_bytes,
+            cycle_id=self._cycle_id(),
+            created_at=now,
+        )
+        with o.store.transaction():
+            o.store.save_message(record)
+            self._conv = o.lifecycle.update_conversation(
+                conv.conversation_id, last_outbound_message_id=record.message_id
+            )
+        await self._post(message, record, track_pending=False)
+        self._publish(
+            EventType.CORRECTION_REQUESTED,
+            o.clock.now(),
+            cycle_id=record.cycle_id,
+            payload={
+                "message_id": record.message_id,
+                "error_code": error.error_code,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "expected_types": sorted(message_type.value for message_type in expected),
+                "rejected_message_id": rejected_message_id,
             },
         )
 
@@ -1078,7 +1326,7 @@ class _SessionRun:
                 if exc.error_type is ErrorType.INTERRUPTED:
                     raise _InterruptedError() from exc
                 error, decision = o.failure_manager.handle(
-                    exc,
+                    self._note_unusable_reply(exc, operation),
                     attempt,
                     operation=operation,
                     session_id=self._sid,

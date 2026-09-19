@@ -867,7 +867,12 @@ MODEL_INTERACTION_FIELDS = {
         pytest.param(CycleView, CYCLE_FIELDS, id="cycle"),
         pytest.param(PlanView, PLAN_FIELDS, id="plan"),
         pytest.param(TaskView, TASK_FIELDS | {"timed_out", "reason"}, id="task"),
-        pytest.param(ModelInteractionView, MODEL_INTERACTION_FIELDS, id="model_interaction"),
+        pytest.param(
+            ModelInteractionView,
+            # ADR-023 adds where the correction budget stands, derived and never persisted
+            MODEL_INTERACTION_FIELDS | {"correction_attempt", "correction_max_attempts"},
+            id="model_interaction",
+        ),
         pytest.param(
             RuntimeSnapshot,
             {
@@ -2118,6 +2123,7 @@ def given_metrics_dict_when_read_then_documented_structure(
         "breaker_transitions_total",
         "messages_total",
         "messages_rejected_total",
+        "corrections_total",
         "context_saturations_total",
         "budget_exceeded_total",
     }

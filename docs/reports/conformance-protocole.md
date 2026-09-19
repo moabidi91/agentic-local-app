@@ -2,7 +2,7 @@
 
 # Rapport de conformité protocolaire — comportement de l'application face à un modèle qui se trompe
 
-**Généré le 2026-09-18** à partir de la batterie `tests/conformance` (114 cas, tous exécutés à chaque `pytest`).
+**Généré le 2026-09-19** à partir de la batterie `tests/conformance` (121 cas, tous exécutés à chaque `pytest`).
 
 ## 1. Ce que ce rapport mesure
 
@@ -12,14 +12,17 @@ Chaque ligne des tableaux est un test exécutable de `tests/conformance` : la bo
 
 ## 2. Les politiques en vigueur
 
-Quatre comportements possibles, et un seul est choisi selon la nature de la faute :
+Cinq comportements possibles, et un seul est choisi selon la nature de la faute :
 
-1. **Rejet + échec de session.** Une erreur de protocole (`MODEL_PROTOCOL_ERROR`) n'est jamais rejouée — renvoyer le même message ne changerait rien (spec §7.2). La réponse fautive est **persistée** (`validation_status = "invalid"`, événement `message.rejected`), comptée dans la fenêtre de contexte (elle est dans le contexte du modèle, ADR-013) et dans `protocol_error_count` ; un `FailureRecord` est écrit ; la session passe en `FAILED`.
-2. **Rejet + rotation.** Si la fenêtre de contexte est déjà en `WARNING` et que `context.rotate_on_unusable_reply_in_warning` est vrai (défaut), la même faute est lue comme un signe de saturation : l'application ouvre une conversation enfant, lui envoie un résumé, retransmet le message en attente et **continue** (ADR-019 §2, ADR-014).
-3. **Acceptation avec avertissement.** Une valeur licite mais contradictoire ou implicite (drapeaux contradictoires, workers en séquentiel, budget de sortie supérieur au plafond) est acceptée, normalisée, et l'écart est enregistré comme avertissement sur le message entrant — le modèle n'est pas puni pour une imprécision sans conséquence (ADR-009, ADR-010).
-4. **Acceptation.** Le message est conforme : il est persisté, le cycle avance.
+1. **Rejet + correction.** C'est la première réponse de l'application à une faute (ADR-023). La réponse fautive est **persistée** (`validation_status = "invalid"`, événement `message.rejected`), comptée dans la fenêtre de contexte (elle est dans le contexte du modèle, ADR-013) et dans `protocol_error_count`, et un `FailureRecord` est écrit ; puis l'application POSTe un `protocol_correction_request` qui cite les erreurs de validation exactes, les types valides à cet instant, un rappel de leur forme et un exemple minimal valide, et relit contre la **même** attente. Une erreur de protocole n'est toujours pas rejouée (spec §7.2) — renvoyer le même message ne changerait rien : une correction est un message neuf, pas une nouvelle tentative. Elle n'ouvre aucun cycle et ne consomme aucun plan, seul le budget de durée continue de courir, et au plus `protocol.max_correction_attempts` réponses inutilisables d'affilée sont tolérées (5 par défaut) ; toute réponse valide remet le compteur à zéro.
+2. **Rejet + rotation.** Une fois les corrections épuisées — ou tout de suite, sans corriger, quand la fenêtre est déjà `SATURATED`, un rappel envoyé dans un contexte plein ne pouvant pas recevoir de réponse —, si la fenêtre n'est pas `HEALTHY` et que `context.rotate_on_unusable_reply_in_warning` est vrai (défaut), la faute est lue comme un signe de saturation : l'application ouvre une conversation enfant, lui envoie un résumé, retransmet le message en attente et **continue** (ADR-019 §2, ADR-014), l'enfant repartant avec un budget de corrections neuf.
+3. **Rejet + échec de session.** Ce qui reste quand aucune rotation n'est possible : fenêtre `HEALTHY`, ou `context.rotate_on_unusable_reply_in_warning` à faux — auquel cas même une fenêtre saturée échoue au lieu de rotationner. La session passe en `FAILED` sur la **dernière** erreur, dont les `details` disent combien de corrections ont été tentées.
+4. **Acceptation avec avertissement.** Une valeur licite mais contradictoire ou implicite (drapeaux contradictoires, workers en séquentiel, budget de sortie supérieur au plafond) est acceptée, normalisée, et l'écart est enregistré comme avertissement sur le message entrant — le modèle n'est pas puni pour une imprécision sans conséquence (ADR-009, ADR-010).
+5. **Acceptation.** Le message est conforme : il est persisté, le cycle avance.
 
-Une réponse que le **codec** ne sait même pas lire (pas d'enveloppe du tout : du texte nu, un JSON invalide, un chemin absent) ne passe pas par l'adaptateur : c'est une `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY` levée au niveau du transport, avec un extrait brut de la réponse (ADR-021) — même politique (1 ou 2), mais aucune enveloppe à persister.
+Une réponse que le **codec** ne sait même pas lire (pas d'enveloppe du tout : du texte nu, un JSON invalide, un chemin absent) ne passe pas par l'adaptateur : c'est une `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY` levée au niveau du transport, avec un extrait brut de la réponse (ADR-021). Même politique (1, 2 ou 3) et, depuis ADR-023, même trace : faute d'enveloppe, l'enregistrement entrant garde ce que le codec a pu citer — l'extrait et la raison — sous le type interne `system_error`.
+
+**La batterie, elle, tourne avec `protocol.max_correction_attempts = 0`** (`tests/conformance/harness.py`). Chaque cas épingle la **classification** d'une faute : le code d'erreur, ce qui est persisté, ce qui est publié. La correction est orthogonale à cette classification — elle décide de ce que l'application fait *ensuite* —, et la désactiver isole donc ce que la matrice mesure : une faute, un verdict, cas par cas, avec « rejet puis échec » vrai ligne à ligne. La boucle de correction se vérifie dans ses propres cas, qui fixent la borne explicitement.
 
 ## 3. Ce que la campagne a corrigé
 
@@ -33,6 +36,7 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 
 | Famille de cas | Cas | ✅ conforme | ⚠️ à surveiller | ❌ écart |
 |---|---|---|---|---|
+| Politique de correction | 7 | 7 | 0 | 0 |
 | Enveloppe et forme du message | 19 | 19 | 0 | 0 |
 | Séquencement des messages | 15 | 15 | 0 | 0 |
 | Forme brute de la réponse | 7 | 7 | 0 | 0 |
@@ -43,10 +47,21 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | Contenus de conclusion | 16 | 15 | 1 | 0 |
 | Réponses licites mais inattendues | 5 | 5 | 0 | 0 |
 
-**Total : 114 cas — 112 conformes, 2 à surveiller, 0 écarts.**
+**Total : 121 cas — 119 conformes, 2 à surveiller, 0 écarts.**
 
 ## 5. La matrice
 
+### Politique de correction
+
+| Cas | Ce que le modèle envoie | Ce que fait l'application | Code | Suite | Règle |  |
+|---|---|---|---|---|---|---|
+| `corr-one-fault-then-valid` | une réponse hors grammaire, puis la bonne après le rappel | rappel du protocole envoyé, relecture contre la même attente, session menée à son terme | `accepté après correction` | correction puis poursuite normale | ADR-023 · ADR-007 | ✅ |
+| `corr-no-cycle-no-plan` | une faute au milieu d'une session dont le budget est serré | la correction ne consomme ni cycle ni plan : seuls les vrais tours sont comptés | `accepté après correction` | correction hors budget de cycles et de plans | ADR-023 · §2.8 · ADR-012 | ✅ |
+| `corr-counter-resets` | une faute, une réponse valide, puis une nouvelle faute | le compteur est consécutif : la réponse valide rend tout le budget | `accepté après correction` | correction, remise à zéro, correction | ADR-023 | ✅ |
+| `corr-exhausted` | une réponse inutilisable de plus que la borne configurée | échec sur la dernière erreur, ses détails disant combien de corrections ont été tentées | `UNEXPECTED_MESSAGE_TYPE` | corrections épuisées puis échec | ADR-023 · §7.2 | ✅ |
+| `corr-disabled` | une réponse hors grammaire, la politique de correction étant désactivée | échec immédiat : le réglage à zéro rétablit la conduite d'avant ADR-023 | `UNEXPECTED_MESSAGE_TYPE` | échec dès la première faute | ADR-023 · §7.2 | ✅ |
+| `corr-request-content` | une réponse hors grammaire, et on lit ce que l'application renvoie au modèle | le rappel cite l'erreur, les types attendus et un exemple minimal valide | `protocol_correction_request` | correction | ADR-023 · §12 | ✅ |
+| `corr-event-published` | une réponse hors grammaire, et on lit le flux d'événements | `correction.requested` est publié et audité à côté de `message.rejected` | `correction.requested` | correction | ADR-023 · ADR-015 · ADR-018 | ✅ |
 ### Enveloppe et forme du message
 
 | Cas | Ce que le modèle envoie | Ce que fait l'application | Code | Suite | Règle |  |
@@ -93,12 +108,12 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 
 | Cas | Ce que le modèle envoie | Ce que fait l'application | Code | Suite | Règle |  |
 |---|---|---|---|---|---|---|
-| `raw-no-json` | de la prose sans le moindre JSON (codec json_text) | erreur de transport avec `reason = no_json_found` et l'extrait brut de la réponse | `UNPARSEABLE_REPLY` | échec ; rien n'est persisté en entrant, seul un FailureRecord est écrit | §3.12 · ADR-021 | ✅ |
-| `raw-json-unbalanced` | un JSON tronqué (accolade jamais refermée) | erreur de transport avec `reason = json_unbalanced` | `UNPARSEABLE_REPLY` | échec ; aucune enveloppe à persister | §3.12 · ADR-021 | ✅ |
-| `raw-fenced-invalid-json` | un bloc ```json``` dont le contenu n'est pas du JSON valide | erreur de transport avec `reason = json_invalid` et l'erreur du parseur | `UNPARSEABLE_REPLY` | échec ; aucune enveloppe à persister | §3.12 · ADR-021 | ✅ |
-| `raw-path-not-found` | une réponse dont le `content_path` configuré n'existe pas | erreur de transport avec `reason = path_not_found` et le chemin cherché | `UNPARSEABLE_REPLY` | échec ; aucune enveloppe à persister | §3.12 · ADR-020 · ADR-021 | ✅ |
-| `raw-unexpected-type` | un objet brut alors que le codec attend du texte (aucun `content_path`) | erreur de transport avec `reason = unexpected_type` et `expected = string` | `UNPARSEABLE_REPLY` | échec ; aucune enveloppe à persister | §3.12 · ADR-021 | ✅ |
-| `raw-no-envelope` | un texte dont le JSON décodé est un tableau vide | le décorateur refuse la réponse : `reason = no_envelope` | `UNPARSEABLE_REPLY` | échec ; aucune enveloppe à persister | §3.12 · ADR-004 · ADR-021 | ✅ |
+| `raw-no-json` | de la prose sans le moindre JSON (codec json_text) | erreur de transport avec `reason = no_json_found` ; l'extrait brut est persisté en entrant sous `system_error` et compté (ADR-021 §2 amendé par ADR-023) | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-021 · ADR-023 | ✅ |
+| `raw-json-unbalanced` | un JSON tronqué (accolade jamais refermée) | erreur de transport avec `reason = json_unbalanced` | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-021 · ADR-023 | ✅ |
+| `raw-fenced-invalid-json` | un bloc ```json``` dont le contenu n'est pas du JSON valide | erreur de transport avec `reason = json_invalid` et l'erreur du parseur | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-021 · ADR-023 | ✅ |
+| `raw-path-not-found` | une réponse dont le `content_path` configuré n'existe pas | erreur de transport avec `reason = path_not_found` et le chemin cherché | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-020 · ADR-021 · ADR-023 | ✅ |
+| `raw-unexpected-type` | un objet brut alors que le codec attend du texte (aucun `content_path`) | erreur de transport avec `reason = unexpected_type` et `expected = string` | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-021 · ADR-023 | ✅ |
+| `raw-no-envelope` | un texte dont le JSON décodé est un tableau vide | le décorateur refuse la réponse : `reason = no_envelope` | `UNPARSEABLE_REPLY` | échec ; l'extrait brut est persisté, aucune enveloppe à enregistrer | §3.12 · ADR-004 · ADR-021 · ADR-023 | ✅ |
 | `raw-two-envelopes-in-one-item` | un seul élément brut qui contient un tableau de deux enveloppes | le codec rend deux messages, l'adaptateur les refuse : la chaîne codec → adaptateur tient | `UNEXPECTED_EXTRA_MESSAGE` | échec ; le lot décodé est persisté comme rejet | §3.12 · ADR-007 · ADR-021 | ✅ |
 ### Politique appliquée
 

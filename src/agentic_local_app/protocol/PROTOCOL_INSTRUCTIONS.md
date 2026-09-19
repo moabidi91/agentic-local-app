@@ -52,14 +52,15 @@ What you may send after each message you receive:
 | `user_request` (follow-up, after you already concluded a turn with a `final_answer` or a `user_response` in this conversation) | `discovery_plan`, `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `execution_result` | `execution_plan`, `priority_clarification`, `final_answer`, `user_response` |
 | `context_resume_request` | `context_resume_ack` |
+| `protocol_correction_request` | the types listed in its `expected_types` — the same ones that were expected before your refused message (section 10) |
 
-Any other type, at any other time, is rejected as a protocol error. Repeated protocol errors end
-the conversation, so re-read this table when in doubt. You never send `user_request`,
-`execution_result` or `context_resume_request`: those come from the application only. Every
-message you send is a JSON envelope: bare text outside an envelope is not a message and is
-rejected.
+Any other type, at any other time, is rejected as a protocol error. {rejection_policy_rule} You
+never send `user_request`, `execution_result`, `context_resume_request` or
+`protocol_correction_request`: those come from the application only. Every message you send is a
+JSON envelope: bare text outside an envelope is not a message and is rejected.
 
-Message types you receive: `user_request`, `execution_result`, `context_resume_request`.
+Message types you receive: `user_request`, `execution_result`, `context_resume_request`,
+`protocol_correction_request`.
 Message types you send: `discovery_plan`, `execution_plan`, `priority_clarification`,
 `final_answer`, `user_response`, `context_resume_ack`.
 
@@ -195,6 +196,55 @@ grown too large (section 7).
   }
 }
 ```
+
+### 2.4 protocol_correction_request
+
+Sent when your last reply could not be used: wrong shape, wrong type for this turn, a value out of
+its domain, or no readable JSON envelope at all. It is not a punishment, it is the application
+asking again for the message it is still waiting for. What to do with it is section 10.
+
+```json
+{
+  "type": "protocol_correction_request",
+  "conversation_id": "conv-1001",
+  "message_id": "msg-007",
+  "content": {
+    "rejected_message_id": "msg-006",
+    "error_code": "UNEXPECTED_MESSAGE_TYPE",
+    "errors": [
+      { "received": "execution_plan", "expected": ["discovery_plan", "user_response"] }
+    ],
+    "expected_types": ["discovery_plan", "user_response"],
+    "reminder": "Your last reply was refused (UNEXPECTED_MESSAGE_TYPE): that type is not one of the types expected at this point.",
+    "example": {
+      "type": "discovery_plan",
+      "conversation_id": "conv-1001",
+      "message_id": "<new-unique-message-id>",
+      "content": {
+        "plan_id": "<new-unique-plan-id>",
+        "objective": "Discover the execution environment",
+        "execution_policy": "sequential",
+        "tasks": [
+          { "task_id": "<new-unique-task-id>", "type": "cmd", "cmd": "uname -a", "continue_on_error": true, "depends_on": [] }
+        ]
+      }
+    },
+    "attempt": 1,
+    "max_attempts": 5
+  }
+}
+```
+
+| Field | Present | Meaning |
+|---|---|---|
+| `rejected_message_id` | when your message had a readable `message_id` | the message that was refused. It stays refused: never resend it. |
+| `error_code` | always | why it was refused (`SCHEMA_INVALID`, `UNEXPECTED_MESSAGE_TYPE`, `DUPLICATE_TASK_ID`, `UNPARSEABLE_REPLY`, ...). |
+| `errors` | always | the validation details, as produced: `loc` / `type` / `msg` for a schema failure, `expected` / `received` and the identifiers involved otherwise. This is the list to fix, item by item. |
+| `expected_types` | always | the message types accepted **right now**. They are the ones that were expected before your refused message: a correction changes nothing to the grammar. |
+| `reminder` | always | the shape of each expected message: its mandatory fields and their value domains. |
+| `example` | always | a **minimal valid** message of one of `expected_types`, with the right `conversation_id` and a placeholder `message_id`. Copy its shape, never its `message_id`. |
+| `raw_excerpt` | for `UNPARSEABLE_REPLY` | the beginning of what you sent, as the application received it, when no envelope could be read in it. |
+| `attempt` / `max_attempts` | always | this is correction `attempt` out of `max_attempts`. When `attempt` equals `max_attempts`, the next refused reply ends the session. |
 
 ## 3. Plans: discovery_plan, execution_plan, priority_clarification
 
@@ -574,7 +624,36 @@ evidence is a `final_answer`. After a `user_response`, the user may continue the
 with a follow-up `user_request` (their answer to your question, or a new request), to which you
 answer with any plan type, a `final_answer` or another `user_response`.
 
-## 10. What gets rejected
+## 10. If you receive a protocol_correction_request
+
+Your previous message was not usable and the application is asking you to send it again, correctly.
+Nothing else changed: the same message is still expected, the conversation is still open, no budget
+was spent on the refusal.
+
+Do exactly this:
+
+1. **Read `errors`.** It lists what is wrong, and only that. `loc` points at the field
+   (`content.tasks.0.cmd`), `msg` says why, `type` is the rule that failed. For the other codes,
+   `received` / `expected` and the identifiers name the conflict.
+2. **Send one new message** whose `type` is one of `expected_types` — no other type is accepted,
+   including a message explaining yourself: there is no free-text channel to the application. To
+   talk to the *user*, `user_response` is a normal message and is listed in `expected_types` when
+   it is allowed here.
+3. **Use a new `message_id`**, unique in the session, as for every message. The refused
+   `message_id` is taken: reusing it is a new protocol error (`DUPLICATE_MESSAGE_ID`). The same
+   applies to a refused plan's `plan_id` and `task_id` values.
+4. **Fix exactly what `errors` lists.** Keep the rest of your message: the correction is about the
+   protocol, not about your reasoning. Never resend the refused message unchanged — it will be
+   refused identically.
+5. **Copy the shape of `example`** when you are unsure: it is a minimal valid message of one of
+   the expected types, with the right `conversation_id`. Replace its placeholder identifiers.
+
+Do **not** answer a `protocol_correction_request` with a `context_resume_ack`, and do not
+acknowledge it in any way: your answer *is* the corrected message.
+
+{correction_budget_rule}
+
+## 11. What gets rejected
 
 The application validates every message you send and treats each violation as a protocol error:
 unknown or unexpected `type` for the current turn, more than one message in a turn, bare text

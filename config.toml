@@ -137,7 +137,7 @@ max_message_bytes = 196608              # taille max d'un message sortant (<= bu
 max_state_summary_bytes = 4096          # taille max du state_summary porté par le modèle
 
 # --------------------------------------------------------------------------------------------
-# Protocole côté modèle (ADR-022) — accueillera aussi la politique de correction (ADR-023)
+# Protocole côté modèle (ADR-022, ADR-023)
 # --------------------------------------------------------------------------------------------
 [protocol]
 allow_direct_response = true            # le modèle peut répondre au premier user_request d'une
@@ -146,6 +146,18 @@ allow_direct_response = true            # le modèle peut répondre au premier u
                                         # obligatoire de la spec §14 ; false = grammaire stricte.
                                         # Après un execution_result ou un user_request de suivi,
                                         # user_response est toujours accepté.
+max_correction_attempts = 5             # ADR-023 : sur une réponse inutilisable (schéma, séquence,
+                                        # sémantique, ou illisible par le codec), l'application
+                                        # envoie un protocol_correction_request — rappel du
+                                        # protocole, détails de la faute, types attendus, exemple
+                                        # minimal valide — et relit, au plus ce nombre de réponses
+                                        # inutilisables d'affilée. Une correction ne consomme ni
+                                        # cycle ni plan ; le budget de durée, lui, continue de
+                                        # courir. Au-delà : politique d'avant ADR-023 (rotation si
+                                        # la fenêtre n'est pas HEALTHY et que
+                                        # rotate_on_unusable_reply_in_warning est vrai, sinon échec
+                                        # de session). 0 désactive la politique : la première
+                                        # réponse inutilisable termine la session.
 
 # --------------------------------------------------------------------------------------------
 # Fenêtre de contexte et rotation (ADR-013, ADR-005)

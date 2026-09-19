@@ -1,6 +1,6 @@
 # ADR-021 — Codec de messages par modèle : la forme brute des réponses convertie par configuration
 
-**Statut** : accepté (2026-09-18) — complète [ADR-020](ADR-020-transport-enfichable.md) et [ADR-004](ADR-004-contrat-de-transport.md)
+**Statut** : accepté (2026-09-18) — complète [ADR-020](ADR-020-transport-enfichable.md) et [ADR-004](ADR-004-contrat-de-transport.md) ; §2 amendé par [ADR-023](ADR-023-politique-de-correction.md) (la réponse illisible est persistée comme message entrant)
 
 ## Contexte
 
@@ -20,7 +20,9 @@ Brancher un tel modèle imposait soit d'écrire un provider dédié qui mélange
 
 ### 2. Les échecs : `CodecError` = `MODEL_PROTOCOL_ERROR / UNPARSEABLE_REPLY`
 
-Une forme brute illisible lève une `CodecError`, sous-classe de `TransportError` (origine `TransportGateway` : le décorateur est un transport), `error_type = MODEL_PROTOCOL_ERROR`, `error_code = UNPARSEABLE_REPLY`, **non rejouable** (§7.2). Ses `details` portent toujours `codec`, l'`index` de l'élément brut, un `excerpt` (≤ 500 caractères de la forme brute : la chaîne telle quelle, sinon son JSON canonique) et une `reason`, plus `operation` / `http_status` estampillés par le décorateur. L'orchestrateur la traite comme tout échec de transport : `FailureRecord` + `failure.recorded`, décision `fail` (aucun retry, le disjoncteur n'est pas nourri), session `FAILED` — ou **une rotation** si la fenêtre est `WARNING` (ADR-019 §2, la réponse inutilisable). Rien n'est persisté comme message entrant (aucun `message.rejected`) : à la différence d'une `ProtocolError` de l'adaptateur, il n'y a pas d'enveloppe à enregistrer ; c'est l'`excerpt` du `FailureRecord` qui garde la trace de ce que le modèle a rendu.
+Une forme brute illisible lève une `CodecError`, sous-classe de `TransportError` (origine `TransportGateway` : le décorateur est un transport), `error_type = MODEL_PROTOCOL_ERROR`, `error_code = UNPARSEABLE_REPLY`, **non rejouable** (§7.2). Ses `details` portent toujours `codec`, l'`index` de l'élément brut, un `excerpt` (≤ 500 caractères de la forme brute : la chaîne telle quelle, sinon son JSON canonique) et une `reason`, plus `operation` / `http_status` estampillés par le décorateur. L'orchestrateur la traite comme tout échec de transport : `FailureRecord` + `failure.recorded`, décision `fail` (aucun retry, le disjoncteur n'est pas nourri) — puis la **politique de correction** d'[ADR-023](ADR-023-politique-de-correction.md) : un `protocol_correction_request` citant l'`excerpt` et, une fois le budget épuisé, une rotation si la fenêtre n'est pas `HEALTHY` (ADR-019 §2, la réponse inutilisable) ou une session `FAILED`.
+
+**Amendé par ADR-023.** Cet ADR disait ici que rien n'était persisté comme message entrant, faute d'enveloppe à enregistrer, et que l'`excerpt` du `FailureRecord` suffisait à garder la trace. La politique de correction a besoin d'**une** trace et d'**un** compteur, uniformes pour toutes les réponses inutilisables : la réponse est donc désormais persistée comme enregistrement entrant **invalide** (`validation_status = "invalid"`), portant `{"raw": <extrait>, "reason": <pourquoi>}` sous le type interne `system_error`, exactement comme une réponse dont le `type` est illisible — avec `message.rejected` publié, `protocol_error_count` incrémenté et la taille de cet enregistrement comptée dans la fenêtre (la forme brute n'est connue que par son extrait). Il n'y a toujours pas d'enveloppe : ce qui est enregistré est ce que le codec a pu citer, pas un message protocolaire.
 
 ### 3. Sélection par configuration : `CodecRegistry`
 

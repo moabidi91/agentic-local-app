@@ -566,6 +566,9 @@ MODEL_KEYS_4_1 = {
     "last_post_status",
     "last_get_status",
     "last_protocol_validation_status",
+    # ADR-023: where the correction budget stands, derived from the messages, never persisted
+    "correction_attempt",
+    "correction_max_attempts",
 }
 
 

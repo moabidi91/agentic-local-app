@@ -134,6 +134,8 @@ class ConversationManagerLike(Protocol):
 
     def last_reply(self, session_id: str) -> dict[str, Any] | None: ...
 
+    def corrections(self, session_id: str) -> list[dict[str, Any]]: ...
+
     def running_task_ids(self, session_id: str) -> list[str]: ...
 
     async def shutdown(self) -> None: ...
@@ -549,6 +551,12 @@ def create_app(
     async def list_failures(sid: str) -> JSONResponse:
         require_session(sid)
         return JSONResponse(content=_dump_all(manager.store.list_failures(sid)))
+
+    @router.get("/sessions/{sid}/corrections")
+    async def list_corrections(sid: str) -> JSONResponse:
+        """ADR-023: the ``protocol_correction_request`` messages sent to the model, oldest first."""
+        require_session(sid)
+        return JSONResponse(content=manager.corrections(sid))
 
     @router.get("/sessions/{sid}/audit")
     async def list_audit(

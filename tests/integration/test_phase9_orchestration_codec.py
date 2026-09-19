@@ -260,7 +260,9 @@ async def given_chat_completion_items_when_content_and_id_paths_configured_then_
 async def given_reply_without_json_when_received_then_session_failed_with_unparseable_reply_recorded() -> (
     None
 ):
-    rig = make_codec_rig()
+    """The classification of an undecodable reply, with the correction policy of ADR-023 off
+    (``max_correction_attempts = 0``): the loop applies the policy that predates it."""
+    rig = make_codec_rig(config=make_config(protocol={"max_correction_attempts": 0}))
     reply_raw(rig, REMOTE_1, NO_JSON)
 
     session = await rig.run()
@@ -286,15 +288,21 @@ async def given_reply_without_json_when_received_then_session_failed_with_unpars
     assert rig.events(EventType.RETRY_SCHEDULED) == []
     assert rig.app.breaker.consecutive_failures == 0  # a protocol error never feeds the breaker
 
-    # not a rejected message: nothing was decoded, so nothing inbound is persisted or counted
-    assert rig.events(EventType.MESSAGE_REJECTED) == []
+    # no envelope was decoded, but the reply is still persisted and counted: the raw excerpt
+    # under the internal system_error type (ADR-021 §2 amended by ADR-023)
+    rejected = rig.events(EventType.MESSAGE_REJECTED)
+    assert len(rejected) == 1 and rejected[0].payload["error_code"] == UNPARSEABLE_REPLY
+    assert rejected[0].payload["message_type"] is None
     messages = rig.store.list_messages("conv-0001")
-    assert [m.direction for m in messages] == [MessageDirection.OUTBOUND]
+    assert [m.direction for m in messages] == [MessageDirection.OUTBOUND, MessageDirection.INBOUND]
+    assert messages[1].message_type is MessageType.SYSTEM_ERROR
+    assert messages[1].validation_status == "invalid"
+    assert messages[1].payload == {"raw": NO_JSON, "reason": "no_json_found"}
     conversation = rig.conversation("conv-0001")
     assert conversation.status is ConversationState.FAILED
-    assert conversation.protocol_error_count == 0
-    assert conversation.get_cursor is None
-    assert conversation.last_model_response_state == "awaiting"
+    assert conversation.protocol_error_count == 1
+    assert conversation.get_cursor is None  # an unreadable reply carries no identifier
+    assert conversation.last_model_response_state == "received_invalid"
     assert rig.cycles("conv-0001")[0].status is CycleState.FAILED
     assert rig.transport.closed == [REMOTE_1]
     recorded = rig.events(EventType.FAILURE_RECORDED)
@@ -310,7 +318,9 @@ async def given_reply_without_json_when_received_then_session_failed_with_unpars
 async def given_unparseable_reply_in_warning_window_when_received_then_rotation_then_completion() -> (
     None
 ):
-    rig = make_codec_rig({"outbound": "text"})
+    rig = make_codec_rig(
+        {"outbound": "text"}, config=make_config(protocol={"max_correction_attempts": 0})
+    )
     script_raw_java_scenario(rig)
     session = await rig.run()
     sid = session.session_id
@@ -353,4 +363,7 @@ async def given_unparseable_reply_in_warning_window_when_received_then_rotation_
     assert child.status is ConversationState.WAITING_USER
     assert child.get_cursor == "model-msg-0010"
     assert rig.conversation("conv-0001").status is ConversationState.CLOSED
-    assert rig.events(EventType.MESSAGE_REJECTED) == []
+    # the undecodable reply left its raw excerpt in the parent (ADR-021 §2 amended by ADR-023)
+    rejected = rig.events(EventType.MESSAGE_REJECTED)
+    assert len(rejected) == 1 and rejected[0].conversation_id == "conv-0001"
+    assert rejected[0].payload["error_code"] == UNPARSEABLE_REPLY

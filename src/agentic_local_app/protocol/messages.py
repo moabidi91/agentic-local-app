@@ -8,6 +8,8 @@ Every extension is **optional** so that the examples of the specification valida
 - ``ExecutionResultContent.skipped_tasks`` etc. carry ``{task_id, reason}`` objects (ADR-009)
 - ``ContextResumeRequestContent.pending_message_type`` (ADR-014)
 - ``UserResponseContent``, a new inbound type: the model's direct answer to the user (ADR-022)
+- ``ProtocolCorrectionRequestContent``, a new outbound type: the application asks the model to fix
+  an unusable reply instead of ending the session on the first fault (ADR-023)
 
 The envelope (``type``, ``conversation_id``, ``message_id``, ``content``) is common to every message.
 """
@@ -189,6 +191,33 @@ class UserResponseContent(ProtocolModel):
 
 
 # ------------------------------------------------------------------------------------------------
+# protocol_correction_request — the application asks for a fix (ADR-023, not in §12)
+# ------------------------------------------------------------------------------------------------
+class ProtocolCorrectionRequestContent(ProtocolModel):
+    """What the application sends back when the model's reply is unusable (ADR-023).
+
+    It is **outbound only** (application → model) and carries everything the model needs to send a
+    correct message without guessing: the code of the refusal, the validation details exactly as
+    the adapter produced them, the message types valid *right now* (the ADR-007 row that was
+    pending, unchanged by the fault), a reminder of their shape generated from the content models,
+    a minimal valid ``example`` to copy, and where the model stands in the correction budget.
+
+    ``rejected_message_id`` is absent when the reply carried no readable identifier;
+    ``raw_excerpt`` is present for ``UNPARSEABLE_REPLY``, where there is no envelope to quote.
+    """
+
+    rejected_message_id: str | None = None
+    error_code: str = Field(min_length=1)
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    expected_types: list[str] = Field(default_factory=list)
+    reminder: str = ""
+    example: dict[str, Any] = Field(default_factory=dict)
+    raw_excerpt: str | None = None
+    attempt: int = Field(ge=1)
+    max_attempts: int = Field(ge=1)
+
+
+# ------------------------------------------------------------------------------------------------
 # 12.8 / 12.9 context resume (+ ADR-014 pending_message_type)
 # ------------------------------------------------------------------------------------------------
 class ContextResumeRequestContent(ProtocolModel):
@@ -239,6 +268,7 @@ CONTENT_MODELS: dict[MessageType, type[BaseModel]] = {
     MessageType.EXECUTION_RESULT: ExecutionResultContent,
     MessageType.FINAL_ANSWER: FinalAnswerContent,
     MessageType.USER_RESPONSE: UserResponseContent,
+    MessageType.PROTOCOL_CORRECTION_REQUEST: ProtocolCorrectionRequestContent,
     MessageType.CONTEXT_RESUME_REQUEST: ContextResumeRequestContent,
     MessageType.CONTEXT_RESUME_ACK: ContextResumeAckContent,
     MessageType.SYSTEM_ERROR: SystemErrorContent,

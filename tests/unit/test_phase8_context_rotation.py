@@ -688,14 +688,25 @@ def given_warning_and_request_timeout_when_should_rotate_asked_then_false(
     assert not tiny_monitor.should_rotate_on_unusable_reply(warning, timeout)
 
 
-@pytest.mark.parametrize("window", [ContextWindowState.HEALTHY, ContextWindowState.SATURATED])
-def given_non_warning_window_and_protocol_error_when_should_rotate_asked_then_false(
-    tiny_monitor: ContextWindowMonitor, window: ContextWindowState
+def given_healthy_window_and_protocol_error_when_should_rotate_asked_then_false(
+    tiny_monitor: ContextWindowMonitor,
 ) -> None:
-    conversation = _conversation(window=window)
+    conversation = _conversation(window=ContextWindowState.HEALTHY)
     assert not tiny_monitor.should_rotate_on_unusable_reply(
         conversation, _error(ErrorType.MODEL_PROTOCOL_ERROR)
     )
+
+
+def given_saturated_window_and_protocol_error_when_should_rotate_asked_then_true(
+    tiny_monitor: ContextWindowMonitor,
+) -> None:
+    """ADR-023: a window that is already full rotates at once — correcting inside it is pointless,
+    the correction itself would not fit (ADR-019 §2 only spelled out the WARNING case)."""
+    conversation = _conversation(window=ContextWindowState.SATURATED)
+    assert tiny_monitor.should_rotate_on_unusable_reply(
+        conversation, _error(ErrorType.MODEL_PROTOCOL_ERROR)
+    )
+    assert tiny_monitor.is_saturated(conversation)
 
 
 def given_flag_disabled_when_should_rotate_asked_in_warning_then_false() -> None:

@@ -56,7 +56,10 @@ from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.observability.execution_tracker import ExecutionTracker, RuntimeSnapshot
 from agentic_local_app.observability.telemetry import TelemetryService
 from agentic_local_app.persistence.memory import InMemoryConversationStore
-from agentic_local_app.protocol.messages import UserResponseContent
+from agentic_local_app.protocol.messages import (
+    ProtocolCorrectionRequestContent,
+    UserResponseContent,
+)
 
 __all__ = ["FakeConversationManager"]
 
@@ -247,6 +250,32 @@ class FakeConversationManager:
             **self._reply_head(last),
             "content": dict(last.payload.get("content", {})),
         }
+
+    def corrections(self, session_id: str) -> list[dict[str, Any]]:
+        """ADR-023, same contract as the façade: the ``protocol_correction_request`` messages sent
+        to the model, oldest first, identifiers and sizes plus the content fields."""
+        items: list[dict[str, Any]] = []
+        for conversation in self.store.list_conversations(session_id):
+            for message in self.store.list_messages(
+                conversation.conversation_id, direction=MessageDirection.OUTBOUND
+            ):
+                if message.message_type is not MessageType.PROTOCOL_CORRECTION_REQUEST:
+                    continue
+                dumped = message.model_dump(mode="json")
+                items.append(
+                    {
+                        "message_id": message.message_id,
+                        "conversation_id": message.conversation_id,
+                        "cycle_id": message.cycle_id,
+                        "created_at": dumped["created_at"],
+                        "posted_at": dumped["posted_at"],
+                        "size_bytes": message.size_bytes,
+                        **ProtocolCorrectionRequestContent.model_validate(
+                            message.payload["content"]
+                        ).model_dump(mode="json"),
+                    }
+                )
+        return items
 
     def _concluding_messages(self, session_id: str) -> list[MessageRecord]:
         return [

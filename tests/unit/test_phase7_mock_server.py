@@ -27,9 +27,11 @@ from agentic_local_app.testing.mock_model_server import (
     Step,
     create_mock_app,
     default_analysis_scenario,
+    default_correction_scenario,
     default_java_debug_scenario,
     load_scenario,
     run_mock_server,
+    wrong_then_right,
 )
 from agentic_local_app.transport.gateway import HttpTransportGateway
 
@@ -249,8 +251,45 @@ def given_analysis_scenario_when_inspected_then_single_user_response_to_the_user
     assert content["expects_reply"] is False
     assert "invalid target release" in content["body"]
     assert scenario.token is None and scenario.steps[0].fault is None
-    assert set(BUILTIN_SCENARIOS) == {"java", "analysis"}
+    assert set(BUILTIN_SCENARIOS) == {"java", "analysis", "correction"}
     assert BUILTIN_SCENARIOS["analysis"]() == scenario
+
+
+# ---- ADR-023: scripting a model that gets it wrong before it gets it right ---------------------
+def given_wrong_then_right_when_built_then_one_step_per_unusable_reply_then_the_valid_one() -> None:
+    wrong = {"type": "execution_plan", "message_id": "auto"}
+    right = [{"type": "discovery_plan", "message_id": "auto"}]
+
+    steps = wrong_then_right("user_request", wrong, right, times=3)
+
+    assert [step.on for step in steps] == [
+        "user_request",
+        "protocol_correction_request",
+        "protocol_correction_request",
+        "protocol_correction_request",
+    ]
+    assert [step.respond for step in steps] == [[wrong], [wrong], [wrong], right]
+    # the steps are copies: mutating the script afterwards cannot reach the scenario
+    assert steps[0].respond[0] is not wrong
+    with pytest.raises(ValueError, match="times >= 1"):
+        wrong_then_right("user_request", wrong, right, times=0)
+
+
+def given_correction_scenario_when_inspected_then_wrong_type_then_the_java_loop() -> None:
+    scenario = default_correction_scenario()
+    java = default_java_debug_scenario()
+
+    assert [step.on for step in scenario.steps] == [
+        "user_request",
+        "protocol_correction_request",
+        "execution_result",
+        "execution_result",
+    ]
+    # the first reply is the §12.3 execution_plan, one turn too early: valid content, wrong type
+    assert scenario.steps[0].respond == java.steps[1].respond
+    assert scenario.steps[1].respond == java.steps[0].respond
+    assert scenario.steps[2:] == java.steps[1:]
+    assert BUILTIN_SCENARIOS["correction"]() == scenario
 
 
 def given_run_mock_server_with_scenario_name_when_called_then_named_scenario_used() -> None:

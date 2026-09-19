@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from agentic_local_app.config import (
     AppConfig,
@@ -70,13 +71,17 @@ from agentic_local_app.domain.states import (
 )
 from agentic_local_app.protocol import adapter as adapter_module
 from agentic_local_app.protocol.adapter import (
+    CORRECTION_EXAMPLE_MESSAGE_ID,
     EXPECTED_INBOUND,
     InboundMessage,
     OutboundMessage,
     OutboundSituation,
     ProtocolAdapter,
+    example_envelope_for,
     expected_inbound_for,
+    last_substantive_outbound,
     render_instructions,
+    situation_for,
 )
 from agentic_local_app.protocol.messages import (
     ContextResumeAckContent,
@@ -84,6 +89,7 @@ from agentic_local_app.protocol.messages import (
     ExecutionResultContent,
     FinalAnswerContent,
     PlanContent,
+    ProtocolCorrectionRequestContent,
     TaskRef,
     TaskResult,
     UserResponseContent,
@@ -135,6 +141,33 @@ USER_RESPONSE_EXAMPLE: dict[str, Any] = {
         "body": "## Why the build fails\n\nThe project targets Java 21 but Maven runs on Java 17.",
         "status": "completed",
         "expects_reply": False,
+    },
+}
+
+#: The ``protocol_correction_request`` of ADR-023 (not in §12): application -> model only.
+CORRECTION_REQUEST_EXAMPLE: dict[str, Any] = {
+    "type": "protocol_correction_request",
+    "conversation_id": REMOTE_ID,
+    "message_id": "msg-011",
+    "content": {
+        "rejected_message_id": "msg-010",
+        "error_code": "UNEXPECTED_MESSAGE_TYPE",
+        "errors": [{"received": "execution_plan", "expected": ["discovery_plan"]}],
+        "expected_types": ["discovery_plan"],
+        "reminder": "Send exactly one message, of one of these types: `discovery_plan`.",
+        "example": {
+            "type": "discovery_plan",
+            "conversation_id": REMOTE_ID,
+            "message_id": "<new-unique-message-id>",
+            "content": {
+                "plan_id": "<new-unique-plan-id>",
+                "objective": "Discover the execution environment",
+                "execution_policy": "sequential",
+                "tasks": [{"task_id": "<new-unique-task-id>", "type": "cmd", "cmd": "uname -a"}],
+            },
+        },
+        "attempt": 1,
+        "max_attempts": 5,
     },
 }
 
@@ -305,6 +338,7 @@ def _sample_message(message_type: MessageType, conversation_id: str) -> dict[str
         MessageType.CONTEXT_RESUME_REQUEST: SPEC["12.8"],
         MessageType.CONTEXT_RESUME_ACK: SPEC["12.9"],
         MessageType.SYSTEM_ERROR: SPEC["12.10"],
+        MessageType.PROTOCOL_CORRECTION_REQUEST: CORRECTION_REQUEST_EXAMPLE,
     }
     if message_type is MessageType.CHUNK_REQUEST:
         raw = _message(
@@ -2193,6 +2227,312 @@ def given_instructions_plan_examples_when_parsed_by_adapter_then_accepted(
             stored_output_task_ids=refs,
         )
         assert isinstance(inbound.content, PlanContent)
+
+
+# =============================================================================================
+# 7bis. protocol_correction_request (ADR-023)
+# =============================================================================================
+
+#: The families of refusal a correction request must be able to describe.
+CORRECTION_FAULTS: dict[str, dict[str, Any]] = {
+    "SCHEMA_INVALID": {
+        "errors": [
+            {"loc": "content.tasks.0.cmd", "msg": "Field required", "type": "missing"},
+            {"loc": "content.plan_id", "msg": "Input should be a valid string", "type": "string"},
+        ],
+        "message_id": "msg-200",
+    },
+    "UNEXPECTED_MESSAGE_TYPE": {
+        "received": "execution_plan",
+        "expected": ["discovery_plan", "user_response"],
+    },
+    "DUPLICATE_TASK_ID": {"task_id": "t1", "plan_id": "plan-9"},
+    "UNPARSEABLE_REPLY": {
+        "reason": "no_json_found",
+        "excerpt": "I am unable to produce a plan right now, sorry.",
+        "index": 0,
+        "operation": "GET",
+    },
+}
+
+
+def _correction(
+    adapter: ProtocolAdapter,
+    code: str,
+    details: Mapping[str, Any] | None = None,
+    *,
+    expected: frozenset[MessageType] = AFTER_INITIAL_REQUEST,
+    rejected_message_id: str | None = "msg-200",
+    attempt: int = 1,
+    max_attempts: int = 5,
+    conversation: ConversationRecord | None = None,
+) -> OutboundMessage:
+    error = ProtocolError(code, **dict(details or CORRECTION_FAULTS.get(code, {}))).error
+    return adapter.build_protocol_correction_request(
+        conversation or _conversation(),
+        "msg-corr-1",
+        error=error,
+        expected=expected,
+        rejected_message_id=rejected_message_id,
+        attempt=attempt,
+        max_attempts=max_attempts,
+    )
+
+
+def _correction_content(message: OutboundMessage) -> ProtocolCorrectionRequestContent:
+    return ProtocolCorrectionRequestContent.model_validate(message.payload["content"])
+
+
+def given_correction_content_model_when_validated_then_optional_fields_default() -> None:
+    minimal = ProtocolCorrectionRequestContent.model_validate(
+        {"error_code": "SCHEMA_INVALID", "attempt": 1, "max_attempts": 5}
+    )
+    assert minimal.rejected_message_id is None and minimal.raw_excerpt is None
+    assert minimal.errors == [] and minimal.expected_types == [] and minimal.example == {}
+    assert minimal.reminder == ""
+    assert content_model_for(MessageType.PROTOCOL_CORRECTION_REQUEST) is (
+        ProtocolCorrectionRequestContent
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("error_code", ""), ("attempt", 0), ("max_attempts", 0)],
+)
+def given_correction_content_out_of_domain_when_validated_then_rejected(
+    field: str, value: Any
+) -> None:
+    raw = {"error_code": "SCHEMA_INVALID", "attempt": 1, "max_attempts": 5, field: value}
+    with pytest.raises(ValidationError):
+        ProtocolCorrectionRequestContent.model_validate(raw)
+
+
+def given_correction_request_when_built_then_envelope_is_outbound_and_addressed_to_the_remote(
+    adapter: ProtocolAdapter,
+) -> None:
+    message = _correction(adapter, "UNEXPECTED_MESSAGE_TYPE")
+
+    assert message.message_type is MessageType.PROTOCOL_CORRECTION_REQUEST
+    assert message.envelope.conversation_id == REMOTE_ID
+    assert message.envelope.message_id == "msg-corr-1"
+    assert message.payload["type"] == "protocol_correction_request"
+    assert message.size_bytes == size_bytes(message.payload)
+
+
+@pytest.mark.parametrize("code", sorted(CORRECTION_FAULTS))
+def given_each_family_of_fault_when_correction_built_then_code_details_and_budget_carried(
+    adapter: ProtocolAdapter, code: str
+) -> None:
+    message = _correction(adapter, code, attempt=2, max_attempts=5)
+    content = _correction_content(message)
+
+    assert content.error_code == code
+    assert content.attempt == 2 and content.max_attempts == 5
+    assert content.rejected_message_id == "msg-200"
+    assert content.expected_types == sorted(m.value for m in AFTER_INITIAL_REQUEST)
+    assert code in content.reminder and content.reminder.splitlines()[0].endswith(".")
+    # every expected type is described, with its mandatory fields
+    for message_type in AFTER_INITIAL_REQUEST:
+        assert message_type.value in content.reminder
+    assert content.errors, "the validation details must be carried over"
+
+
+def given_schema_failure_when_correction_built_then_pydantic_errors_are_carried_unchanged(
+    adapter: ProtocolAdapter,
+) -> None:
+    content = _correction_content(_correction(adapter, "SCHEMA_INVALID"))
+
+    assert content.errors == CORRECTION_FAULTS["SCHEMA_INVALID"]["errors"]
+
+
+def given_flat_details_when_correction_built_then_one_entry_without_envelope_noise(
+    adapter: ProtocolAdapter,
+) -> None:
+    content = _correction_content(_correction(adapter, "DUPLICATE_TASK_ID"))
+
+    assert content.errors == [{"task_id": "t1", "plan_id": "plan-9"}]
+    assert content.raw_excerpt is None
+
+
+def given_unparseable_reply_when_correction_built_then_raw_excerpt_quoted_back(
+    adapter: ProtocolAdapter,
+) -> None:
+    content = _correction_content(
+        _correction(adapter, "UNPARSEABLE_REPLY", rejected_message_id=None)
+    )
+
+    assert content.rejected_message_id is None
+    assert content.raw_excerpt == CORRECTION_FAULTS["UNPARSEABLE_REPLY"]["excerpt"]
+    # ``excerpt`` and ``operation`` belong to the envelope of the correction, not to ``errors``
+    assert content.errors == [{"reason": "no_json_found", "index": 0}]
+
+
+def given_unexpected_type_the_model_attempted_when_correction_built_then_that_type_illustrated(
+    adapter: ProtocolAdapter,
+) -> None:
+    """The example shows the shape the model got wrong when it is one of the expected types."""
+    content = _correction_content(
+        _correction(
+            adapter,
+            "UNEXPECTED_MESSAGE_TYPE",
+            {"received": "final_answer", "expected": ["final_answer", "execution_plan"]},
+            expected=AFTER_EXECUTION_RESULT,
+        )
+    )
+
+    assert content.example["type"] == "final_answer"
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [AFTER_INITIAL_REQUEST, AFTER_FOLLOW_UP_REQUEST, AFTER_EXECUTION_RESULT, AFTER_RESUME_REQUEST],
+    ids=["initial", "follow-up", "result", "resume"],
+)
+def given_each_expectation_row_when_correction_built_then_its_example_parses_back_as_valid(
+    adapter: ProtocolAdapter, expected: frozenset[MessageType]
+) -> None:
+    """The embedded example must itself be a message the adapter accepts: an example the
+    application would refuse would teach the model the wrong shape (ADR-023)."""
+    message = _correction(adapter, "SCHEMA_INVALID", expected=expected)
+    example = _correction_content(message).example
+
+    assert example["message_id"] == CORRECTION_EXAMPLE_MESSAGE_ID
+    assert example["conversation_id"] == REMOTE_ID
+    assert MessageType(example["type"]) in expected
+    inbound = _parse(
+        adapter,
+        example,
+        expected=expected,
+        expected_original_conversation_id=(
+            example["content"].get("original_conversation_id")
+            if example["type"] == "context_resume_ack"
+            else None
+        ),
+    )
+    assert inbound.envelope.message_id == CORRECTION_EXAMPLE_MESSAGE_ID
+
+
+@pytest.mark.parametrize(
+    "message_type",
+    sorted(INBOUND_MESSAGE_TYPES, key=lambda m: m.value),
+)
+def given_each_inbound_type_when_example_requested_then_a_valid_minimal_message_is_returned(
+    adapter: ProtocolAdapter, message_type: MessageType
+) -> None:
+    example = example_envelope_for(message_type, REMOTE_ID)
+
+    inbound = _parse(
+        adapter,
+        example,
+        expected=frozenset({message_type}),
+        expected_original_conversation_id=(
+            example["content"].get("original_conversation_id")
+            if message_type is MessageType.CONTEXT_RESUME_ACK
+            else None
+        ),
+    )
+    assert inbound.envelope.message_id == CORRECTION_EXAMPLE_MESSAGE_ID
+
+
+def given_an_outbound_only_type_when_example_requested_then_value_error() -> None:
+    with pytest.raises(ValueError, match="no minimal example"):
+        example_envelope_for(MessageType.USER_REQUEST, REMOTE_ID)
+
+
+def given_no_expected_type_when_correction_built_then_reminder_says_so_and_example_is_empty(
+    adapter: ProtocolAdapter,
+) -> None:
+    content = _correction_content(_correction(adapter, "SCHEMA_INVALID", expected=frozenset()))
+
+    assert content.expected_types == [] and content.example == {}
+    assert "Nothing is expected" in content.reminder
+
+
+@pytest.mark.parametrize(("attempt", "max_attempts"), [(0, 5), (1, 0), (-1, 5)])
+def given_a_budget_out_of_domain_when_correction_built_then_value_error(
+    adapter: ProtocolAdapter, attempt: int, max_attempts: int
+) -> None:
+    with pytest.raises(ValueError, match="attempt >= 1"):
+        _correction(adapter, "SCHEMA_INVALID", attempt=attempt, max_attempts=max_attempts)
+
+
+def given_a_huge_fault_when_correction_built_then_it_is_truncated_under_max_message_bytes(
+    config: AppConfig,
+) -> None:
+    """ADR-010 applies to a correction like to any outbound message: it is shrunk, never over."""
+    small = config.model_copy(
+        update={"payload": config.payload.model_copy(update={"max_message_bytes": 1200})}
+    )
+    adapter = ProtocolAdapter(small)
+
+    message = _correction(
+        adapter,
+        "UNPARSEABLE_REPLY",
+        {"reason": "no_json_found", "excerpt": "x" * 50_000, "operation": "GET"},
+    )
+    content = _correction_content(message)
+
+    assert message.size_bytes <= 1200
+    # what is dropped first is what the model itself wrote; the code and the budget always survive
+    assert content.error_code == "UNPARSEABLE_REPLY"
+    assert content.attempt == 1 and content.max_attempts == 5
+    assert content.expected_types == sorted(m.value for m in AFTER_INITIAL_REQUEST)
+    assert len(content.raw_excerpt or "") < 50_000
+
+
+def given_a_fault_that_fits_when_correction_built_then_nothing_is_truncated(
+    adapter: ProtocolAdapter,
+) -> None:
+    content = _correction_content(_correction(adapter, "UNPARSEABLE_REPLY"))
+
+    assert content.raw_excerpt == CORRECTION_FAULTS["UNPARSEABLE_REPLY"]["excerpt"]
+    assert content.example and content.reminder
+
+
+def given_same_inputs_when_correction_built_twice_then_byte_identical(
+    adapter: ProtocolAdapter,
+) -> None:
+    first = _correction(adapter, "SCHEMA_INVALID")
+    second = _correction(adapter, "SCHEMA_INVALID")
+
+    assert first.payload == second.payload and first.size_bytes == second.size_bytes
+
+
+# ---- the correction is transparent for the expectation table (ADR-007 row unchanged) ----------
+def given_a_correction_request_when_classified_then_it_opens_no_row_of_the_table() -> None:
+    with pytest.raises(ValueError, match="sets no expectation"):
+        situation_for(_outbound_record(MessageType.PROTOCOL_CORRECTION_REQUEST), _conversation())
+
+
+def given_trailing_correction_requests_when_last_substantive_searched_then_the_corrected_one() -> (
+    None
+):
+    corrected = _outbound_record(MessageType.USER_REQUEST)
+    trail = [
+        corrected,
+        _outbound_record(MessageType.PROTOCOL_CORRECTION_REQUEST),
+        _outbound_record(MessageType.PROTOCOL_CORRECTION_REQUEST),
+    ]
+
+    assert last_substantive_outbound(trail) is corrected
+    assert last_substantive_outbound([]) is None
+    assert last_substantive_outbound(trail[1:]) is None
+
+
+def given_only_correction_requests_and_inbound_when_searched_then_inbound_is_ignored() -> None:
+    inbound = MessageRecord(
+        message_id="msg-in",
+        session_id="sess-0001",
+        conversation_id="conv-0001",
+        direction=MessageDirection.INBOUND,
+        message_type=MessageType.DISCOVERY_PLAN,
+        payload={},
+        size_bytes=0,
+        created_at=T0,
+    )
+    result = _outbound_record(MessageType.EXECUTION_RESULT)
+
+    assert last_substantive_outbound([result, inbound]) is result
 
 
 # =============================================================================================

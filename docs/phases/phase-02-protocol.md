@@ -8,7 +8,7 @@
 
 Le `ProtocolAdapter` est la frontière entre le modèle et l'application (§3.5) : il « construit les messages sortants, analyse les messages entrants, valide la conformité au protocole et rejette les réponses malformées ou non déterministes ». Cette phase livre :
 
-1. la **construction** des trois messages sortants — `user_request` (§12.1), `execution_result` (§12.5), `context_resume_request` (§12.8 + `pending_message_type` d'ADR-014) — en JSON canonique (ADR-017), comparée à l'octet près aux exemples de la spec ;
+1. la **construction** des messages sortants — `user_request` (§12.1), `execution_result` (§12.5), `context_resume_request` (§12.8 + `pending_message_type` d'ADR-014), et `protocol_correction_request` (ADR-023, hors §12 : la faute citée au modèle, les types valides à cet instant, un rappel engendré depuis les modèles de contenu et un exemple minimal valide, le tout ramené sous `payload.max_message_bytes`) — en JSON canonique (ADR-017), les trois premiers comparés à l'octet près aux exemples de la spec ;
 2. la **table des messages attendus** d'ADR-007 (`EXPECTED_INBOUND`) : quel type le modèle a le droit d'envoyer après chaque message sortant ;
 3. l'**analyse et la validation** de chaque message entrant : enveloppe, direction, attente, schéma du contenu, puis règles structurelles d'ADR-007 (unicité, dépendances, `chunk_request`), borne du `state_summary` d'ADR-005 — chaque violation étant une `ProtocolError` (`MODEL_PROTOCOL_ERROR`, non rejouable) avec un code et des `details` explicites, sérialisables en JSON ;
 4. la **projection** d'un plan accepté en `PlanRecord` / `TaskRecord` `PENDING`, avec les valeurs effectives d'ADR-008 (timeouts), ADR-009 (drapeaux, règle d'arrêt), ADR-010 (budgets de sortie) et ADR-011 (champs de `chunk_request`) ;
@@ -35,6 +35,7 @@ classDiagram
         +build_user_request(conversation, message_id, goal, user_message, budget) OutboundMessage
         +build_execution_result(conversation, message_id, content) OutboundMessage
         +build_context_resume_request(conversation, message_id, original_conversation_id, goal, context_summary, pending_message_type) OutboundMessage
+        +build_protocol_correction_request(conversation, message_id, error, expected, rejected_message_id, attempt, max_attempts) OutboundMessage
         +expected_inbound(last_outbound, conversation) frozenset~MessageType~
         +parse_inbound(raw_messages, expected, conversation, known_message_ids, known_plan_ids, known_task_ids, stored_output_task_ids, expected_original_conversation_id) InboundMessage
         +plan_to_records(inbound, session, conversation, cycle_id, clock) tuple
@@ -237,7 +238,7 @@ Chaque état d'attente correspond à une ligne de `EXPECTED_INBOUND` : `AttenteD
 | `context_resume_request` | `context_resume_request` | — | `context_resume_ack` |
 | *(aucun)* | `last_outbound = None` | rien n'est en attente | ∅ — tout message reçu est `UNEXPECTED_MESSAGE_TYPE` |
 
-Exactement un message par tour ; `system_error`, `user_request`, `execution_result`, `context_resume_request` et `chunk_request` ne sont jamais des messages entrants. La table de base `EXPECTED_INBOUND` garde la ligne initiale stricte de §14 ; `expected_inbound_for(situation, allow_direct_response=…)` y applique le drapeau d'ADR-022, que `ProtocolAdapter.expected_inbound` lit dans sa configuration. Le contenu d'un `user_response` (`UserResponseContent` : `format`, `body` opaque non vide, `status`, `expects_reply`) n'a qu'une règle sémantique, la borne `USER_RESPONSE_TOO_LARGE` (`body` ≤ `payload.max_message_bytes` en UTF-8).
+Exactement un message par tour ; `system_error`, `user_request`, `execution_result`, `context_resume_request`, `protocol_correction_request` et `chunk_request` ne sont jamais des messages entrants. Un `protocol_correction_request` (ADR-023) n'ajoute par ailleurs **aucune ligne** à la table : il redemande le message déjà attendu, si bien que `situation_for` se lit sur le dernier message sortant **substantiel** (`last_substantive_outbound`, qui saute les corrections et les rejets qu'elles corrigent) et qu'une réponse à une correction est validée contre la ligne qui était pendante avant la faute. La table de base `EXPECTED_INBOUND` garde la ligne initiale stricte de §14 ; `expected_inbound_for(situation, allow_direct_response=…)` y applique le drapeau d'ADR-022, que `ProtocolAdapter.expected_inbound` lit dans sa configuration. Le contenu d'un `user_response` (`UserResponseContent` : `format`, `body` opaque non vide, `status`, `expects_reply`) n'a qu'une règle sémantique, la borne `USER_RESPONSE_TOO_LARGE` (`body` ≤ `payload.max_message_bytes` en UTF-8).
 
 ## 5. Catalogue des codes `ProtocolError`
 
