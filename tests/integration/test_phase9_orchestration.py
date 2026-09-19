@@ -16,12 +16,13 @@ transport failures · follow-up and shutdown · hygiene.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agentic_local_app.domain.canonical import size_bytes
-from agentic_local_app.domain.errors import ErrorType, TransportError
+from agentic_local_app.domain.errors import ConfigError, ErrorType, TransportError
 from agentic_local_app.domain.events import EventType
 from agentic_local_app.domain.models import SessionBudget
 from agentic_local_app.domain.states import (
@@ -563,7 +564,9 @@ async def given_config_defaults_when_session_started_without_budget_then_config_
         "max_total_duration_ms": rig.config.budget.default_max_total_duration_ms,
     }
     assert session.auto_close_on_final_answer is rig.config.budget.auto_close_on_final_answer
-    assert session.user_id == rig.config.transport.user_id
+    # ADR-028 §2: the machine identity, the one GET /whoami answers — not transport.user_id, which
+    # is only the last resort of that resolution (ADR-024 §2)
+    assert session.user_id == rig.app.identity.user_id
     assert session.current_conversation_id == "conv-0001"
     assert session.started_at == rig.clock.now()
     # the loop runs in the background: the start returned before the first POST
@@ -1489,13 +1492,17 @@ async def given_network_error_on_post_when_retried_then_same_message_reposted_af
     assert kinds.index(("retry.scheduled", None)) < kinds.index(("message.outbound", None))
 
 
-async def given_authentication_error_on_post_when_decided_then_no_retry_and_session_failed(
+async def given_authorization_error_on_post_when_decided_then_no_retry_and_session_failed(
     rig: Rig,
 ) -> None:
+    """A 403 is not a token to renew (ADR-025): it fails on the spot, without a retry.
+
+    The 401 of the same shape pauses instead — ``test_phase9_pause.py``.
+    """
     rig.transport.enqueue_error(
         "post",
         _transport_error(
-            ErrorType.AUTHN_ERROR, "HTTP_401", operation="POST", retryable=False, http_status=401
+            ErrorType.AUTHZ_ERROR, "HTTP_403", operation="POST", retryable=False, http_status=403
         ),
     )
 
@@ -1506,7 +1513,7 @@ async def given_authentication_error_on_post_when_decided_then_no_retry_and_sess
     assert rig.transport.posted == []
     assert rig.transport.get_calls == []
     failures = rig.store.list_failures(sid)
-    assert [(f.error_type, f.error_code) for f in failures] == [(ErrorType.AUTHN_ERROR, "HTTP_401")]
+    assert [(f.error_type, f.error_code) for f in failures] == [(ErrorType.AUTHZ_ERROR, "HTTP_403")]
     assert session.last_failure_id == failures[0].failure_id
     decisions = rig.store.list_retry_decisions(sid)
     assert [(d.operation, d.decision, d.delay_ms) for d in decisions] == [("POST", "fail", None)]
@@ -2036,3 +2043,286 @@ async def given_interrupt_before_first_loop_tick_when_loop_starts_then_nothing_s
     assert rig.transport.inits == [] and rig.transport.posted == []
     assert rig.conversation("conv-0001").status is ConversationState.INTERRUPTED
     assert rig.store.list_failures(sid) == []
+
+
+# ================================================================================================
+# 10. working space of a session (ADR-026 §5 / §6): bound when it starts, released when it ends
+# ================================================================================================
+def _scratch_rig(tmp_path: Path, **scratch: Any) -> Rig:
+    """A rig whose ``[scratch]`` lives under ``tmp_path`` — the suite writes nowhere else."""
+    values: dict[str, Any] = {
+        "root": str(tmp_path / "scratch"),
+        "archive_root": str(tmp_path / "scratch-archive"),
+    }
+    values.update(scratch)
+    return make_rig(make_config(scratch=values))
+
+
+async def given_a_session_that_completes_when_its_loop_ends_then_its_working_space_is_released(
+    tmp_path: Path,
+) -> None:
+    rig = _scratch_rig(tmp_path)
+    rig.script_java_scenario()
+
+    session = await rig.run()
+    sid = session.session_id
+
+    assert session.status is SessionState.COMPLETED
+    folder = tmp_path / "scratch" / sid
+    assert not folder.exists()  # created by the first command, deleted by the policy
+    assert rig.app.scratch.inventory(sid).entries == ()
+    # the commands did see it while the session was running (ADR-026 §3)
+    assert rig.executor.calls[0].env == {
+        "AGENTIC_SCRATCH_DIR": str(folder),
+        "AGENTIC_WORKING_SPACE": str(folder),
+        "AGENTIC_SESSION_ID": sid,
+    }
+    assert rig.app.release_working_spaces() == []  # nothing left for the shutdown to clean up
+
+
+async def given_a_session_that_fails_when_its_loop_ends_then_its_working_space_is_kept(
+    tmp_path: Path,
+) -> None:
+    """``keep_on_failure`` wins over ``delete``: a failed session is the one to look inside."""
+    rig = _scratch_rig(tmp_path)
+    rig.script_java_scenario()
+
+    session = await rig.run(
+        budget={"max_cycles": 2, "max_plans": 10, "max_total_duration_ms": 1_000}
+    )
+    sid = session.session_id
+
+    assert session.status is SessionState.FAILED
+    folder = tmp_path / "scratch" / sid
+    assert folder.is_dir()
+
+
+async def given_a_bound_working_space_when_the_session_ends_then_it_is_never_touched(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pom.xml").write_text("<project/>", encoding="utf-8")
+    rig = _scratch_rig(tmp_path)
+    rig.script_java_scenario()
+
+    session = await rig.run(working_space=str(project))
+    sid = session.session_id
+
+    assert session.status is SessionState.COMPLETED
+    assert project.is_dir() and (project / "pom.xml").read_text(encoding="utf-8") == "<project/>"
+    assert not (tmp_path / "scratch" / sid).exists()  # no folder was generated beside it
+    assert rig.executor.calls[0].env == {
+        "AGENTIC_SCRATCH_DIR": str(project),
+        "AGENTIC_WORKING_SPACE": str(project),
+        "AGENTIC_SESSION_ID": sid,
+    }
+
+
+async def given_a_bound_working_space_when_a_follow_up_runs_then_it_is_still_the_working_space(
+    tmp_path: Path,
+) -> None:
+    """§11: a follow-up is the same session — the folder the user designated still applies."""
+    project = tmp_path / "project"
+    project.mkdir()
+    rig = _scratch_rig(tmp_path)
+    rig.script_java_scenario()
+
+    session = await rig.run(working_space=str(project))
+    sid = session.session_id
+    rig.reply(
+        REMOTE_1,
+        discovery_plan(
+            REMOTE_1,
+            message_id="model-msg-0004",
+            plan_id="plan-3",
+            tasks=[cmd_task("t9", CMD_JAVA)],
+        ),
+        final_answer(REMOTE_1, message_id="model-msg-0005"),
+    )
+
+    await rig.manager.continue_session(sid, "and the tests?")
+    await rig.wait(sid)
+
+    assert rig.task(sid, "t9").status is TaskState.COMPLETED
+    assert rig.executor.calls[-1].env == {
+        "AGENTIC_SCRATCH_DIR": str(project),
+        "AGENTIC_WORKING_SPACE": str(project),
+        "AGENTIC_SESSION_ID": sid,
+    }
+    assert not (tmp_path / "scratch" / sid).exists()
+
+
+async def given_an_unusable_working_space_when_a_session_starts_then_refused_before_anything(
+    tmp_path: Path,
+) -> None:
+    rig = _scratch_rig(tmp_path)
+
+    with pytest.raises(ConfigError) as exc:
+        await rig.start(working_space=str(tmp_path / "absent"))
+
+    assert exc.value.error.error_code == "WORKING_SPACE_INVALID"
+    assert exc.value.error.details["reason"] == "does_not_exist"
+    assert rig.store.list_sessions() == []  # no record at all
+    assert rig.transport.inits == []
+
+
+async def given_a_cleanup_that_fails_when_the_session_ends_then_the_session_is_not_broken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-026 §5: a filesystem problem is reported, never thrown at a finished session."""
+    rig = _scratch_rig(tmp_path)
+    rig.script_java_scenario()
+    monkeypatch.setattr(
+        rig.app.scratch,
+        "release",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("device is busy")),
+    )
+
+    session = await rig.run()
+
+    assert session.status is SessionState.COMPLETED
+    loop = rig.manager.loop_task(session.session_id)
+    assert loop is not None and loop.exception() is None  # the loop ended on its own terms
+    assert rig.store.get_session(session.session_id) is not None
+
+
+# ================================================================================================
+# 14. a session opened without an opening message (ADR-028)
+# ================================================================================================
+async def given_no_opening_message_when_session_started_then_ready_and_nothing_happened(
+    rig: Rig,
+) -> None:
+    """ADR-028 §1: the session exists, and that is all that happened."""
+    session = await rig.manager.start_session()
+
+    assert session.status is SessionState.READY
+    assert session.goal == "" and session.user_message == ""
+    assert session.current_conversation_id is None
+    assert session.started_at is None and session.ended_at is None
+    assert rig.conversations(session.session_id) == []
+    assert rig.manager.loop_task(session.session_id) is None  # no loop was even created
+    # nothing reached the model: no remote conversation, no message posted, none persisted
+    assert rig.transport.inits == [] and rig.transport.posted == []
+    assert rig.event_kinds() == [("session.created", None)]
+    assert rig.app.audit.verify(session.session_id).valid is True
+
+
+async def given_an_empty_session_when_the_first_message_arrives_then_the_full_loop_runs(
+    rig: Rig,
+) -> None:
+    """ADR-028 §1: the first message opens the first conversation and its first cycle."""
+    rig.script_java_scenario()
+    session = await rig.manager.start_session()
+    sid = session.session_id
+    rig.recorder.clear()
+
+    started = await rig.manager.continue_session(sid, USER_MESSAGE)
+    ended = await rig.wait(sid)
+
+    assert started.status is SessionState.RUNNING
+    assert ended.status is SessionState.COMPLETED
+    assert ended.goal == USER_MESSAGE  # the first message became the goal
+    assert ended.user_message == USER_MESSAGE
+    conversations = rig.conversations(sid)
+    assert [c.conversation_id for c in conversations] == ["conv-0001"]
+    assert conversations[0].parent_conversation_id is None
+    assert len(rig.transport.inits) == 1
+    assert rig.posted_types() == ["user_request", "execution_result", "execution_result"]
+    opening = rig.posted(0)
+    assert opening["content"]["goal"] == USER_MESSAGE
+    assert opening["content"]["user_message"] == USER_MESSAGE
+    assert [c.cycle_type for c in rig.cycles("conv-0001")][0] is CycleType.DISCOVERY
+    assert rig.app.audit.verify(sid).valid is True
+
+
+async def given_an_empty_session_when_interrupted_then_nothing_to_interrupt_and_still_usable(
+    rig: Rig,
+) -> None:
+    """A session with no conversation is idle: the interrupt is a no-op, the session still works."""
+    rig.script_java_scenario()
+    sid = (await rig.manager.start_session()).session_id
+
+    report = await rig.manager.interrupt(sid)
+
+    assert report.nothing_to_interrupt is True
+    assert report.conversation_id is None
+    assert report.session_status is SessionState.READY
+    assert rig.session(sid).status is SessionState.READY
+    assert rig.event_kinds() == [("session.created", None)]  # a no-op writes and publishes nothing
+    # and it is still the session it was: the first message runs the loop as if nothing happened
+    await rig.manager.continue_session(sid, USER_MESSAGE)
+    assert (await rig.wait(sid)).status is SessionState.COMPLETED
+
+
+async def given_an_empty_session_when_listed_and_read_then_visible_like_any_other(
+    rig: Rig,
+) -> None:
+    session = await rig.manager.start_session()
+    sid = session.session_id
+
+    assert rig.manager.list_sessions() == [session]
+    assert rig.manager.list_sessions(statuses=[SessionState.READY]) == [session]
+    assert rig.manager.get_session(sid) == session
+    snapshot = rig.manager.snapshot(sid)
+    assert snapshot.session.status is SessionState.READY
+    assert snapshot.conversation is None and snapshot.conversations == []
+    assert snapshot.cycle is None and snapshot.plan is None and snapshot.tasks == []
+    assert rig.manager.final_answer(sid) is None
+    assert rig.manager.last_reply(sid) is None
+    assert rig.manager.running_task_ids(sid) == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "missing"),
+    [({"goal": GOAL}, "user_message"), ({"user_message": USER_MESSAGE}, "goal")],
+    ids=["goal_without_message", "message_without_goal"],
+)
+async def given_half_an_opening_message_when_session_started_then_refused_before_anything(
+    rig: Rig, kwargs: dict[str, Any], missing: str
+) -> None:
+    """ADR-028 §1: the pair is all or nothing, and the refusal costs no record."""
+    with pytest.raises(ValueError, match=missing):
+        await rig.manager.start_session(**kwargs)
+
+    assert rig.store.list_sessions() == []
+    assert rig.transport.inits == []
+    assert rig.event_kinds() == []
+
+
+async def given_a_user_id_when_session_started_then_the_record_carries_it(rig: Rig) -> None:
+    """ADR-028 §2: the caller's user travels with the session; ``SessionRecord`` already had the
+    column, so nothing was added to the schema."""
+    named = await rig.manager.start_session(user_id="alice")
+    blank = await rig.manager.start_session(user_id="   ")
+    defaulted = await rig.manager.start_session()
+
+    assert named.user_id == "alice"
+    assert rig.session(named.session_id).user_id == "alice"  # persisted, not just returned
+    assert blank.user_id == rig.manager.default_user_id  # a blank name is no name
+    assert defaulted.user_id == rig.manager.default_user_id
+    assert rig.manager.default_user_id == rig.app.identity.user_id  # what GET /whoami answers
+
+
+def given_a_wired_application_when_no_identity_is_injectable_then_the_config_is_the_last_resort() -> (
+    None
+):
+    """ADR-024 §2 keeps the final say: an identity that resolves to nothing falls back on the
+    configured ``transport.user_id``, so the default is never empty."""
+    from agentic_local_app.identity import current_user
+
+    identity = current_user(environ={}, runner=lambda _: None, fallback_user_id="configured-user")
+    rig = make_rig()
+    application = build_application(
+        rig.config,
+        store=rig.store,
+        transport=rig.transport,
+        executor=rig.executor,
+        clock=rig.clock,
+        ids=rig.ids,
+        run_recovery=False,
+        identity=identity,
+    )
+
+    assert identity.source == "config"
+    assert application.manager.default_user_id == "configured-user"

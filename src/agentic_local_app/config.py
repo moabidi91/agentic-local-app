@@ -8,13 +8,22 @@ lists and tables are given as JSON (``AGENTIC__TRANSPORT__OPTIONS='{"init": {...
 Secrets never live in the file: ``transport.token_env`` names the environment variable holding the
 model API token (an optional ``.env`` file is loaded into the environment first, without overriding
 variables already set).
+
+ADR-024 adds named model profiles: ``[models]`` declares one complete transport section per model
+and ``models.active`` names the one this process runs with. The model is chosen **once**, at
+start-up; changing model means restarting the application with another active profile.
+
+ADR-027 adds ``credential_fields`` to a profile: the inputs a user interface has to render before
+that model can be called (a token, and whatever else a templated provider needs — a chat id, an
+organisation slug). Each field names the environment variable its value is written to; a profile
+that declares none falls back to one implicit ``access_token`` field built from ``token_env``.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
-from collections.abc import MutableMapping
+from collections.abc import Mapping, MutableMapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -31,6 +40,15 @@ DEFAULT_TRANSPORT_PROVIDER = "generic_http"
 DEFAULT_CODEC = "passthrough"
 #: Marker of an environment reference inside a provider option (``${env:VAR}``, ADR-020).
 ENV_REFERENCE_MARKER = "${env:"
+#: Name of the implicit model profile built from ``[transport]`` when there is no ``[models]``
+#: (ADR-024).
+DEFAULT_MODEL_PROFILE = "default"
+#: Key of the implicit credential field a profile falls back to when it declares none (ADR-027 §1).
+DEFAULT_CREDENTIAL_KEY = "access_token"
+#: Label of that implicit field — the same words the front shows when it has no declaration.
+DEFAULT_CREDENTIAL_LABEL = "Access token"
+#: Placeholder of that implicit field.
+DEFAULT_CREDENTIAL_PLACEHOLDER = "Paste an access token"
 #: Option keys whose values are always masked by :meth:`AppConfig.masked` (substring match).
 SECRET_KEY_MARKERS: tuple[str, ...] = ("key", "token", "secret", "password", "authorization")
 MASK = "***"
@@ -47,6 +65,42 @@ class AppSection(_Section):
     env_file: str = ".env"
 
 
+class CredentialField(_Section):
+    """ADR-027 §1 — one input a user interface renders for a model profile.
+
+    ``key`` is the identifier the interface sends back in the ``credentials`` object of
+    ``POST /credentials``; ``label`` and ``placeholder`` are presentation; ``secret`` says whether
+    the value may be remembered between launches (**default ``true``: fail closed**); ``env`` is
+    the environment variable the value is written to, which is the only field the application acts
+    on. ``env`` never leaves the process: the catalogue served to an interface drops it.
+    """
+
+    key: str
+    label: str
+    placeholder: str | None = None
+    secret: bool = True
+    env: str
+
+    @field_validator("key")
+    @classmethod
+    def _key_is_an_identifier(cls, value: str) -> str:
+        """A key travels as a JSON object key and as a form field name: keep it plain."""
+        value = value.strip()
+        if not value:
+            raise ValueError("must name a credential field")
+        if not value.isidentifier():
+            raise ValueError("must be shaped like an identifier (letters, digits, underscores)")
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _env_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must name an environment variable")
+        return value
+
+
 class TransportSection(_Section):
     """ADR-004 (endpoints, token, user id, timeouts), ADR-020 (pluggable provider) and ADR-021
     (message codec per model).
@@ -60,6 +114,15 @@ class TransportSection(_Section):
     ``agentic_local_app.codecs`` entry point, import path), the codec converting the raw shape of
     the model's replies into protocol envelopes and back (``passthrough`` = identity, the
     transport is used bare); ``codec_options`` is its own sub-table.
+
+    The same section describes a **named model profile** of ``[models]`` (ADR-024); ``display_name``
+    and ``description`` are presentation only — nothing in the application reads them, they travel
+    to the user interfaces through :class:`ModelProfileView`.
+
+    ``credential_fields`` (ADR-027 §1) declares what the profile needs to be called: one entry per
+    input an interface renders. Left out (``None``, the default), the profile falls back to one
+    implicit ``access_token`` field built from ``token_env`` — see
+    :func:`declared_credential_fields`. An explicitly empty list means the profile needs nothing.
     """
 
     init_url: str = "http://127.0.0.1:9000/v1/conversations"
@@ -80,6 +143,29 @@ class TransportSection(_Section):
     # ADR-021
     codec: str = DEFAULT_CODEC
     codec_options: dict[str, Any] = Field(default_factory=dict)
+    # ADR-024: presentation of the profile in a model catalogue, never read by the application
+    display_name: str | None = None
+    description: str | None = None
+    # ADR-027: the inputs an interface renders before this profile can be called
+    credential_fields: list[CredentialField] | None = None
+
+    @field_validator("credential_fields")
+    @classmethod
+    def _credential_keys_unique(
+        cls, value: list[CredentialField] | None
+    ) -> list[CredentialField] | None:
+        """Two fields sharing a key would make the posted object ambiguous."""
+        if value is None:
+            return None
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for field in value:
+            if field.key in seen:
+                duplicates.add(field.key)
+            seen.add(field.key)
+        if duplicates:
+            raise ValueError(f"credential field key(s) declared twice: {sorted(duplicates)}")
+        return value
 
     @field_validator("provider")
     @classmethod
@@ -118,6 +204,132 @@ class TransportSection(_Section):
         return value or None
 
 
+class ModelsSection(_Section):
+    """ADR-024 — the named model profiles and the one this process runs with.
+
+    ``active`` names a profile; every other key of ``[models]`` is a profile, validated exactly
+    like ``[transport]``::
+
+        [models]
+        active = "mock"
+
+        [models.mock]
+        provider = "generic_http"
+        codec = "passthrough"
+
+        [models.claude]
+        provider = "templated_http"
+        codec = "json_text"
+        token_env = "CLAUDE_API_KEY"
+        display_name = "Claude (chat completions)"
+
+    A profile is **complete**: it inherits nothing from ``[transport]``, only the defaults of
+    :class:`TransportSection`. Without ``[models]``, ``[transport]`` is the implicit profile named
+    ``default`` and it is the active one (:data:`DEFAULT_MODEL_PROFILE`).
+    """
+
+    active: str = DEFAULT_MODEL_PROFILE
+    profiles: dict[str, TransportSection] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _gather_profiles(cls, data: Any) -> Any:
+        """``[models.<name>]`` sub-tables are profiles; ``active`` is the only reserved key."""
+        if not isinstance(data, dict):
+            return data
+        profiles: dict[str, Any] = dict(data.get("profiles") or {})
+        profiles.update({k: v for k, v in data.items() if k not in {"active", "profiles"}})
+        gathered: dict[str, Any] = {"profiles": profiles}
+        if "active" in data:
+            gathered["active"] = data["active"]
+        return gathered
+
+    @field_validator("active")
+    @classmethod
+    def _active_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must name a model profile")
+        return value
+
+
+class CredentialFieldView(_Section):
+    """What the interfaces show of one credential field (ADR-027 §2): everything but ``env``.
+
+    The name of the environment variable is an implementation detail of this process and stays
+    here; an interface only ever needs the key it sends back, and what to draw around the input.
+    """
+
+    key: str
+    label: str
+    placeholder: str | None
+    secret: bool
+
+
+class ModelProfileView(_Section):
+    """What the interfaces show of one profile (ADR-024 §3): a catalogue entry, no secret.
+
+    ``requires_credentials`` is computed at read time, never stored: at least one declared field
+    has no value in the environment right now. ``credential_fields`` is **always present** — a
+    possibly empty list, in declaration order (ADR-027 §2) — so an interface never has to guess
+    what to render from a bare boolean.
+    """
+
+    name: str
+    display_name: str | None
+    description: str | None
+    provider: str
+    codec: str
+    requires_credentials: bool
+    credential_fields: list[CredentialFieldView]
+    active: bool
+
+
+def declared_credential_fields(section: TransportSection) -> list[CredentialField]:
+    """ADR-027 §1 — the fields of a profile, declared or implicit, in declaration order.
+
+    A profile that declares no list falls back to exactly one implicit ``access_token`` field
+    built from ``token_env``, and to nothing at all when it names no variable either. That is
+    what a front does with ``requires_credentials`` alone, so both ends degrade identically.
+    """
+    if section.credential_fields is not None:
+        return list(section.credential_fields)
+    variable = section.token_env.strip()
+    if not variable:
+        return []
+    return [
+        CredentialField(
+            key=DEFAULT_CREDENTIAL_KEY,
+            label=DEFAULT_CREDENTIAL_LABEL,
+            placeholder=DEFAULT_CREDENTIAL_PLACEHOLDER,
+            secret=True,
+            env=variable,
+        )
+    ]
+
+
+def credential_field_views(section: TransportSection) -> list[CredentialFieldView]:
+    """The same fields as :func:`declared_credential_fields`, stripped of ``env`` (ADR-027 §2)."""
+    return [
+        CredentialFieldView(
+            key=field.key, label=field.label, placeholder=field.placeholder, secret=field.secret
+        )
+        for field in declared_credential_fields(section)
+    ]
+
+
+def requires_credentials(
+    section: TransportSection, environ: Mapping[str, str] | None = None
+) -> bool:
+    """ADR-024 / ADR-027: at least one declared field has no value in the environment (yet).
+
+    Unchanged for a profile that declares no field: it falls back to the implicit ``access_token``
+    field of ``token_env``, so the answer is still "``token_env`` named and that variable empty".
+    """
+    env: Mapping[str, str] = os.environ if environ is None else environ
+    return any(not env.get(field.env, "").strip() for field in declared_credential_fields(section))
+
+
 class ExecutionSection(_Section):
     """ADR-003 (platform), ADR-008 (timeouts), ADR-018 (live output)."""
 
@@ -129,6 +341,68 @@ class ExecutionSection(_Section):
     interrupt_drain_timeout_ms: int = Field(default=5_000, gt=0)
     live_output_chunk_bytes: int = Field(default=4_096, gt=0)
     live_output_interval_ms: int = Field(default=250, ge=0)
+
+
+def _as_absolute(value: str) -> Path:
+    """A configured directory as an absolute, normalised path — without touching the filesystem.
+
+    ``os.path.abspath`` resolves ``.``/``..`` and the current directory lexically; ``Path.resolve``
+    is deliberately avoided, it would follow symbolic links and depend on what exists right now.
+    """
+    return Path(os.path.abspath(os.path.expanduser(value)))
+
+
+class ScratchSection(_Section):
+    """ADR-026: the working space offered to the model's commands, and its fate.
+
+    ``root`` is the parent of the per-session folders (``<root>/<session_id>``), created lazily and
+    narrowed to the owner on POSIX. ``policy`` decides what happens to a folder **the application
+    generated** when its session ends — a ``working_space`` handed over by the user is never deleted
+    nor archived, whatever the policy. ``keep_on_failure`` overrides ``delete`` and ``archive`` for
+    a session that failed, because that is when the files are worth looking at.
+    ``max_inventory_entries`` bounds what an inventory reports, not what it walks.
+
+    ``enabled = false`` restores the behaviour that predates the ADR: no folder is created and no
+    variable is exported.
+    """
+
+    enabled: bool = True
+    root: str = "./data/scratch"
+    policy: Literal["delete", "keep", "archive"] = "delete"
+    archive_root: str = "./data/scratch-archive"
+    keep_on_failure: bool = True
+    max_inventory_entries: int = Field(default=200, gt=0)
+
+    @field_validator("root", "archive_root")
+    @classmethod
+    def _directory_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("must name a directory")
+        return value
+
+    @model_validator(mode="after")
+    def _archive_outside_root(self) -> ScratchSection:
+        """``archive_root`` inside ``root`` would make an archive look like a session folder."""
+        root, archive = _as_absolute(self.root), _as_absolute(self.archive_root)
+        if archive == root or archive.is_relative_to(root) or root.is_relative_to(archive):
+            raise ValueError("scratch.archive_root must be outside scratch.root")
+        return self
+
+
+class SkillsSection(_Section):
+    """ADR-027 §4: the reusable notes a user interface offers to attach to a session.
+
+    A skill is a markdown file the user wrote somewhere on this machine; the application only ever
+    **lists** them (``GET /skills``) so that the interface can propose a choice instead of a free
+    text field. ``root`` is the folder that is walked (``""`` = unset, nothing is walked) and
+    ``enabled = false`` turns the listing off without touching the path.
+
+    Nothing here is ever read, opened or sent to the model: what a session does with the skills it
+    was given is undecided (ADR-027, point ouvert).
+    """
+
+    enabled: bool = True
+    root: str = ""
 
 
 class PayloadSection(_Section):
@@ -198,14 +472,34 @@ class CircuitBreakerSection(_Section):
     half_open_max_calls: int = Field(default=1, ge=1)
 
 
+#: Origins allowed by default (ADR-018): the Vite dev server of the desktop front, which pins its
+#: port to 1420 (``vite.config.ts``, ``strictPort``), the default Vite port, a packaged Tauri
+#: desktop application, plus the historical front port. Both spellings of the loopback are listed:
+#: a browser treats ``localhost`` and ``127.0.0.1`` as two different origins.
+DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "tauri://localhost",
+)
+
+
 class ApiSection(_Section):
-    """ADR-018 local HTTP API."""
+    """ADR-018 local HTTP API.
+
+    ``allow_destructive_admin`` opens the one route that destroys data,
+    ``POST /admin/reset-database``; it is ``false`` by default and the route then answers
+    ``403 ADMIN_DISABLED`` without touching anything.
+    """
 
     host: str = "127.0.0.1"
     port: int = Field(default=8765, gt=0, lt=65536)
-    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
+    cors_origins: list[str] = Field(default_factory=lambda: list(DEFAULT_CORS_ORIGINS))
     page_size: int = Field(default=100, gt=0)
     sse_queue_size: int = Field(default=1_000, gt=0)
+    allow_destructive_admin: bool = False
 
 
 class CliSection(_Section):
@@ -221,7 +515,10 @@ class AppConfig(BaseModel):
 
     app: AppSection = Field(default_factory=AppSection)
     transport: TransportSection = Field(default_factory=TransportSection)
+    models: ModelsSection = Field(default_factory=ModelsSection)
     execution: ExecutionSection = Field(default_factory=ExecutionSection)
+    scratch: ScratchSection = Field(default_factory=ScratchSection)
+    skills: SkillsSection = Field(default_factory=SkillsSection)
     payload: PayloadSection = Field(default_factory=PayloadSection)
     protocol: ProtocolSection = Field(default_factory=ProtocolSection)
     context: ContextSection = Field(default_factory=ContextSection)
@@ -231,6 +528,32 @@ class AppConfig(BaseModel):
     api: ApiSection = Field(default_factory=ApiSection)
     cli: CliSection = Field(default_factory=CliSection)
     telemetry: TelemetrySection = Field(default_factory=TelemetrySection)
+
+    @model_validator(mode="after")
+    def _resolve_active_model(self) -> AppConfig:
+        """ADR-024: the active profile **becomes** ``transport``, once, at load time.
+
+        Without ``[models]`` the section itself is the implicit profile named ``default``, so the
+        catalogue always has at least one entry and nothing that reads ``config.transport`` changes.
+        With ``[models]``, the selected profile is copied over ``transport``: one model per process,
+        chosen at start-up — changing model means restarting with another ``models.active``.
+
+        The two fields are rebound through :func:`object.__setattr__`: the model is frozen, and
+        pydantic ignores a validator that returns another instance when the model is built by
+        ``__init__``. Nothing is re-validated, both values are already validated sections.
+        """
+        models = self.models
+        if not models.profiles:
+            models = models.model_copy(update={"profiles": {DEFAULT_MODEL_PROFILE: self.transport}})
+            object.__setattr__(self, "models", models)
+        profile = models.profiles.get(models.active)
+        if profile is None:
+            raise ConfigError(
+                "MODEL_PROFILE_UNKNOWN", model=models.active, available=sorted(models.profiles)
+            )
+        if profile is not self.transport:
+            object.__setattr__(self, "transport", profile)
+        return self
 
     @model_validator(mode="after")
     def _cross_section_bounds(self) -> AppConfig:
@@ -244,18 +567,50 @@ class AppConfig(BaseModel):
             raise ValueError("context.summary_budget_bytes must be <= payload.max_message_bytes")
         return self
 
+    @property
+    def active_transport(self) -> TransportSection:
+        """The transport of the active model profile (ADR-024).
+
+        After validation this **is** :attr:`transport`: ``_resolve_active_model`` copies the active
+        profile over the section, so every existing reader of ``config.transport`` already runs with
+        the selected model.
+        """
+        return self.transport
+
+    def profile_views(self, environ: Mapping[str, str] | None = None) -> list[ModelProfileView]:
+        """Model catalogue for the interfaces (ADR-024 §3): active profile first, then by name."""
+        views = [
+            ModelProfileView(
+                name=name,
+                display_name=profile.display_name,
+                description=profile.description,
+                provider=profile.provider,
+                codec=profile.codec,
+                requires_credentials=requires_credentials(profile, environ),
+                credential_fields=credential_field_views(profile),
+                active=name == self.models.active,
+            )
+            for name, profile in self.models.profiles.items()
+        ]
+        return sorted(views, key=lambda view: (not view.active, view.name))
+
     def masked(self) -> dict[str, Any]:
         """Effective configuration as a dict with the token masked (for ``config show`` / ``/config``).
 
         Provider options (ADR-020) and codec options (ADR-021) are masked with a simple guard:
         any value containing an environment reference (``${env:...}``) and any value under a key
         that looks secret (``*key*``, ``*token*``, ``*secret*``, ``*password*``,
-        ``*authorization*``) becomes ``***``.
+        ``*authorization*``) becomes ``***``. The options of **every** model profile (ADR-024) are
+        masked the same way, not only those of the active one.
         """
         data = self.model_dump()
         data["transport"]["token"] = MASK if self.transport.token else None
         data["transport"]["options"] = mask_options(self.transport.options)
         data["transport"]["codec_options"] = mask_options(self.transport.codec_options)
+        for name, profile in self.models.profiles.items():
+            dumped = data["models"]["profiles"][name]
+            dumped["options"] = mask_options(profile.options)
+            dumped["codec_options"] = mask_options(profile.codec_options)
         return data
 
 

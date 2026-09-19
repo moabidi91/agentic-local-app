@@ -56,6 +56,7 @@ from agentic_local_app.persistence.memory import InMemoryConversationStore
 from agentic_local_app.persistence.sqlite_store import SqliteConversationStore
 from integration.phase9_rig import (
     REMOTE_1,
+    USER_MESSAGE,
     Rig,
     cmd_task,
     discovery_plan,
@@ -873,3 +874,43 @@ def given_session_running_with_new_conversation_when_recovery_runs_then_session_
         ("session", "INTERRUPTING"),
         ("session", "READY"),
     ]
+
+
+# ================================================================================================
+# 3. a session opened without an opening message survives a restart (ADR-028)
+# ================================================================================================
+async def given_an_empty_session_when_the_application_restarts_then_untouched_and_still_usable(
+    tmp_path: Path,
+) -> None:
+    """ADR-028 §1: a ``READY`` session with no conversation is not an open session — the recovery
+    only settles ``RUNNING`` / ``INTERRUPTING`` ones (ADR-016 §2), so it survives as it was and its
+    first message opens its first conversation on the other side of the restart."""
+    clock = FakeClock()
+    first = _sqlite_rig(tmp_path, clock, run_recovery=True)
+    session = await first.manager.start_session(user_id="alice")
+    sid = session.session_id
+    audited_before = first.store.count_audit_events(sid)
+    first.store.close()  # the process stops, nothing was running
+
+    second = _sqlite_rig(tmp_path, clock, run_recovery=True, ids=first.ids)
+    report = second.manager.recovery_report
+
+    assert report is not None and report.actions == []
+    assert report.sessions_ready == [] and report.sessions_resumable == []
+    restored = second.session(sid)
+    assert restored == session  # byte for byte the record the first process wrote
+    assert restored.status is SessionState.READY
+    assert restored.user_id == "alice"
+    assert second.conversations(sid) == []
+    assert second.store.count_audit_events(sid) == audited_before
+    assert second.app.audit.verify(sid).valid is True
+
+    # still usable: the first message runs the loop in the restarted process
+    second.script_java_scenario()
+    await second.manager.continue_session(sid, USER_MESSAGE)
+    ended = await second.wait(sid)
+
+    assert ended.status is SessionState.COMPLETED
+    assert ended.goal == USER_MESSAGE
+    assert [c.conversation_id for c in second.conversations(sid)] == ["conv-0001"]
+    assert second.app.audit.verify(sid).valid is True

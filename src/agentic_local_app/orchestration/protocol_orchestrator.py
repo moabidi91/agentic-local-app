@@ -1,6 +1,6 @@
 """``ProtocolOrchestrator`` — the protocol loop (spec §2.2, §3.2, §7, §8.4, §10, §11, §14, §15 ;
 ADR-004, ADR-006, ADR-007, ADR-010, ADR-012, ADR-013, ADR-014, ADR-015, ADR-017, ADR-019,
-ADR-022).
+ADR-022, ADR-025).
 
 One ``run`` drives one session from an entry point to a terminal state of the loop, with every
 state change owned by its component (``ConversationLifecycleManager`` for sessions and
@@ -12,9 +12,10 @@ event that reports it (ADR-015). Three entry points:
   identifier: remote ``init``, then the initial ``user_request`` (``discovery`` cycle);
 - :meth:`ProtocolOrchestrator.continue_session` — a reusable conversation (``WAITING_USER``, §11):
   a follow-up ``user_request`` (``execution`` cycle, follow-up row of the ADR-007 table);
-- :meth:`ProtocolOrchestrator.resume_session` — after a restart (ADR-016): a conversation
-  ``WAITING_MODEL_RESPONSE`` whose last outbound message is persisted; the POST is replayed with the
-  same ``message_id`` when it was not confirmed, then the loop **receives first**.
+- :meth:`ProtocolOrchestrator.resume_session` — after a restart (ADR-016) or after a pause
+  (ADR-025): a conversation ``WAITING_MODEL_RESPONSE`` whose last outbound message is persisted;
+  the POST is replayed with the same ``message_id`` when it was not confirmed, then the loop
+  **receives first**.
 
 The loop itself (§14 amended by the ADRs — see ``docs/phases/phase-09-orchestration.md``):
 
@@ -42,6 +43,13 @@ The loop itself (§14 amended by the ADRs — see ``docs/phases/phase-09-orchest
    does a ``user_response`` (ADR-022) — the model's direct answer to the user — except that it is
    never written to ``SessionRecord.final_answer`` and that a question (``expects_reply``) keeps
    the conversation ``WAITING_USER`` even under ``auto_close_on_final_answer``.
+
+Pause (ADR-025): when the failure policy answers ``pause`` to an ``AUTHN_ERROR`` — a 401, that is
+a token to renew and nothing else — the loop stops **without losing anything**
+(:meth:`_SessionRun._pause`): the pending outbound message stays pending exactly as ADR-016 expects
+it, the conversation keeps its state, the cycle stays open, the remote conversation stays open, and
+the session goes ``RUNNING -> PAUSED`` (``session.paused``). The loop task ends cleanly; the session
+resumes through :meth:`ProtocolOrchestrator.resume_session` once the user provided a token.
 
 Interruption (§2.9, ADR-006): the token is checked before every step and every transport call is
 abandoned by the ``InterruptionHandler``; the loop then stops **silently** — nothing is sent, no
@@ -133,7 +141,10 @@ from agentic_local_app.protocol.messages import (
     UserResponseContent,
 )
 from agentic_local_app.resilience.circuit_breaker import CircuitBreaker
-from agentic_local_app.resilience.failure_manager import FailureManager
+from agentic_local_app.resilience.failure_manager import (
+    CREDENTIALS_REQUIRED_REASON,
+    FailureManager,
+)
 from agentic_local_app.transport.gateway import (
     OP_GET,
     OP_INIT,
@@ -146,6 +157,8 @@ __all__ = [
     "CIRCUIT_OPEN_CODE",
     "REASON_AUTO_CLOSE",
     "REASON_BUDGET_EXCEEDED",
+    "REASON_CREDENTIALS_PROVIDED",
+    "REASON_CREDENTIALS_REQUIRED",
     "REASON_FAILURE",
     "REASON_FINAL_ANSWER",
     "REASON_PLAN_RECEIVED",
@@ -183,6 +196,9 @@ REASON_AUTO_CLOSE = "auto_close"
 REASON_FAILURE = "failure"
 REASON_BUDGET_EXCEEDED = "budget_exceeded"
 REASON_ROTATION_FAILED = "rotation_failed"
+#: ADR-025: ``reason`` of ``RUNNING -> PAUSED`` and of the ``PAUSED -> RUNNING`` that follows.
+REASON_CREDENTIALS_REQUIRED = CREDENTIALS_REQUIRED_REASON
+REASON_CREDENTIALS_PROVIDED = "credentials_provided"
 
 #: ``reason`` values of ``context.window_state_changed`` (06 §1.1).
 WINDOW_REASON_THRESHOLD = "threshold"
@@ -282,6 +298,21 @@ class _RotateRequestedError(Exception):
         self.error = error
 
 
+class _PausedError(Exception):
+    """ADR-025: the failure policy decided ``pause`` (``AUTHN_ERROR``).
+
+    The loop must stop **without writing anything else**: the ``FailureRecord`` is already there
+    (the decision path recorded it), the outbound message stays pending and the conversation keeps
+    its state, so the session resumes exactly where it stopped once a token is provided.
+    """
+
+    def __init__(self, error: NormalizedError, *, operation: str, message_id: str | None) -> None:
+        super().__init__(f"{error.error_type.value}/{error.error_code}")
+        self.error = error
+        self.operation = operation
+        self.message_id = message_id
+
+
 class _FailedError(Exception):
     """The loop must end in ``FAILED``: the error, the transition reason, whether a
     ``FailureRecord`` was already written, and the budget stage when it is a budget failure."""
@@ -372,7 +403,7 @@ class ProtocolOrchestrator:
         return await _SessionRun(self, session_id, _Entry.FOLLOW_UP, user_message).run()
 
     async def resume_session(self, session_id: str) -> SessionRecord:
-        """ADR-016: replay the unconfirmed POST if any, then GET first, then the loop."""
+        """ADR-016 / ADR-025: replay the unconfirmed POST if any, then GET first, then the loop."""
         return await _SessionRun(self, session_id, _Entry.RESUME, None).run()
 
 
@@ -409,6 +440,8 @@ class _SessionRun:
             pass  # nothing is sent, nothing is written: the InterruptionHandler cleans up
         except asyncio.CancelledError:
             raise
+        except _PausedError as paused:
+            self._pause(paused)  # ADR-025: the loop ends cleanly, the session waits for a token
         except _FailedError as failed:
             await self._terminate_failed(failed)
         except AppError as exc:
@@ -1339,6 +1372,12 @@ class _SessionRun:
                     continue
                 if decision.kind == "rotate":
                     raise _RotateRequestedError(error) from exc
+                if decision.kind == "pause":
+                    raise _PausedError(
+                        error,
+                        operation=operation,
+                        message_id=self._pending_message_id(),
+                    ) from exc
                 if decision.kind == "abort":
                     raise _InterruptedError() from exc
                 raise _FailedError(error, reason=REASON_FAILURE, recorded=True) from exc
@@ -1391,6 +1430,41 @@ class _SessionRun:
             return
         self._cycle = cycle.model_copy(update={"retry_count": cycle.retry_count + 1})
         o.store.save_cycle(self._cycle)
+
+    # ---- pause (ADR-025) -----------------------------------------------------------------------
+    def _pause(self, paused: _PausedError) -> None:
+        """Put the session on hold until the user provides a token, losing nothing.
+
+        Everything the loop built stays exactly as it is: the outbound message stays pending (the
+        recovery reads it back with :func:`pending_outbound_of`), the conversation keeps its state
+        and its cursor, the cycle stays ``RUNNING`` and its budget is not spent twice, the remote
+        conversation is **not** closed. Only the session moves, ``RUNNING -> PAUSED``; the
+        ``FailureRecord`` and its ``failure.recorded`` were written by the decision path.
+
+        The state change is persisted and published first (ADR-015), then ``session.paused`` says
+        why — an interface that reacts to it never reads a session still marked ``RUNNING``.
+        """
+        o = self._o
+        session = self._session()
+        if not can_transition(SESSION_TRANSITIONS, session.status, SessionState.PAUSED):
+            # interrupted (or already terminal) while the decision was being taken
+            log.info("session %s is %s: it is not paused", self._sid, session.status.value)
+            return
+        o.lifecycle.transition_session(
+            self._sid, SessionState.PAUSED, reason=REASON_CREDENTIALS_REQUIRED
+        )
+        self._publish(
+            EventType.SESSION_PAUSED,
+            o.clock.now(),
+            cycle_id=self._cycle_id(),
+            payload={
+                "reason": REASON_CREDENTIALS_REQUIRED,
+                "error_code": paused.error.error_code,
+                "error_type": paused.error.error_type.value,
+                "operation": paused.operation,
+                "message_id": paused.message_id,
+            },
+        )
 
     # ---- failure termination -------------------------------------------------------------------
     async def _terminate_failed(self, failed: _FailedError) -> None:
@@ -1661,6 +1735,11 @@ class _SessionRun:
 
     def _plan_id(self) -> str | None:
         return self._conv.current_plan_id if self._conv is not None else None
+
+    def _pending_message_id(self) -> str | None:
+        """The message ``M`` the loop is sending or waiting a reply to, ``None`` before the first
+        one (a remote ``init``). A ``protocol_correction_request`` never replaces it (ADR-023)."""
+        return self._last_outbound.message_id if self._last_outbound is not None else None
 
     def _remote(self) -> str:
         conv = self._conversation()

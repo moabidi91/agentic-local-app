@@ -144,6 +144,7 @@ Le détail de chaque couche et le mapping vers les modules Python est dans [`doc
 | [`docs/spec/`](docs/spec/SPEC-v1.1.md) | La spécification v1.1, source de vérité |
 | [`docs/architecture/`](docs/architecture/00-overview.md) | Conception détaillée : composants, machines à états, protocole, exécution, persistance, transport, rotation, interruption, observabilité, module map |
 | [`docs/adr/`](docs/adr/README.md) | Architecture Decision Records : chaque arbitrage pris là où la spec était ambiguë ou muette |
+| [`docs/contracts/`](docs/contracts/front-backend-v1.md) | **Contrat front ↔ application** : chaque route de l'API locale avec sa requête, sa réponse et ses refus, l'enveloppe d'erreur, le flux live, et l'état des lieux méthode par méthode du front de bureau |
 | [`docs/phases/`](docs/phases/README.md) | Guides d'implémentation par phase TDD (objectif, conception, plan de tests, gate) |
 | [`docs/guides/`](docs/guides/README.md) | **Guides pratiques** : [prendre en main l'application](docs/guides/01-prise-en-main.md), [brancher un modèle par configuration](docs/guides/02-brancher-un-modele.md), [écrire un provider de transport](docs/guides/03-ecrire-un-provider.md), [écrire un codec de messages](docs/guides/04-ecrire-un-codec.md) |
 | [`examples/`](examples/README.md) | Un provider et un codec écrits **hors de l'application** (`acme_model_plugin`), sélectionnés par chemin d'import dans [`examples/config.acme.toml`](examples/config.acme.toml), couverts par les tests |
@@ -177,14 +178,28 @@ uv run agentic-app run "Understand the root cause of a Java build failure" \
 #    quand le modèle pose une question (user_response avec expects_reply), lui répondre :
 uv run agentic-app reply <sid> "Only the service-api module fails."
 
+#    si le modèle refuse le jeton (401), la session est mise en pause (ADR-025) et `run` sort
+#    en code 3 : fournir un jeton — jamais en argument, donc jamais dans l'historique du shell —
+#    puis reprendre la session là où elle s'est arrêtée
+cat jeton.txt | uv run agentic-app credentials     # ou : uv run agentic-app credentials
+uv run agentic-app credentials --from-env CLAUDE_API_KEY
+uv run agentic-app resume <sid>
+
 # 3. ou exposer l'API locale (REST + flux SSE) pour un front ou un autre outil
 uv run agentic-app serve --host 127.0.0.1 --port 8765
 curl -X POST http://127.0.0.1:8765/api/v1/sessions \
      -H "Content-Type: application/json" \
      -d '{"goal":"…","user_message":"…"}'
+#    ou, comme un écran de connexion : une session ouverte sans rien dire au modèle (ADR-028)
+curl -X POST http://127.0.0.1:8765/api/v1/sessions \
+     -H "Content-Type: application/json" -d '{}'       # -> 201, status READY
+uv run agentic-app open --user-id alice                # la même chose en console
+uv run agentic-app reply <sid> "Debug the Java error." # son premier message démarre la boucle
 curl -N http://127.0.0.1:8765/api/v1/events            # flux live de tous les événements
 curl http://127.0.0.1:8765/api/v1/sessions/<sid>/snapshot
 curl http://127.0.0.1:8765/api/v1/sessions/<sid>/reply  # la dernière réponse : final_answer ou user_response
+curl http://127.0.0.1:8765/api/v1/models                # catalogue + champs d'identifiants à afficher
+curl http://127.0.0.1:8765/api/v1/skills                # notes réutilisables trouvées sous [skills] root
 
 # 4. vérifier ou afficher la configuration effective
 uv run agentic-app config validate
@@ -198,6 +213,14 @@ uv run agentic-app transport show
 uv run agentic-app codec list
 uv run agentic-app codec show
 ```
+
+**Codes de sortie de `run`** : `0` réponse finale, `1` échec ou erreur, `2` interruption (Ctrl-C), `3` session **en pause** sur une erreur d'authentification ([ADR-025](docs/adr/ADR-025-pause-sur-erreur-d-authentification.md)). Le code 3 n'est pas un échec : rien n'est perdu — la conversation, le cycle ouvert et le message en attente sont conservés —, la raison de la pause est affichée (opération refusée, code HTTP, depuis quand), et `agentic-app credentials` puis `agentic-app resume <sid>` reprennent exactement où la session s'est arrêtée. Le jeton ne se donne jamais en argument de commande : il est lu sur l'entrée standard (saisie masquée sur un terminal) ou dans la variable nommée par `--from-env`, envoyé à l'application, et il n'est ni affiché, ni journalisé, ni écrit dans un fichier.
+
+**Ouvrir une session avant d'avoir quelque chose à dire** ([ADR-028](docs/adr/ADR-028-ouverture-de-session-sans-message.md)). `POST /sessions` prend son message d'ouverture comme une **paire facultative**. Avec `goal` et `user_message`, rien ne change : la réponse arrive en `RUNNING` et la boucle a déjà commencé. Avec **ni l'un ni l'autre**, la session est créée `READY` et attend — aucune conversation, aucun cycle, **rien n'est posté au modèle**, aucun `user_request` n'est persisté ; le premier message envoyé par `POST /sessions/{sid}/messages` ouvre sa première conversation et devient son but. Un seul des deux champs est refusé en `400 GOAL_REQUIRED` / `400 USER_MESSAGE_REQUIRED`, avant toute création. C'est la forme dont a besoin un écran de connexion, qui demande un utilisateur, un modèle, des identifiants et un dossier de travail, jamais une phrase : sans elle, une interface est obligée d'inventer un message, et le modèle reçoit une demande que personne n'a tapée.
+
+En console, `agentic-app run "<but>"` est inchangée — elle exige un but et lance la boucle dans son propre processus. La commande `agentic-app open` est le pendant de l'écran de connexion : cliente de l'API comme `reply` ou `resume`, elle ouvre une session vide (`--user-id`, `--working-space`, `--skill`, `--effort`) et affiche la commande qui lui enverra son premier message. `POST /sessions` accepte aussi un `user_id` facultatif ; omis, la session porte **exactement ce que rend `GET /whoami`** — l'identité machine d'[ADR-024](docs/adr/ADR-024-profils-de-modele.md) §2, et non plus la constante `transport.user_id`, qui la contredisait à l'écran.
+
+**Identifiants d'un modèle, skills et niveau d'effort** ([ADR-027](docs/adr/ADR-027-champs-d-identifiants-par-modele.md)). Un profil de modèle déclare dans `credential_fields` ce qu'une interface doit demander avant de l'appeler — un jeton, et le cas échéant un identifiant de conversation, une organisation, un espace de travail. `GET /models` rend ces champs (`key`, `label`, `placeholder`, `secret`) sans jamais nommer la variable d'environnement derrière, et `POST /credentials` reçoit `{"credentials": {"<clé>": "<valeur>"}}` (l'ancien `{"token": …}` reste accepté comme raccourci du champ implicite `access_token`). Un profil qui ne déclare rien se comporte comme s'il déclarait ce seul champ implicite, construit sur `token_env`. `GET /skills` liste les fichiers `*.md` trouvés sous `[skills] root` (jamais d'erreur : racine absente ou illisible = liste vide). **`skills` et `effort`, acceptés à la création d'une session, sont journalisés dans l'événement `session.created` et rien d'autre** : aucun fichier n'est lu, aucune consigne n'en est tirée, et le modèle reçoit exactement ce qu'il recevait avant. Les transmettre au modèle demande sa propre décision, donc un ADR.
 
 Tout ce qui est externe ou paramétrable se règle **une seule fois** dans [`config.toml`](config.toml) (endpoints du modèle, jeton via variable d'environnement, identifiant utilisateur, timeouts, drains, limites de payload, réponse directe du modèle et politique de correction (`[protocol]` : `allow_direct_response`, `max_correction_attempts`), budgets, seuils de contexte, API). Pour brancher un vrai modèle : renseigner `[transport]` (`init_url`, `post_url`, `get_url`, `user_id`) et exporter le jeton dans la variable nommée par `token_env`. Le contrat attendu de l'endpoint est décrit dans [ADR-004](docs/adr/ADR-004-contrat-de-transport.md) ; le serveur mock en est l'implémentation de référence. Le pas-à-pas complet — les quatre requêtes, l'arbre de décision provider / codec, la vérification, le dépannage par code d'erreur — est le [guide 02](docs/guides/02-brancher-un-modele.md) ; la prise en main de l'application (installation, configuration, première session, API et flux live) est le [guide 01](docs/guides/01-prise-en-main.md).
 

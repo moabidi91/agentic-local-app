@@ -1,11 +1,15 @@
 """``agentic-app`` — the console interface (ADR-002, ADR-018).
 
 Commands: ``run`` (a session in-process, live display, **Ctrl-C = interruption**), ``serve`` (the
-HTTP API), ``status`` / ``sessions`` / ``interrupt`` / ``reply`` / ``audit verify`` (clients of
-the API; ``reply`` answers a question the model asked with a ``user_response``, ADR-022),
-``config show`` / ``config validate``, ``transport list`` / ``transport show`` (the pluggable
-transport providers of ADR-020; ``show`` also names the effective message codec), ``codec list`` /
-``codec show`` (the message codecs of ADR-021), ``mock-server`` (the scripted model), ``version``.
+HTTP API), ``open`` / ``status`` / ``sessions`` / ``interrupt`` / ``reply`` / ``credentials`` /
+``resume`` / ``audit verify`` (clients of the API; ``open`` creates a session without an opening
+message, the way a sign-in screen does, and nothing is sent to the model until the first ``reply``
+(ADR-028); ``reply`` answers a question the model asked with a
+``user_response``, ADR-022; ``credentials`` hands over a token and ``resume`` restarts a session
+paused on a 401, ADR-025), ``config show`` / ``config validate``, ``transport list`` /
+``transport show`` (the pluggable transport providers of ADR-020; ``show`` also names the effective
+message codec), ``codec list`` / ``codec show`` (the message codecs of ADR-021), ``mock-server``
+(the scripted model), ``version``.
 
 Everything external is injectable through :class:`CliDependencies` (``ctx.obj``): the application
 factory (``orchestration.wiring.build_application``, imported lazily so that this module never
@@ -16,8 +20,10 @@ process, a port or a network call.
 Ctrl-C in ``run``: the first one turns into ``manager.interrupt(session_id)`` — either as the
 ``KeyboardInterrupt`` raised at the await point or as the ``CancelledError`` that ``asyncio.run``
 injects on SIGINT (which is then *uncancelled* so the interruption can run to ``READY``); the
-second one, raised by ``asyncio.run`` itself, ends the process (exit code 2). Exit codes: 0 final
-answer, 1 failure or error, 2 interrupted.
+second one, raised by ``asyncio.run`` itself, ends the process (exit code 2). Exit codes of
+``run``: 0 final answer, 1 failure or error, 2 interrupted, **3 paused** — a 401 suspended the
+session (ADR-025), the reason is printed, and nothing was lost: ``agentic-app credentials`` then
+``agentic-app resume <sid>`` picks the session up where it stopped.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import os
+import sys
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -45,6 +53,7 @@ from agentic_local_app.domain.errors import AppError, ConfigError, NormalizedErr
 from agentic_local_app.domain.events import Event, EventType
 from agentic_local_app.domain.models import SessionBudget, SessionRecord
 from agentic_local_app.domain.states import SessionState
+from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
 from agentic_local_app.testing.mock_model_server import (
@@ -60,6 +69,7 @@ __all__ = [
     "EXIT_FAILED",
     "EXIT_INTERRUPTED",
     "EXIT_OK",
+    "EXIT_PAUSED",
     "ApplicationLike",
     "CliDependencies",
     "app",
@@ -70,19 +80,28 @@ __all__ = [
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_INTERRUPTED = 2
+#: ADR-025: the session is ``PAUSED`` on an authentication error — nothing is lost, a token is
+#: missing. Distinct from a failure on purpose: the run is resumable, and a script can tell.
+EXIT_PAUSED = 3
 #: Name of the bus subscriber that feeds the live display of ``run``.
 CLI_SUBSCRIBER_NAME = "cli"
 _EVENT_TAIL = 8
 _OUTPUT_TAIL = 12
-_TERMINAL_SESSION_STATES = frozenset({SessionState.COMPLETED, SessionState.FAILED})
+#: States on which ``run`` stops waiting: the two terminal ones and the pause of ADR-025, whose
+#: loop has ended for good (waiting on it again would spin on an answer that never changes).
+_RUN_STOP_STATES = frozenset({SessionState.COMPLETED, SessionState.FAILED, SessionState.PAUSED})
 _ACTIVE_SESSION_STATES = frozenset({SessionState.RUNNING, SessionState.INTERRUPTING})
 
 
 class ApplicationLike(Protocol):
-    """What ``orchestration.wiring.build_application(config)`` returns: it carries the façade."""
+    """What ``orchestration.wiring.build_application(config)`` returns: the façade and, for the
+    API it serves, the machine identity resolved once at wiring time (ADR-024 §6)."""
 
     @property
     def manager(self) -> ConversationManagerLike: ...
+
+    @property
+    def identity(self) -> UserIdentity: ...
 
 
 ServerRunner = Callable[..., None]
@@ -207,7 +226,11 @@ def _api_base(config: AppConfig, api_url: str | None) -> str:
 
 
 def _api_call(deps: CliDependencies, base_url: str, method: str, path: str, **kwargs: Any) -> Any:
-    """One request to the API; a normalized error or a transport failure ends the command."""
+    """One request to the API; a normalized error or a transport failure ends the command.
+
+    ``None`` for a route that answers without a body (``204``), so that a command which only needs
+    the acknowledgement does not have to know how the answer is shaped.
+    """
     try:
         with httpx.Client(base_url=base_url, transport=deps.transport, timeout=30.0) as client:
             response = client.request(method, path, **kwargs)
@@ -215,6 +238,8 @@ def _api_call(deps: CliDependencies, base_url: str, method: str, path: str, **kw
         raise _fail(f"Cannot reach the API at {base_url}: {exc}") from None
     if response.status_code >= 400:
         raise _fail(_describe_http_error(response)) from None
+    if response.status_code == 204 or not response.content:
+        return None
     return response.json()
 
 
@@ -465,7 +490,7 @@ async def _run_session(
             while True:
                 if not json_output:
                     live.update(_live_view(manager, sid, tail), refresh=True)
-                if session.status in _TERMINAL_SESSION_STATES:
+                if session.status in _RUN_STOP_STATES:
                     break
                 if session.status is SessionState.READY and (seen_active or interruption):
                     break
@@ -497,6 +522,8 @@ async def _run_session(
             code = EXIT_OK
         elif interruption is not None or session.status is SessionState.READY:
             code = EXIT_INTERRUPTED
+        elif session.status is SessionState.PAUSED:
+            code = EXIT_PAUSED
         else:
             code = EXIT_FAILED
         return _RunOutcome(session, code, interruption, error, snapshot)
@@ -530,6 +557,25 @@ def _report_dict(report: InterruptionReport | None) -> dict[str, Any] | None:
     }
 
 
+def _render_pause(sid: str, reason: dict[str, Any] | None) -> list[RenderableType]:
+    """ADR-025 §7: why the session is paused, and the two commands that pick it up again."""
+    detail = reason or {}
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold")
+    grid.add_column()
+    for key in ("reason", "error_code", "error_type", "operation", "since"):
+        grid.add_row(*_row(key, _value(detail.get(key))))
+    return [
+        Panel(grid, title=f"Session {sid} paused — a token is needed", title_align="left"),
+        Text(
+            "Nothing is lost: the conversation, the cycle and the pending message are kept.\n"
+            "Provide a token, then resume the session:\n"
+            "  agentic-app credentials            # the token is read from stdin\n"
+            f"  agentic-app resume {sid}"
+        ),
+    ]
+
+
 def _render_user_response(sid: str, status: str, reply: dict[str, Any]) -> list[RenderableType]:
     """The panel of a ``user_response`` (ADR-022) and, for a question, how to answer it."""
     content = reply.get("content") or {}
@@ -560,6 +606,7 @@ def _print_outcome(
     sid = session.session_id
     final_answer = manager.final_answer(sid)
     last_reply = manager.last_reply(sid)
+    paused_reason = manager.paused_reason(sid)
     if json_output:
         document = {
             "session_id": sid,
@@ -567,6 +614,7 @@ def _print_outcome(
             "exit_code": outcome.exit_code,
             "final_answer": final_answer,
             "last_reply": last_reply,
+            "paused_reason": paused_reason,
             "interruption": _report_dict(outcome.interruption),
             "error": outcome.error.model_dump(mode="json") if outcome.error else None,
             "snapshot": outcome.snapshot,
@@ -577,6 +625,10 @@ def _print_outcome(
         console.print(_render_report(_report_dict(outcome.interruption) or {}))
     if outcome.error is not None:
         _print_error(outcome.error)
+    if session.status is SessionState.PAUSED:
+        for part in _render_pause(sid, paused_reason):
+            console.print(part)
+        return
     status = session.status.value
     if last_reply is not None and last_reply.get("type") == "user_response":
         for part in _render_user_response(sid, status, last_reply):
@@ -623,7 +675,11 @@ def run(
     ] = False,
     json_output: JsonOption = False,
 ) -> None:
-    """Start a session, follow it live; Ctrl-C interrupts it (twice: forced exit)."""
+    """Start a session, follow it live; Ctrl-C interrupts it (twice: forced exit).
+
+    Exit codes: 0 final answer, 1 failure or error, 2 interrupted, 3 paused on an authentication
+    error (ADR-025) — provide a token with `agentic-app credentials`, then `agentic-app resume`.
+    """
     deps = _deps(ctx)
     cfg = _load(_config_path(ctx, config))
     application = _build_application(deps, cfg)
@@ -671,7 +727,7 @@ def serve(
     deps = _deps(ctx)
     cfg = _load(_config_path(ctx, config))
     application = _build_application(deps, cfg)
-    api = create_app(application.manager)
+    api = create_app(application.manager, identity=application.identity)
     bind_host = host or cfg.api.host
     bind_port = port or cfg.api.port
     typer.echo(f"Serving the API on http://{bind_host}:{bind_port}{API_PREFIX} (Ctrl-C to stop)")
@@ -719,7 +775,7 @@ def mock_server(
 
 
 # ================================================================================================
-# API clients: status · sessions · interrupt · audit verify
+# API clients: open · status · sessions · interrupt · audit verify
 # ================================================================================================
 @app.command()
 def status(
@@ -798,6 +854,60 @@ def interrupt(
     _console().print(_render_report(report))
 
 
+@app.command("open")
+def open_session(
+    ctx: typer.Context,
+    user_id: Annotated[
+        str | None,
+        typer.Option("--user-id", help="Who the session belongs to (default: the machine user)."),
+    ] = None,
+    working_space: Annotated[
+        str | None,
+        typer.Option("--working-space", help="Absolute, existing folder the commands work in."),
+    ] = None,
+    skill: Annotated[
+        list[str] | None,
+        typer.Option("--skill", help="A reusable note, by name or path; repeat for several."),
+    ] = None,
+    effort: Annotated[
+        str | None, typer.Option("--effort", help="low | medium | high (recorded, not applied).")
+    ] = None,
+    api_url: ApiUrlOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Open a session with no first message, the way a sign-in screen does (ADR-028).
+
+    Nothing is sent to the model: the session is created READY, with no conversation and no cycle,
+    and it waits. The first `agentic-app reply <sid> "..."` opens its first conversation and
+    becomes its goal. Use `agentic-app run` when the goal and the message are known up front: that
+    one starts the loop immediately, in this process.
+
+    `--working-space`, `--skill` and `--effort` are the other fields of that screen; the skills and
+    the effort level are recorded in the `session.created` event and nothing more (ADR-027 §4).
+    """
+    deps = _deps(ctx)
+    base = _api_base(_load(deps.config_path), api_url)
+    body: dict[str, Any] = {}
+    if user_id is not None:
+        body["user_id"] = user_id
+    if working_space is not None:
+        body["working_space"] = working_space
+    if skill:
+        body["skills"] = list(skill)
+    if effort is not None:
+        body["effort"] = effort
+    session = _api_call(deps, base, "POST", "/sessions", json=body)
+    if json_output:
+        typer.echo(json.dumps(session, indent=2, sort_keys=True))
+        return
+    sid = _value(session.get("session_id"))
+    typer.echo(
+        f"Session {sid} [{_value(session.get('status'))}] opened for "
+        f"{_value(session.get('user_id'))}; nothing was sent to the model. "
+        f'Send its first message with: agentic-app reply {sid} "..."'
+    )
+
+
 @app.command()
 def reply(
     ctx: typer.Context,
@@ -819,6 +929,79 @@ def reply(
     typer.echo(
         f"Session {_value(session.get('session_id'))} [{_value(session.get('status'))}]: "
         f"message accepted in conversation {_value(session.get('current_conversation_id'))}. "
+        f"Follow it with: agentic-app status {session_id}"
+    )
+
+
+@app.command()
+def credentials(
+    ctx: typer.Context,
+    from_env: Annotated[
+        str | None,
+        typer.Option("--from-env", help="Name of an environment variable holding the token."),
+    ] = None,
+    api_url: ApiUrlOption = None,
+) -> None:
+    """Hand a model API token over to the running application (ADR-025).
+
+    The token is read from standard input (`cat token.txt | agentic-app credentials`, or typed
+    hidden on a terminal) or from the variable named by `--from-env`; it is never taken from a
+    command-line argument, which would end up in the shell history and in the process list. It is
+    sent to the API, which writes it to the variable named by `transport.token_env` — it is never
+    printed, and never written to a file by this command.
+
+    It is posted as `{"token": …}`, the one-field alias of ADR-027 §3: it fills the implicit
+    `access_token` field. A profile that declares several `credential_fields` needs the other
+    values too, which only an interface posting `{"credentials": {…}}` can provide.
+    """
+    deps = _deps(ctx)
+    cfg = _load(deps.config_path)
+    token = _read_token(from_env)
+    if not token.strip():
+        raise _fail(
+            f"Empty token (from {from_env})." if from_env else "Empty token (nothing on stdin)."
+        )
+    base = _api_base(cfg, api_url)
+    _api_call(deps, base, "POST", "/credentials", json={"token": token})
+    typer.echo(
+        f"Token accepted, stored in {cfg.transport.token_env} for the running application. "
+        "A paused session can now be resumed with: agentic-app resume <sid>"
+    )
+
+
+def _read_token(from_env: str | None) -> str:
+    """The token, from an environment variable or from standard input; never from an argument."""
+    if from_env is not None:
+        value = os.environ.get(from_env)
+        if value is None:
+            raise _fail(f"The environment variable {from_env} is not set.")
+        return value
+    if sys.stdin.isatty():
+        return str(typer.prompt("Token", hide_input=True))
+    return sys.stdin.read()
+
+
+@app.command()
+def resume(
+    ctx: typer.Context,
+    session_id: Annotated[str, typer.Argument()],
+    api_url: ApiUrlOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Resume a session paused on an authentication error, once a token was provided (ADR-025).
+
+    The session picks up exactly where it stopped: same conversation, same cycle, the refused
+    message replayed or the awaited reply read. Follow it with `agentic-app status <sid>`.
+    """
+    deps = _deps(ctx)
+    base = _api_base(_load(deps.config_path), api_url)
+    session = _api_call(deps, base, "POST", f"/sessions/{session_id}/resume")
+    if json_output:
+        typer.echo(json.dumps(session, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"Session {_value(session.get('session_id'))} [{_value(session.get('status'))}] resumed "
+        f"in conversation {_value(session.get('current_conversation_id'))}. "
         f"Follow it with: agentic-app status {session_id}"
     )
 

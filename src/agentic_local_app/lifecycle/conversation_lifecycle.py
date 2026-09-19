@@ -106,8 +106,18 @@ class ConversationLifecycleManager:
         user_id: str,
         budget: SessionBudget,
         auto_close: bool,
+        *,
+        skills: list[str] | None = None,
+        effort: str | None = None,
     ) -> SessionRecord:
-        """A new ``READY`` session. Persists it, then publishes ``session.created``."""
+        """A new ``READY`` session. Persists it, then publishes ``session.created``.
+
+        ``skills`` and ``effort`` (ADR-027 §4) are what the user picked on the sign-in screen.
+        They are **traced only**: they travel in the payload of ``session.created`` and nowhere
+        else — no record field, no column, no message to the model. Nothing reads them back, and
+        turning them into behaviour (a file handed to the model, an instruction derived from the
+        effort level) is a decision of its own that still has to be written.
+        """
         now = self._clock.now()
         session = SessionRecord(
             session_id=self._ids.session_id(),
@@ -125,7 +135,12 @@ class ConversationLifecycleManager:
             EventType.SESSION_CREATED,
             now,
             session_id=session.session_id,
-            payload={"goal": goal, "budget": budget.model_dump()},
+            payload={
+                "goal": goal,
+                "budget": budget.model_dump(),
+                "skills": list(skills or []),
+                "effort": effort,
+            },
         )
         return session
 

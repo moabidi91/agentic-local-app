@@ -3,6 +3,10 @@
 Every event is small, structured and self-describing: the observability components (AuditLog,
 ExecutionTracker, TelemetryService, SSE stream) consume nothing else. ``task.output`` events carry
 live output chunks and are the only events **not** written to the audit log (ADR-018).
+
+``session.paused`` (ADR-025) follows the ``session.state_changed`` that wrote ``PAUSED``: it says
+why the loop stopped (``reason``, ``error_code``, ``error_type``, ``operation``) and which message
+was in flight (``message_id``), so an interface can explain the pause without reading the failures.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from agentic_local_app.domain.states import StrEnum
 class EventType(StrEnum):
     SESSION_CREATED = "session.created"
     SESSION_STATE_CHANGED = "session.state_changed"
+    SESSION_PAUSED = "session.paused"
     CONVERSATION_CREATED = "conversation.created"
     CONVERSATION_STATE_CHANGED = "conversation.state_changed"
     CYCLE_STARTED = "cycle.started"

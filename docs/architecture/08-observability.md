@@ -184,11 +184,14 @@ Base `http://{api.host}:{api.port}/api/v1` (défaut `127.0.0.1:8765`). Aucun ét
 
 | Méthode | Route | Rôle | Réponse |
 |---|---|---|---|
-| POST | `/sessions` | crée et démarre une session (`goal`, `user_message`, `session_budget?`, `auto_close_on_final_answer?`) | `201 {session_id}` |
+| POST | `/sessions` | crée une session et la démarre **si un message d'ouverture est fourni** (`goal?` + `user_message?`, appariés : les deux → `RUNNING`, aucun → `READY` sans conversation ni cycle, un seul → 400 `GOAL_REQUIRED` / `USER_MESSAGE_REQUIRED`, ADR-028 §1) ; `user_id?` (défaut : ce que rend `/whoami`, ADR-028 §2), `session_budget?`, `auto_close_on_final_answer?`, `working_space?` (ADR-026 §3 ; 400 `WORKING_SPACE_INVALID` si le chemin est inutilisable, avant toute création), `skills?` / `effort?` (tracés dans `session.created` et rien d'autre, ADR-027 §4 ; 400 `EFFORT_INVALID`) | `201 SessionRecord` |
 | GET | `/sessions?status=running,ready&limit=&cursor=` | liste paginée, filtrable | `[SessionRecord]` + `next_cursor` |
 | GET | `/sessions/{sid}` | `SessionRecord` + conversation courante | — |
 | POST | `/sessions/{sid}/interrupt` | interruption ; répond quand `READY` est atteint | `200 InterruptionReport` (`already_idle` si rien à interrompre) |
-| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11), ou réponse à une question du modèle (ADR-022) | `202` |
+| POST | `/sessions/{sid}/messages` | message de suivi (conversation réutilisable, §11), ou réponse à une question du modèle (ADR-022) ; 409 `SESSION_BUSY` tant que la boucle tourne, 409 `CONFLICT` si la session n'est pas réutilisable | `202` |
+| POST | `/sessions/{sid}/resume` | reprise d'une session mise en pause par un 401, une fois le jeton fourni (ADR-025 §5) ; 409 `SESSION_NOT_RESUMABLE` si la façade refuse | `200 SessionRecord` |
+| GET | `/sessions/{sid}/pause` | pourquoi la session est en pause, de quoi écrire la pop-in (ADR-025 §7) ; 404 `NOT_PAUSED` si elle ne l'est pas | `{reason, error_code, error_type, operation, since}` |
+| GET | `/sessions/{sid}/chat?include_system=` | les messages protocolaires vus comme des tours de conversation, du plus ancien au plus récent, toutes conversations confondues : `user_request` → `user`, `user_response` / `final_answer` → `assistant` (le `diagnosis` seul), plans, `execution_result`, corrections et rotations → `system` avec un résumé d'une ligne (`include_system=false` ne garde que l'utilisateur et le modèle) | `{messages: [{id, role, text, created_at, message_type, plan_id?}]}` |
 | GET | `/sessions/{sid}/snapshot` | snapshot complet §4 (une requête pour tout afficher) | `RuntimeSnapshot` |
 | GET | `/sessions/{sid}/responses` · `/sessions/{sid}/reply` | les `user_response` du modèle (ADR-022) ; la dernière réponse concluante, `final_answer` ou `user_response` (404 `REPLY_NOT_FOUND` s'il n'y en a pas) | `[…]` · `{type, message_id, conversation_id, cycle_id, received_at, content}` |
 | GET | `/sessions/{sid}/conversations` · `/conversations/{cid}` | chaîne des conversations (rotations, interruptions) | `[ConversationRecord]` |
@@ -205,6 +208,11 @@ Base `http://{api.host}:{api.port}/api/v1` (défaut `127.0.0.1:8765`). Aucun ét
 | GET | `/tasks/{tid}/output/live` **(SSE)** | sortie d'une tâche pendant qu'elle tourne (`task.output`) | `text/event-stream` |
 | GET | `/metrics` | métriques `TelemetryService` | texte type Prometheus |
 | GET | `/health` · `/config` | santé (processus, disjoncteur, store, `RecoveryReport`), configuration effective (jeton masqué) | JSON |
+| GET | `/whoami` | qui est l'utilisateur sur cette machine et d'où vient l'information (ADR-024 §5) | `{user_id, source, host}` |
+| GET | `/models` | catalogue des profils de modèle, l'actif d'abord, `requires_credentials` calculé à la lecture (ADR-024 §3) — ni jeton, ni URL, ni options | `{active, models: [ModelProfileView]}` |
+| POST | `/credentials` | jeton du profil **actif** (ADR-025 §6) ; le corps porte un secret : il n'est ni renvoyé, ni journalisé, ni mis dans un détail d'erreur. 400 `CREDENTIALS_EMPTY`, 409 `CREDENTIALS_NOT_CONFIGURED` | `204` |
+| GET | `/admin/sessions` · `/admin/events` · `/admin/audit` | l'écran « base en direct » du front : toutes les sessions, tous les événements audités (identifiants, type, horodatage, `payload`) et la chaîne d'audit avec ses empreintes, **toutes sessions confondues**, du plus récent au plus ancien | `{items, limit, offset, next_offset}` |
+| POST | `/admin/reset-database` | vide la base (sessions, plans, tâches, messages, blobs, échecs, chaîne d'audit) sans toucher au schéma ; 403 `ADMIN_DISABLED` et aucune écriture tant que `api.allow_destructive_admin` est `false` | `204` |
 
 ### 6.1 Format d'un événement SSE
 
@@ -257,9 +265,10 @@ sequenceDiagram
 |---|---|---|---|
 | `[api]` | `host` | `127.0.0.1` | liaison locale uniquement (ADR-002) |
 | `[api]` | `port` | 8765 | — |
-| `[api]` | `cors_origins` | `["http://localhost:3000"]` | origines autorisées pour le front |
+| `[api]` | `cors_origins` | `["http://localhost:1420", "http://127.0.0.1:1420", "http://localhost:3000", "http://localhost:5173", "http://127.0.0.1:5173", "tauri://localhost"]` | origines autorisées pour le front : l'application Tauri et son serveur de développement Vite, dont le port est épinglé à 1420 (ADR-028 §3), plus le port Vite par défaut et le port historique (les deux orthographes de la boucle locale sont deux origines distinctes) |
 | `[api]` | `page_size` | 100 | taille de page des listes |
 | `[api]` | `sse_queue_size` | 1 000 | événements en attente par client SSE avant abandon du client |
+| `[api]` | `allow_destructive_admin` | `false` | ouvre `POST /admin/reset-database`, qui vide la base sans confirmation ni sauvegarde ; à `false` la route répond 403 `ADMIN_DISABLED` |
 | `[cli]` | `refresh_interval_ms` | 250 | rafraîchissement de l'affichage du snapshot |
 | `[telemetry]` | `enabled` | `true` | inscription du `TelemetryService` sur le bus et exposition de `/metrics` |
 

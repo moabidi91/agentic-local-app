@@ -93,13 +93,23 @@ TERMINAL_CONVERSATION_STATES: frozenset[ConversationState] = frozenset(
 )
 
 # --------------------------------------------------------------------------------------------
-# Session (ADR-006 / ADR-007)
+# Session (ADR-006 / ADR-007 / ADR-025)
+#   - RUNNING -> PAUSED added (ADR-025: an authentication error waits for new credentials)
 # --------------------------------------------------------------------------------------------
 SESSION_TRANSITIONS: Mapping[SessionState, frozenset[SessionState]] = {
     SessionState.READY: frozenset({SessionState.RUNNING}),
     SessionState.RUNNING: frozenset(
-        {SessionState.COMPLETED, SessionState.INTERRUPTING, SessionState.FAILED}
+        {
+            SessionState.COMPLETED,
+            SessionState.PAUSED,
+            SessionState.INTERRUPTING,
+            SessionState.FAILED,
+        }
     ),
+    # ADR-025: nothing runs while the session is PAUSED and nothing was lost. It resumes when the
+    # user provides a token (RUNNING), is abandoned (FAILED), or is interrupted — and an
+    # interruption has nothing to drain here, so it lands on READY without passing by INTERRUPTING.
+    SessionState.PAUSED: frozenset({SessionState.RUNNING, SessionState.READY, SessionState.FAILED}),
     SessionState.INTERRUPTING: frozenset({SessionState.READY, SessionState.FAILED}),
     # COMPLETED -> RUNNING: follow-up user message on a reusable conversation (§11).
     # When auto_close_on_final_answer is true the lifecycle manager refuses it (COMPLETED is then

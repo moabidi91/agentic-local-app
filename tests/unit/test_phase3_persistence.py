@@ -1187,6 +1187,55 @@ def given_blob_when_saved_again_then_content_replaced_and_ranges_follow(
 
 
 # ================================================================================================
+# 7b. Contract — reset: every record goes, the store stays open and usable
+# ================================================================================================
+def given_a_full_store_when_reset_then_every_table_is_empty_and_the_store_still_works(
+    store_impl: ConversationStore,
+) -> None:
+    """The one destructive operation (``POST /admin/reset-database``, gated by configuration)."""
+    store_impl.save_session(make_session())
+    store_impl.save_conversation(make_conversation())
+    store_impl.save_cycle(make_cycle())
+    store_impl.save_plan(make_plan())
+    store_impl.save_task(make_task())
+    store_impl.save_message(make_message())
+    store_impl.save_failure(make_failure())
+    store_impl.save_retry_decision(make_retry_decision())
+    store_impl.save_context_summary(make_summary())
+    store_impl.save_blob(make_blob())
+    for event in audit_chain("sess-0001", 3):
+        store_impl.append_audit_event(event)
+
+    store_impl.reset()
+
+    assert store_impl.list_sessions() == []
+    assert store_impl.get_session("sess-0001") is None
+    assert store_impl.list_conversations("sess-0001") == []
+    assert store_impl.list_cycles("conv-0001") == []
+    assert store_impl.list_plans("sess-0001") == []
+    assert store_impl.list_tasks("sess-0001") == []
+    assert store_impl.list_messages("conv-0001") == []
+    assert store_impl.list_failures("sess-0001") == []
+    assert store_impl.list_retry_decisions("sess-0001") == []
+    assert store_impl.list_context_summaries("sess-0001") == []
+    assert store_impl.get_blob(make_blob().blob_id) is None
+    assert store_impl.count_audit_events("sess-0001") == 0
+    assert store_impl.get_last_audit_event("sess-0001") is None
+    # a reset database is exactly a fresh one: the chain starts again at sequence 1
+    store_impl.save_session(make_session())
+    store_impl.append_audit_event(make_audit_event(event_id="evt-new", sequence=1))
+    assert [e.event_id for e in store_impl.list_audit_events("sess-0001")] == ["evt-new"]
+    assert [s.session_id for s in store_impl.list_sessions()] == ["sess-0001"]
+
+
+def given_a_closed_store_when_reset_then_store_closed(store_impl: ConversationStore) -> None:
+    store_impl.close()
+    with pytest.raises(PersistenceError) as exc:
+        store_impl.reset()
+    assert error_of(exc).error_code == "STORE_CLOSED"
+
+
+# ================================================================================================
 # 8. Contract — append-only audit chain (§3.16, §17.3, ADR-017)
 # ================================================================================================
 def given_empty_session_when_events_appended_then_last_count_and_ascending_list(

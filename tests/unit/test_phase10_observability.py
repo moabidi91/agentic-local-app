@@ -394,7 +394,12 @@ def given_audit_event_when_hash_input_built_then_exactly_the_documented_fields(
         "task_id": None,
         "event_type": "session.created",
         "timestamp": clock.now().isoformat(),
-        "payload": {"goal": "diagnose disk usage", "budget": BUDGET.model_dump()},
+        "payload": {
+            "goal": "diagnose disk usage",
+            "budget": BUDGET.model_dump(),
+            "skills": [],
+            "effort": None,
+        },
     }
     assert audit_hash_input(audited) == expected
     assert audited.event_hash == chain_hash(GENESIS_HASH, expected)

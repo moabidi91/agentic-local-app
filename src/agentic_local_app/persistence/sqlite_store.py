@@ -842,6 +842,17 @@ class SqliteConversationStore(ConversationStore):
         return 0 if row is None else int(row[0])
 
     # ---- maintenance ----------------------------------------------------------------------
+    def reset(self) -> None:
+        """Delete the rows of every table in one transaction; the schema is left untouched.
+
+        The tables are emptied rather than dropped and recreated: the schema (version 1, ADR-025 /
+        ADR-026 add no column) is exactly the one the connection already opened, so nothing can
+        drift between a fresh database and a reset one.
+        """
+        with self.transaction():
+            for table in _TABLES:
+                self._execute(f"DELETE FROM {table.name}")
+
     def close(self) -> None:
         """Idempotent. An open transaction is discarded by the connection (rollback)."""
         if self.closed:

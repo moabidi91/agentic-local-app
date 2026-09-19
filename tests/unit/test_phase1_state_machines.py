@@ -354,6 +354,41 @@ def given_session_table_when_adr006_flow_checked_then_interrupting_returns_to_re
     assert is_terminal(SESSION_TRANSITIONS, SessionState.FAILED)
 
 
+def given_session_table_when_adr025_pause_checked_then_reachable_and_not_terminal() -> None:
+    """ADR-025: ``PAUSED`` is entered from ``RUNNING`` only, and is never an end of the road."""
+    assert {
+        current
+        for current in SessionState
+        if can_transition(SESSION_TRANSITIONS, current, SessionState.PAUSED)
+    } == {SessionState.RUNNING}
+    assert SESSION_TRANSITIONS[SessionState.PAUSED] == {
+        SessionState.RUNNING,  # the user provided a token
+        SessionState.READY,  # the user interrupted the paused session (nothing to drain)
+        SessionState.FAILED,  # the pause is given up on
+    }
+    assert not is_terminal(SESSION_TRANSITIONS, SessionState.PAUSED)
+    # a pause is not an interruption: it does not pass by INTERRUPTING, and it never ends a session
+    assert not can_transition(SESSION_TRANSITIONS, SessionState.PAUSED, SessionState.INTERRUPTING)
+    assert not can_transition(SESSION_TRANSITIONS, SessionState.PAUSED, SessionState.COMPLETED)
+    assert _path(SESSION_TRANSITIONS, SessionState.READY, SessionState.PAUSED) == [
+        SessionState.RUNNING,
+        SessionState.PAUSED,
+    ]
+
+
+def given_paused_session_when_driven_through_the_manager_then_every_exit_is_accepted(
+    lifecycle: ConversationLifecycleManager,
+) -> None:
+    """ADR-025: the three exits of ``PAUSED`` go through the lifecycle manager like any other."""
+    for target in (SessionState.RUNNING, SessionState.READY, SessionState.FAILED):
+        session = _session_in(lifecycle, SessionState.PAUSED)
+        assert session.status is SessionState.PAUSED
+        moved = lifecycle.transition_session(
+            session.session_id, target, reason="credentials_provided"
+        )
+        assert moved.status is target
+
+
 def given_plan_and_task_tables_when_terminal_sets_read_then_equal_states_without_exit() -> None:
     assert TERMINAL_PLAN_STATES == {
         PlanState.COMPLETED,
@@ -427,7 +462,13 @@ def given_no_session_when_created_then_ready_record_persisted_and_created_event_
     assert event.event_type is EventType.SESSION_CREATED
     assert event.session_id == "sess-0001" and event.conversation_id is None
     assert event.timestamp == clock.now()
-    assert event.payload == {"goal": "g", "budget": BUDGET.model_dump()}
+    # ADR-027 §4: the two sign-in extras are always in the payload, empty when nothing was chosen
+    assert event.payload == {
+        "goal": "g",
+        "budget": BUDGET.model_dump(),
+        "skills": [],
+        "effort": None,
+    }
 
 
 def given_store_failing_when_session_created_then_persistence_error_nothing_stored_no_event(

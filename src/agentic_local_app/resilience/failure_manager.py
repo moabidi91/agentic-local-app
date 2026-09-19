@@ -11,9 +11,15 @@ Decision (:meth:`FailureManager.decide`) — **the policy is keyed on ``error_ty
 | error_type                                        | decision |
 |---------------------------------------------------|----------|
 | MODEL_CONTEXT_WINDOW_ERROR                        | rotate (ADR-013) |
+| AUTHN_ERROR                                       | pause (ADR-025, ``credentials_required``) |
 | NETWORK / TIMEOUT / RATE_LIMIT, SYSTEM transient  | retry while ``can_retry(attempt)`` and the breaker allows, else fail (``max_attempts_exhausted`` / ``circuit_open``) |
 | INTERRUPTED                                       | abort |
 | everything else                                   | fail (``non_retryable:<type>``) |
+
+``pause`` is for the one failure a **user** can repair without losing anything: a 401 means the
+token is missing or expired, and only the token. ``AUTHZ_ERROR`` (403) is deliberately **not**
+paused — the credentials were accepted and the operation was refused, so another token of the same
+identity changes nothing and the session fails as before (ADR-025).
 
 The retry delay is ``max(backoff, details.retry_after_ms)``: a server ``Retry-After`` hint is
 honoured even above ``max_delay_ms``. ``can_retry`` is checked before ``breaker.allow()`` so that a
@@ -52,10 +58,24 @@ from agentic_local_app.persistence.interface import ConversationStore
 from agentic_local_app.resilience.circuit_breaker import CircuitBreaker
 from agentic_local_app.resilience.retry_controller import RetryController
 
-__all__ = ["BREAKER_FED_ERROR_TYPES", "Decision", "DecisionKind", "FailureManager"]
+__all__ = [
+    "BREAKER_FED_ERROR_TYPES",
+    "CREDENTIALS_REQUIRED_REASON",
+    "PAUSING_ERROR_TYPES",
+    "Decision",
+    "DecisionKind",
+    "FailureManager",
+]
 
-DecisionKind = Literal["retry", "abort", "rotate", "fail"]
+DecisionKind = Literal["retry", "abort", "rotate", "pause", "fail"]
 _DECISION_KINDS: frozenset[str] = frozenset(get_args(DecisionKind))
+
+#: ``reason`` of a ``pause`` decision (ADR-025): the user has a new token to provide.
+CREDENTIALS_REQUIRED_REASON = "credentials_required"
+
+#: The error types that pause the session instead of ending it (ADR-025). AUTHZ_ERROR is **not**
+#: one of them: a 403 is a permission problem that a new token of the same identity does not fix.
+PAUSING_ERROR_TYPES: frozenset[ErrorType] = frozenset({ErrorType.AUTHN_ERROR})
 
 #: Transport-class failures that count towards opening the breaker (§7.4). SYSTEM_ERROR counts
 #: only when ``details["transient"] is True``.
@@ -66,7 +86,8 @@ _ORIGIN = "FailureManager"
 
 @dataclass(frozen=True)
 class Decision:
-    """What to do about a failure (§3.13): ``retry`` (with ``delay_ms``), ``abort``, ``rotate``, ``fail``."""
+    """What to do about a failure (§3.13): ``retry`` (with ``delay_ms``), ``abort``, ``rotate``,
+    ``pause`` (ADR-025) or ``fail``."""
 
     kind: DecisionKind
     delay_ms: int | None
@@ -155,6 +176,8 @@ class FailureManager:
         strings of future refinements and for symmetry with :meth:`record_decision`."""
         if error.error_type is ErrorType.MODEL_CONTEXT_WINDOW_ERROR:
             return Decision(kind="rotate", delay_ms=None, reason="context_window_exceeded")
+        if error.error_type in PAUSING_ERROR_TYPES:
+            return Decision(kind="pause", delay_ms=None, reason=CREDENTIALS_REQUIRED_REASON)
         if _is_policy_retryable(error):
             if not self.retry.can_retry(attempt):
                 return Decision(kind="fail", delay_ms=None, reason="max_attempts_exhausted")

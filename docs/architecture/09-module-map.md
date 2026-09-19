@@ -70,7 +70,7 @@ src/agentic_local_app/
 │   ├── recovery.py                RecoveryCoordinator + RecoveryReport
 │   └── wiring.py                  build_application(config) : assemble tout (injection)
 ├── interfaces/
-│   ├── cli.py                     typer : run / serve / status / config / transport / codec / mock-server [phase 9]
+│   ├── cli.py                     typer : run / serve / status / credentials / resume / config / transport / codec / mock-server [phase 9]
 │   └── http_api.py                FastAPI : REST + SSE (ADR-018)
 └── testing/
     ├── fake_executor.py           FakeCommandExecutor (sorties, délais, annulation simulés)     [phase 4]
@@ -149,7 +149,7 @@ Les agents implémentent exactement ces surfaces (les paramètres optionnels peu
 | `ExecutionTracker(store, clock)` | `handle(event)` · `subscribe(bus)` · `snapshot(session_id) -> RuntimeSnapshot` · `rebuild(session_id) -> RuntimeSnapshot` |
 | `TelemetryService(clock)` | `handle(event)` · `subscribe(bus)` · `render_text() -> str` · `metrics() -> dict` · `reset()` |
 | `ProtocolOrchestrator(...)` | `async run_session(session_id)` · `async continue_session(session_id, user_message)` |
-| `ConversationManager(...)` | `async start(goal, user_message, budget=None, auto_close=None) -> str` · `async interrupt(session_id)` · `snapshot(session_id)` · `final_answer(session_id)` · `user_responses(session_id)` / `last_reply(session_id)` (ADR-022, relus dans la table des messages) · `recovery_report` |
+| `ConversationManager(...)` | `async start_session(*, goal=None, user_message=None, budget=None, auto_close=None, working_space=None, skills=None, effort=None, user_id=None) -> SessionRecord` (ADR-026 : le dossier de l'utilisateur est validé puis lié ; ADR-027 §4 : `skills` / `effort` tracés dans `session.created` ; ADR-028 : `goal` et `user_message` appariés et facultatifs — sans eux la session reste `READY`, sans conversation et sans rien envoyer —, `user_id` par défaut égal à l'identité machine) · `async continue_session(session_id, user_message)` (ADR-028 : remplit le but d'une session `READY` qui n'en a pas) · `async resume_session(session_id)` (ADR-016, ADR-025) · `async interrupt(session_id)` · `async wait(session_id, *, timeout_ms=None)` · `snapshot(session_id)` · `final_answer(session_id)` · `user_responses(session_id)` / `last_reply(session_id)` (ADR-022, relus dans la table des messages) · `corrections(session_id)` (ADR-023) · `paused_reason(session_id)` (ADR-025 §7) · `recovery_report` |
 | `RecoveryCoordinator(store, lifecycle, bus, executor_platform, clock)` | `recover() -> RecoveryReport` |
 
 ## 4. Doubles de test (§18.3)

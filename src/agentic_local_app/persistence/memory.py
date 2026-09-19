@@ -366,5 +366,22 @@ class InMemoryConversationStore(ConversationStore):
         return len(self._audit.get(session_id, []))
 
     # ---- maintenance ----------------------------------------------------------------------
+    def reset(self) -> None:
+        """Empty every collection, insertion order included (the audit chain restarts at genesis)."""
+        self._write_guard()
+        self._sessions.clear()
+        self._conversations.clear()
+        self._cycles.clear()
+        self._plans.clear()
+        self._tasks.clear()
+        self._messages.clear()
+        self._failures.clear()
+        self._retry_decisions.clear()
+        self._summaries.clear()
+        self._blobs.clear()
+        self._audit.clear()
+        self._order.clear()
+        self._insertion_counter = 0
+
     def close(self) -> None:
         self.closed = True

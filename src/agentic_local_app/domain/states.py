@@ -4,8 +4,9 @@ State names follow the specification (§5) verbatim, in upper case. Protocol-lev
 appear inside JSON messages (message types, execution policy, plan status in execution_result)
 use the lower-case spelling of the specification (§12).
 
-Amendments to the specification are documented in docs/adr/ADR-006 and ADR-007:
-- ``SessionState`` is new: READY lives at session level, INTERRUPTED is terminal for a conversation.
+Amendments to the specification are documented in docs/adr/ADR-006, ADR-007 and ADR-025:
+- ``SessionState`` is new: READY lives at session level, INTERRUPTED is terminal for a conversation,
+  PAUSED waits for credentials (ADR-025).
 - ``CycleState`` is new (the spec lists a cycle ``status`` field without defining its values).
 - ``CircuitState`` supports the CircuitBreaker (§7.4, phase 7 tests: open / half-open / close).
 """
@@ -47,6 +48,9 @@ class SessionState(StrEnum):
     INTERRUPTING = "INTERRUPTING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    #: ADR-025: the loop stopped on an authentication error and waits for new credentials.
+    #: Not terminal, and listed last because the order of this enumeration carries no meaning.
+    PAUSED = "PAUSED"
 
 
 @unique

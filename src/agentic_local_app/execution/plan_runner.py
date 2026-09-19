@@ -1,5 +1,5 @@
 """``PlanRunner`` — execute one plan exactly as received (§3.7, §8 ; ADR-003, ADR-006, ADR-008,
-ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1).
+ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026).
 
 One runner, one ``run`` per plan. The runner owns every plan and task transition (module map §2,
 rule 5): each one is validated against the tables of :mod:`agentic_local_app.domain.transitions`,
@@ -37,6 +37,10 @@ only backward edges in a sequential plan): the adapter guarantees it for plans o
 
 Time and identifiers are injected (``Clock``, ``IdGenerator``, ADR-017): durations are monotonic,
 timestamps come from ``clock.now()``, blob identifiers from ``ids.blob_id()``.
+
+An optional :class:`~agentic_local_app.execution.scratch.ScratchManager` (ADR-026) adds the working
+space of the session to the environment of every ``cmd`` task; without one the environment overlay
+stays empty and nothing changes.
 """
 
 from __future__ import annotations
@@ -90,6 +94,7 @@ from agentic_local_app.execution.payload_guard import (
     TruncatedOutput,
 )
 from agentic_local_app.execution.result_collector import ResultCollector
+from agentic_local_app.execution.scratch import ScratchManager
 from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.persistence.interface import ConversationStore
 from agentic_local_app.protocol.messages import ExecutionResultContent
@@ -197,6 +202,7 @@ class PlanRunner:
         *,
         failure_manager: FailureRecorder | None = None,
         result_collector: ResultCollector | None = None,
+        scratch: ScratchManager | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
@@ -207,6 +213,8 @@ class PlanRunner:
         self.config = config
         self.failure_manager = failure_manager
         self.result_collector = result_collector or ResultCollector()
+        #: ADR-026: the working spaces. ``None`` exports nothing, as before the ADR.
+        self.scratch = scratch
 
     async def run(
         self,
@@ -492,12 +500,17 @@ class _PlanExecution:
         task = self._tasks[task_id]
         if task.type is TaskType.CHUNK_REQUEST:
             return _Ended(chunk=self._serve_chunk(task))
+        # ADR-026: the working space travels as environment variables, not as ``cwd`` — the
+        # commands are about the user's project, the folder is offered, never imposed.
+        scratch = self._runner.scratch
+        env = scratch.environment(task.session_id) if scratch is not None else {}
         spec = CommandSpec(
             task_id=task_id,
             cmd=task.cmd or "",
             timeout_ms=self._timeout_ms(task),
             cwd=self._config.cwd,
             shell=self._config.shell or None,
+            env=env or None,
         )
         try:
             raw = await self._runner.executor.execute(

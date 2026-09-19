@@ -48,8 +48,8 @@ SESSION = "sess-0001"
 CONVERSATION = "conv-0001"
 CYCLE = "cyc-0001"
 
+#: ADR-025 moved ``AUTHN_ERROR`` out of this list: a 401 pauses the session instead of ending it.
 NON_RETRYABLE_TYPES = [
-    ErrorType.AUTHN_ERROR,
     ErrorType.AUTHZ_ERROR,
     ErrorType.MODEL_PROTOCOL_ERROR,
     ErrorType.BUDGET_EXCEEDED,
@@ -699,6 +699,62 @@ def given_non_listed_type_flagged_retryable_when_decided_then_policy_wins_and_fa
     error = _error(error_type, retryable=True, transient=True)
     decision = _manager(store, bus, clock, ids).decide(error, 1, operation="POST")
     assert decision.kind == "fail"
+
+
+@pytest.mark.parametrize("attempt", [1, 2, 9])
+def given_authentication_error_when_decided_then_pause_without_delay(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    attempt: int,
+) -> None:
+    """ADR-025: a 401 is a token to renew, not a session to end — whatever the attempt."""
+    decision = _manager(store, bus, clock, ids).decide(
+        _error(ErrorType.AUTHN_ERROR, "HTTP_401"), attempt, operation="POST"
+    )
+    assert decision == Decision(kind="pause", delay_ms=None, reason="credentials_required")
+
+
+def given_authentication_error_flagged_retryable_when_decided_then_still_paused(
+    store: InMemoryConversationStore, bus: EventBus, clock: FakeClock, ids: SequentialIdGenerator
+) -> None:
+    """The policy is keyed on ``error_type``, never on the producer's ``retryable`` flag."""
+    error = _error(ErrorType.AUTHN_ERROR, "HTTP_401", retryable=True, transient=True)
+    assert _manager(store, bus, clock, ids).decide(error, 1, operation="GET").kind == "pause"
+
+
+def given_authorization_error_when_decided_then_fail_and_not_paused(
+    store: InMemoryConversationStore, bus: EventBus, clock: FakeClock, ids: SequentialIdGenerator
+) -> None:
+    """ADR-025: a 403 is a permission problem; another token of the same identity changes nothing."""
+    decision = _manager(store, bus, clock, ids).decide(
+        _error(ErrorType.AUTHZ_ERROR, "HTTP_403"), 1, operation="POST"
+    )
+    assert decision == Decision(kind="fail", delay_ms=None, reason="non_retryable:AUTHZ_ERROR")
+
+
+def given_authentication_error_when_handled_then_failure_recorded_and_pause_persisted(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    recorder: RecordingSubscriber,
+) -> None:
+    """ADR-025: a pause is journalled exactly like any other outcome — the ``FailureRecord`` and
+    its event are written, the decision is persisted as ``pause``, and no retry is scheduled."""
+    exc = TransportError(ErrorType.AUTHN_ERROR, "HTTP_401", retryable=False, operation="POST")
+    error, decision = _manager(store, bus, clock, ids).handle(
+        exc, 1, operation="POST", session_id=SESSION, conversation_id=CONVERSATION, cycle_id=CYCLE
+    )
+
+    assert decision.kind == "pause" and decision.reason == "credentials_required"
+    assert error.error_type is ErrorType.AUTHN_ERROR
+    failures = store.list_failures(SESSION)
+    assert [(f.error_type, f.error_code) for f in failures] == [(ErrorType.AUTHN_ERROR, "HTTP_401")]
+    decisions = store.list_retry_decisions(SESSION)
+    assert [(d.operation, d.decision, d.delay_ms) for d in decisions] == [("POST", "pause", None)]
+    assert [e.event_type for e in recorder.events] == [EventType.FAILURE_RECORDED]
 
 
 def given_transient_persistence_error_when_decided_then_fail(

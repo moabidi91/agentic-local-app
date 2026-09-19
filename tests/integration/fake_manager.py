@@ -49,17 +49,20 @@ from agentic_local_app.domain.states import (
     TaskState,
     TaskType,
 )
+from agentic_local_app.execution.scratch import validate_working_space
 from agentic_local_app.interruption.handler import InterruptionHandler, InterruptionReport
 from agentic_local_app.lifecycle.conversation_lifecycle import ConversationLifecycleManager
 from agentic_local_app.observability.audit_log import AuditLog
 from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.observability.execution_tracker import ExecutionTracker, RuntimeSnapshot
 from agentic_local_app.observability.telemetry import TelemetryService
+from agentic_local_app.orchestration.protocol_orchestrator import REASON_CREDENTIALS_PROVIDED
 from agentic_local_app.persistence.memory import InMemoryConversationStore
 from agentic_local_app.protocol.messages import (
     ProtocolCorrectionRequestContent,
     UserResponseContent,
 )
+from agentic_local_app.resilience.failure_manager import CREDENTIALS_REQUIRED_REASON
 
 __all__ = ["FakeConversationManager"]
 
@@ -82,6 +85,7 @@ class FakeConversationManager:
         store: InMemoryConversationStore | None = None,
         bus: EventBus | None = None,
         telemetry_enabled: bool = True,
+        default_user_id: str | None = None,
     ) -> None:
         self.config = config or AppConfig()
         self.clock = clock or FakeClock()
@@ -101,6 +105,14 @@ class FakeConversationManager:
             self.store, self.bus, self.lifecycle, self.clock, self.ids, self.config
         )
         self.recovery_report: Any | None = None
+        #: ADR-028 §2: the ``user_id`` of a session created without one, as the façade keeps it.
+        self.default_user_id = (default_user_id or "").strip() or self.config.transport.user_id
+        #: ADR-026: the ``working_space`` bound to a session by ``start_session``, if any.
+        self.working_spaces: dict[str, str] = {}
+        #: ADR-027 §4: the ``skills`` / ``effort`` of ``start_session``, per session — recorded
+        #: here exactly as the façade records them, in the ``session.created`` event and nowhere
+        #: else; nothing in the double reads them back.
+        self.session_extras: dict[str, tuple[list[str] | None, str | None]] = {}
         # ---- test knobs ------------------------------------------------------------------
         #: every façade call, in order: ``(method, *args)``.
         self.calls: list[tuple[Any, ...]] = []
@@ -122,15 +134,27 @@ class FakeConversationManager:
     async def start_session(
         self,
         *,
-        goal: str,
-        user_message: str,
+        goal: str | None = None,
+        user_message: str | None = None,
         budget: SessionBudget | None = None,
         auto_close: bool | None = None,
+        working_space: str | None = None,
+        skills: list[str] | None = None,
+        effort: str | None = None,
+        user_id: str | None = None,
     ) -> SessionRecord:
         self.calls.append(("start_session", goal, user_message, budget, auto_close))
         if self.start_raises is not None:
             exc, self.start_raises = self.start_raises, None
             raise exc
+        # ADR-028 §1, same rule as the façade: the opening message is a pair, all or nothing.
+        if (goal is None) != (user_message is None):
+            missing = "user_message" if goal is not None else "goal"
+            raise ValueError(f"an opening message needs both goal and user_message ({missing})")
+        if working_space is not None:
+            # ADR-026 §3, same order as the façade: a path that cannot be used is refused before
+            # anything is created, so a mistyped working space costs no record.
+            validate_working_space(working_space)
         effective_budget = budget or SessionBudget(
             max_cycles=self.config.budget.default_max_cycles,
             max_plans=self.config.budget.default_max_plans,
@@ -140,13 +164,21 @@ class FakeConversationManager:
             self.config.budget.auto_close_on_final_answer if auto_close is None else auto_close
         )
         session = self.lifecycle.create_session(
-            goal,
-            user_message,
-            self.config.transport.user_id,
+            goal or "",
+            user_message or "",
+            (user_id or "").strip() or self.default_user_id,
             effective_budget,
             effective_auto_close,
+            skills=skills,
+            effort=effort,
         )
         sid = session.session_id
+        if working_space is not None:
+            self.working_spaces[sid] = working_space
+        self.session_extras[sid] = (skills, effort)
+        if user_message is None:
+            # ADR-028: no conversation, no cycle, nothing posted — the session waits, READY.
+            return self.require_session(sid)
         self.lifecycle.transition_session(sid, SessionState.RUNNING, reason="user_request")
         conversation = self.lifecycle.create_conversation(sid)
         self.lifecycle.transition_conversation(
@@ -163,6 +195,27 @@ class FakeConversationManager:
         self.calls.append(("continue_session", session_id, user_message))
         session = self.require_session(session_id)
         conversation = self.current_conversation(session_id)
+        if session.status is SessionState.READY:
+            # ADR-006 §3 / ADR-028, same rule as the façade: a new child conversation in the same
+            # session — after an interruption, after a restart, or on the first message of a
+            # session that was created without one (its parent is then simply None, and that first
+            # message becomes the goal the creation had nothing to record).
+            updates: dict[str, Any] = {"user_message": user_message, "final_answer": None}
+            if not session.goal:
+                updates["goal"] = user_message
+            self.lifecycle.transition_session(
+                session_id, SessionState.RUNNING, reason="user_request", **updates
+            )
+            child = self.lifecycle.create_conversation(
+                session_id, parent_conversation_id=session.current_conversation_id
+            )
+            self.lifecycle.transition_conversation(
+                child.conversation_id, ConversationState.ACTIVE, reason="user_request"
+            )
+            self.lifecycle.transition_conversation(
+                child.conversation_id, ConversationState.WAITING_MODEL_RESPONSE
+            )
+            return self.require_session(session_id)
         # the same rule as the façade: a COMPLETED session whose conversation is reusable — under
         # auto-close only when the model asked a question and left it WAITING_USER (ADR-022)
         if (
@@ -185,6 +238,17 @@ class FakeConversationManager:
             conversation.conversation_id, ConversationState.WAITING_MODEL_RESPONSE
         )
         return self.require_session(session_id)
+
+    async def resume_session(self, session_id: str) -> SessionRecord:
+        """ADR-025 §5, same contract as the façade: a ``PAUSED`` session goes back to ``RUNNING``
+        (``credentials_provided``); anything else is a ``ValueError``."""
+        self.calls.append(("resume_session", session_id))
+        session = self.require_session(session_id)
+        if session.status is not SessionState.PAUSED:
+            raise ValueError(f"session {session_id} is not resumable ({session.status.value})")
+        return self.lifecycle.transition_session(
+            session_id, SessionState.RUNNING, reason=REASON_CREDENTIALS_PROVIDED
+        )
 
     async def interrupt(self, session_id: str) -> InterruptionReport:
         self.calls.append(("interrupt", session_id))
@@ -276,6 +340,23 @@ class FakeConversationManager:
                     }
                 )
         return items
+
+    def paused_reason(self, session_id: str) -> dict[str, Any] | None:
+        """ADR-025, same contract as the façade: why a ``PAUSED`` session waits for a token —
+        ``{reason, error_code, error_type, operation, since}`` — or ``None``."""
+        session = self.store.get_session(session_id)
+        if session is None or session.status is not SessionState.PAUSED:
+            return None
+        failures = self.store.list_failures(session_id)
+        failure = failures[-1] if failures else None
+        operation = failure.details.get("operation") if failure is not None else None
+        return {
+            "reason": CREDENTIALS_REQUIRED_REASON,
+            "error_code": failure.error_code if failure is not None else None,
+            "error_type": failure.error_type.value if failure is not None else None,
+            "operation": operation if isinstance(operation, str) else None,
+            "since": session.model_dump(mode="json")["updated_at"],
+        }
 
     def _concluding_messages(self, session_id: str) -> list[MessageRecord]:
         return [
@@ -585,6 +666,7 @@ class FakeConversationManager:
         error_type: ErrorType = ErrorType.NETWORK_ERROR,
         error_code: str = "CONNECTION_RESET",
         task_id: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> FailureRecord:
         conversation = self.current_conversation(session_id)
         record = FailureRecord(
@@ -598,7 +680,7 @@ class FakeConversationManager:
             origin="TransportGateway",
             retryable=error_type is ErrorType.NETWORK_ERROR,
             recoverable=True,
-            details={"attempt": 1},
+            details=dict(details) if details is not None else {"attempt": 1},
             timestamp=self.clock.now(),
         )
         self.store.save_failure(record)
@@ -724,6 +806,37 @@ class FakeConversationManager:
                 session_id, SessionState.COMPLETED, reason="user_response"
             )
         return self.require_session(session_id)
+
+    def pause(
+        self, session_id: str, *, operation: str = "POST", message_id: str | None = None
+    ) -> SessionRecord:
+        """ADR-025: the loop stopped on a 401 — the failure, then ``PAUSED``, then ``session.paused``.
+
+        Nothing else moves: the conversation keeps its state and its pending message, exactly like
+        the orchestrator's pause.
+        """
+        failure = self.add_failure(
+            session_id,
+            error_type=ErrorType.AUTHN_ERROR,
+            error_code="HTTP_401",
+            details={"attempt": 1, "operation": operation, "http_status": 401},
+        )
+        session = self.lifecycle.transition_session(
+            session_id, SessionState.PAUSED, reason=CREDENTIALS_REQUIRED_REASON
+        )
+        self.publish(
+            EventType.SESSION_PAUSED,
+            session_id,
+            conversation_id=failure.conversation_id,
+            payload={
+                "reason": CREDENTIALS_REQUIRED_REASON,
+                "error_code": failure.error_code,
+                "error_type": failure.error_type.value,
+                "operation": operation,
+                "message_id": message_id,
+            },
+        )
+        return session
 
     def fail(self, session_id: str, reason: str = "failure") -> SessionRecord:
         conversation = self.current_conversation(session_id)

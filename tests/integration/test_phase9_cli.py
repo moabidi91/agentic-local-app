@@ -2,9 +2,9 @@
 
 No process is spawned and no port is opened: ``serve`` and ``mock-server`` receive an injected
 runner, ``run`` receives an injected application factory returning the ``FakeConversationManager``
-double, and the API-client commands (``status``, ``sessions``, ``interrupt``, ``reply``,
-``audit verify``) talk to an ``httpx.MockTransport``. Ctrl-C is simulated by a ``KeyboardInterrupt`` injected in the
-façade double (ADR-002: Ctrl-C = interruption, not process exit).
+double, and the API-client commands (``open``, ``status``, ``sessions``, ``interrupt``, ``reply``,
+``audit verify``) talk to an ``httpx.MockTransport``. Ctrl-C is simulated by a ``KeyboardInterrupt``
+injected in the façade double (ADR-002: Ctrl-C = interruption, not process exit).
 """
 
 from __future__ import annotations
@@ -22,10 +22,12 @@ from agentic_local_app import __version__
 from agentic_local_app.config import ApiSection, AppConfig, TransportSection
 from agentic_local_app.domain.models import SessionBudget
 from agentic_local_app.domain.states import SessionState
+from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.cli import (
     EXIT_FAILED,
     EXIT_INTERRUPTED,
     EXIT_OK,
+    EXIT_PAUSED,
     CliDependencies,
     app,
     main,
@@ -45,10 +47,11 @@ TOKEN_ENV = "AGENTIC_TRANSPORT_TOKEN_PHASE9_CLI"
 # harness
 # ================================================================================================
 class _Application:
-    """What ``build_application`` returns: something carrying the façade."""
+    """What ``build_application`` returns: the façade and the machine identity (ADR-024 §6)."""
 
     def __init__(self, manager: FakeConversationManager) -> None:
         self.manager = manager
+        self.identity = UserIdentity(user_id="tester", source="config", host="workstation")
 
 
 @pytest.fixture
@@ -211,6 +214,7 @@ def given_cli_when_help_then_every_command_listed(runner: CliRunner) -> None:
     for command in (
         "run",
         "serve",
+        "open",
         "status",
         "sessions",
         "interrupt",
@@ -239,8 +243,40 @@ def given_injected_server_runner_when_serve_then_api_app_served_on_config_host_a
     assert result.exit_code == 0, result.output
     assert (served["host"], served["port"]) == ("127.0.0.9", 9765)
     assert served["app"].title.startswith("agentic")
+    assert served["app"].state.manager is fake
     assert deps.captured["config"].app.name == "phase9-cli"  # type: ignore[attr-defined]
     assert "http://127.0.0.9:9765/api/v1" in result.output
+
+
+def given_wired_identity_when_serve_then_the_api_answers_whoami_with_it(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    """ADR-024 §6: the identity is resolved once, at wiring time; the API serves that one."""
+    import asyncio
+
+    served: dict[str, Any] = {}
+
+    def server_runner(asgi_app: Any, *, host: str, port: int) -> None:
+        served["app"] = asgi_app
+
+    result = runner.invoke(
+        app,
+        ["serve", "--config", str(config_file)],
+        obj=_deps(fake, server_runner=server_runner),
+    )
+    assert result.exit_code == 0, result.output
+
+    async def ask() -> Any:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=served["app"]), base_url="http://testserver"
+        ) as client:
+            return (await client.get("/api/v1/whoami")).json()
+
+    assert asyncio.run(ask()) == {
+        "user_id": "tester",
+        "source": "config",
+        "host": "workstation",
+    }
 
 
 def given_host_and_port_options_when_serve_then_they_override_the_config(
@@ -487,6 +523,102 @@ def _session_payload(sid: str = "sess-0001", status: str = "RUNNING") -> dict[st
     body = fake.require_session(sid).model_dump(mode="json")
     body["status"] = status
     return body
+
+
+def _empty_session_payload(sid: str = "sess-0001") -> dict[str, Any]:
+    """ADR-028: what ``POST /sessions`` answers with no opening message — READY, no conversation."""
+    fake = FakeConversationManager()
+    import asyncio
+
+    asyncio.run(fake.start_session(user_id="alice"))
+    return fake.require_session(sid).model_dump(mode="json")
+
+
+def given_mock_api_when_open_then_empty_session_created_and_first_message_hinted(
+    runner: CliRunner,
+) -> None:
+    payload = _empty_session_payload()
+    transport, seen = _mock_api({("POST", "/api/v1/sessions"): (201, payload)})
+    result = runner.invoke(
+        app,
+        ["open", "--user-id", "alice", "--api-url", "http://api.test:1"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 0, result.output
+    assert str(seen[0].url) == "http://api.test:1/api/v1/sessions"
+    assert json.loads(seen[0].content) == {"user_id": "alice"}
+    assert "sess-0001" in result.output and "READY" in result.output
+    assert "alice" in result.output
+    assert 'agentic-app reply sess-0001 "..."' in result.output
+
+
+def given_open_with_the_sign_in_fields_when_invoked_then_all_of_them_travel(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    transport, seen = _mock_api({("POST", "/api/v1/sessions"): (201, _empty_session_payload())})
+    result = runner.invoke(
+        app,
+        [
+            "open",
+            "--working-space",
+            str(tmp_path),
+            "--skill",
+            "deploy",
+            "--skill",
+            "review",
+            "--effort",
+            "high",
+            "--json",
+            "--api-url",
+            "http://api.test",
+        ],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(seen[0].content) == {
+        "working_space": str(tmp_path),
+        "skills": ["deploy", "review"],
+        "effort": "high",
+    }
+    assert json.loads(result.stdout)["status"] == "READY"
+
+
+def given_open_without_any_option_when_invoked_then_an_empty_body_is_posted(
+    runner: CliRunner,
+) -> None:
+    """Nothing is invented: no goal, no message, not even a user id (the API knows who that is)."""
+    transport, seen = _mock_api({("POST", "/api/v1/sessions"): (201, _empty_session_payload())})
+    result = runner.invoke(
+        app, ["open", "--api-url", "http://api.test"], obj=CliDependencies(transport=transport)
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(seen[0].content) == {}
+
+
+def given_an_effort_refused_by_the_api_when_open_then_exit_1_with_the_code(
+    runner: CliRunner,
+) -> None:
+    error = {
+        "error": {
+            "error_type": "SYSTEM_ERROR",
+            "error_code": "EFFORT_INVALID",
+            "severity": "low",
+            "origin": "http_api",
+            "retryable": False,
+            "recoverable": True,
+            "attempt": 1,
+            "max_attempts": 1,
+            "details": {"message": "unknown effort level", "effort": "extreme"},
+        }
+    }
+    transport, _ = _mock_api({("POST", "/api/v1/sessions"): (400, error)})
+    result = runner.invoke(
+        app,
+        ["open", "--effort", "extreme", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == 1
+    assert "EFFORT_INVALID" in result.output
 
 
 def given_mock_api_when_reply_then_follow_up_posted_and_session_printed(runner: CliRunner) -> None:
@@ -1027,3 +1159,195 @@ def given_unknown_transport_provider_when_run_with_real_factory_then_exit_1_befo
     assert result.exit_code == 1, result.output
     assert "TRANSPORT_PROVIDER_UNKNOWN" in result.output and "carrier_pigeon" in result.output
     assert not (tmp_path / "data").exists()  # the store was never opened
+
+
+# ================================================================================================
+# credentials · resume (ADR-025, clients of the API like status / interrupt)
+# ================================================================================================
+def _no_content(_: httpx.Request) -> httpx.Response:
+    return httpx.Response(204)
+
+
+def given_token_on_stdin_when_credentials_then_posted_without_ever_being_printed(
+    runner: CliRunner, config_file: Path
+) -> None:
+    transport, seen = _mock_api({("POST", "/api/v1/credentials"): _no_content})
+    result = runner.invoke(
+        app,
+        ["--config", str(config_file), "credentials"],
+        obj=CliDependencies(transport=transport),
+        input="s3cr3t-token\n",
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert str(seen[0].url) == "http://127.0.0.9:9765/api/v1/credentials"
+    assert json.loads(seen[0].content)["token"].strip() == "s3cr3t-token"
+    assert "s3cr3t-token" not in result.output  # the value is never echoed back at the user
+    assert TOKEN_ENV in result.output  # only the name of the variable, which is public
+    assert "agentic-app resume" in result.output
+
+
+def given_from_env_when_credentials_then_the_variable_is_read_not_an_argument(
+    runner: CliRunner, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SOME_VENDOR_KEY", "k-from-env")
+    transport, seen = _mock_api({("POST", "/api/v1/credentials"): _no_content})
+    result = runner.invoke(
+        app,
+        ["--config", str(config_file), "credentials", "--from-env", "SOME_VENDOR_KEY"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert json.loads(seen[0].content) == {"token": "k-from-env"}
+    assert "k-from-env" not in result.output
+
+
+def given_unset_variable_or_empty_stdin_when_credentials_then_exit_1_without_a_call(
+    runner: CliRunner, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ABSENT_VENDOR_KEY", raising=False)
+    transport, seen = _mock_api({("POST", "/api/v1/credentials"): _no_content})
+    missing = runner.invoke(
+        app,
+        ["--config", str(config_file), "credentials", "--from-env", "ABSENT_VENDOR_KEY"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert missing.exit_code == EXIT_FAILED
+    assert "ABSENT_VENDOR_KEY" in missing.output
+    blank = runner.invoke(
+        app,
+        ["--config", str(config_file), "credentials"],
+        obj=CliDependencies(transport=transport),
+        input="   \n",
+    )
+    assert blank.exit_code == EXIT_FAILED
+    assert "empty" in blank.output.lower()
+    assert seen == []
+
+
+def given_api_refusing_the_token_when_credentials_then_exit_1_with_the_error_code(
+    runner: CliRunner, config_file: Path
+) -> None:
+    error = {
+        "error": {
+            "error_code": "CREDENTIALS_NOT_CONFIGURED",
+            "details": {"message": "the active model profile takes no token"},
+        }
+    }
+    transport, _ = _mock_api({("POST", "/api/v1/credentials"): (409, error)})
+    result = runner.invoke(
+        app,
+        ["--config", str(config_file), "credentials"],
+        obj=CliDependencies(transport=transport),
+        input="s3cr3t-token\n",
+    )
+    assert result.exit_code == EXIT_FAILED
+    assert "CREDENTIALS_NOT_CONFIGURED" in result.output
+    assert "s3cr3t-token" not in result.output
+
+
+def given_mock_api_when_resume_then_session_posted_and_status_printed(runner: CliRunner) -> None:
+    payload = _session_payload()
+    transport, seen = _mock_api({("POST", "/api/v1/sessions/sess-0001/resume"): (200, payload)})
+    result = runner.invoke(
+        app,
+        ["resume", "sess-0001", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert seen[0].method == "POST"
+    assert str(seen[0].url) == "http://api.test/api/v1/sessions/sess-0001/resume"
+    assert "sess-0001" in result.output and "RUNNING" in result.output
+    assert "agentic-app status sess-0001" in result.output
+
+
+def given_session_that_is_not_paused_when_resume_then_exit_1_with_the_conflict(
+    runner: CliRunner,
+) -> None:
+    error = {
+        "error": {
+            "error_code": "SESSION_NOT_RESUMABLE",
+            "details": {"message": "session sess-0001 is not resumable (COMPLETED)"},
+        }
+    }
+    transport, _ = _mock_api({("POST", "/api/v1/sessions/sess-0001/resume"): (409, error)})
+    result = runner.invoke(
+        app,
+        ["resume", "sess-0001", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == EXIT_FAILED
+    assert "SESSION_NOT_RESUMABLE" in result.output
+    assert "not resumable" in result.output
+
+
+def given_mock_api_when_resume_with_json_then_session_record_printed(runner: CliRunner) -> None:
+    payload = _session_payload()
+    transport, _ = _mock_api({("POST", "/api/v1/sessions/sess-0001/resume"): (200, payload)})
+    result = runner.invoke(
+        app,
+        ["resume", "sess-0001", "--json", "--api-url", "http://api.test"],
+        obj=CliDependencies(transport=transport),
+    )
+    assert result.exit_code == EXIT_OK, result.output
+    assert json.loads(result.stdout) == payload
+
+
+# ================================================================================================
+# run on a paused session (ADR-025): it stops, it says why, and it does not spin
+# ================================================================================================
+def given_session_paused_during_a_wait_when_run_then_bounded_polling_and_exit_3(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    """The regression test of the spin: a PAUSED session ends no state ``run`` used to know, so
+    the wait loop turned on itself for ever (measured: ~570 000 ``wait`` calls in two seconds)."""
+    fake.wait_script.append(lambda m, sid: m.pause(sid, operation="POST"))
+    result = runner.invoke(app, ["run", "goal", "--config", str(config_file)], obj=_deps(fake))
+    waits = [call for call in fake.calls if call[0] == "wait"]
+    assert len(waits) <= 3, f"{len(waits)} wait calls: the run is spinning on a paused session"
+    assert result.exit_code == EXIT_PAUSED == 3, result.output
+    assert fake.require_session("sess-0001").status is SessionState.PAUSED
+    assert fake.shutdown_called
+
+
+def given_session_paused_when_run_then_reason_and_the_two_commands_are_printed(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.pause(sid, operation="GET")
+    result = runner.invoke(app, ["run", "goal", "--config", str(config_file)], obj=_deps(fake))
+    assert result.exit_code == EXIT_PAUSED, result.output
+    assert len([call for call in fake.calls if call[0] == "wait"]) == 0
+    output = " ".join(result.output.split())  # rich wraps the panel to the terminal width
+    assert "paused" in output.lower()
+    assert "credentials_required" in output
+    assert "HTTP_401" in output and "AUTHN_ERROR" in output and "GET" in output
+    assert "agentic-app credentials" in output
+    assert "agentic-app resume sess-0001" in output
+
+
+def given_run_with_json_when_session_paused_then_reason_in_the_document(
+    runner: CliRunner, config_file: Path, fake: FakeConversationManager
+) -> None:
+    fake.on_start = lambda m, sid: m.pause(sid)
+    result = runner.invoke(
+        app, ["run", "goal", "--json", "--config", str(config_file)], obj=_deps(fake)
+    )
+    assert result.exit_code == EXIT_PAUSED, result.output
+    document = json.loads(result.stdout)
+    assert document["status"] == "PAUSED"
+    assert document["exit_code"] == EXIT_PAUSED
+    assert document["final_answer"] is None
+    assert document["paused_reason"] == fake.paused_reason("sess-0001")
+    assert document["paused_reason"]["reason"] == "credentials_required"
+    assert document["paused_reason"]["operation"] == "POST"
+
+
+def given_cli_when_help_then_credentials_and_resume_are_listed(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0, result.output
+    for command in ("credentials", "resume"):
+        assert command in result.output
+    run_help = runner.invoke(app, ["run", "--help"])
+    assert "3 paused" in " ".join(run_help.output.split())
+    credentials_help = " ".join(runner.invoke(app, ["credentials", "--help"]).output.split())
+    assert "--from-env" in credentials_help
+    assert "standard input" in credentials_help

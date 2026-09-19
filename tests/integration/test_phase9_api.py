@@ -18,7 +18,9 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,7 +28,15 @@ import pytest
 from fastapi import FastAPI
 
 from agentic_local_app import __version__
-from agentic_local_app.config import ApiSection, AppConfig, BudgetSection, TransportSection
+from agentic_local_app.config import (
+    ApiSection,
+    AppConfig,
+    BudgetSection,
+    CredentialField,
+    ModelsSection,
+    SkillsSection,
+    TransportSection,
+)
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.errors import BudgetExceededError, ErrorType, PersistenceError
 from agentic_local_app.domain.events import Event, EventType
@@ -40,6 +50,7 @@ from agentic_local_app.domain.states import (
     SessionState,
     TaskState,
 )
+from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.http_api import (
     API_PREFIX,
     ConversationManagerLike,
@@ -60,6 +71,14 @@ pytestmark = pytest.mark.phase9
 
 BOUND_S = 2.0
 TOKEN_ENV = "AGENTIC_TRANSPORT_TOKEN_PHASE9_TEST"
+CHAT_ENV = "AGENTIC_CHAT_ID_PHASE9_TEST"
+#: ADR-027 §1: a profile that needs more than a token — the shape the front renders field by field.
+TWO_CREDENTIAL_FIELDS = [
+    CredentialField(
+        key="access_token", label="Access token", placeholder="Paste it", env=TOKEN_ENV
+    ),
+    CredentialField(key="chat_id", label="Chat id", secret=False, env=CHAT_ENV),
+]
 
 
 # ================================================================================================
@@ -379,12 +398,13 @@ async def given_explicit_budget_and_auto_close_when_session_created_then_forward
 @pytest.mark.parametrize(
     "body",
     [
-        {"user_message": "m"},
-        {"goal": "g"},
+        {"goal": "", "user_message": "m"},
+        {"goal": "g", "user_message": ""},
+        {"goal": "g", "user_message": "m", "user_id": ""},
         {"goal": "g", "user_message": "m", "session_budget": {"max_cycles": 0}},
         {"goal": "g", "user_message": "m", "unknown": 1},
     ],
-    ids=["missing_goal", "missing_message", "invalid_budget", "unknown_field"],
+    ids=["empty_goal", "empty_message", "empty_user_id", "invalid_budget", "unknown_field"],
 )
 async def given_invalid_body_when_session_created_then_422_with_uniform_error(
     client: httpx.AsyncClient, manager: FakeConversationManager, body: dict[str, Any]
@@ -680,10 +700,29 @@ async def given_completed_reusable_session_when_follow_up_posted_then_202_and_se
     assert conversation.status is ConversationState.WAITING_MODEL_RESPONSE
 
 
-async def given_running_session_when_follow_up_posted_then_409_conflict(
+async def given_running_session_when_follow_up_posted_then_409_session_busy(
     client: httpx.AsyncClient, manager: FakeConversationManager
 ) -> None:
+    """The front blocks its send button while a session runs; this is the belt behind it."""
     sid = await _start(manager)
+    response = await client.post(_url(f"/sessions/{sid}/messages"), json={"user_message": "m"})
+    assert response.status_code == 409, response.text
+    error = _error(response)
+    assert error["error_code"] == "SESSION_BUSY"
+    assert error["details"] == {
+        "message": f"session {sid} is still running",
+        "session_id": sid,
+        "status": "RUNNING",
+    }
+    assert ("continue_session", sid, "m") not in manager.calls  # the façade was never called
+
+
+async def given_failed_session_when_follow_up_posted_then_409_conflict(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """A session that is not busy but not reusable either keeps the generic conflict."""
+    sid = await _start(manager)
+    manager.fail(sid)
     response = await client.post(_url(f"/sessions/{sid}/messages"), json={"user_message": "m"})
     assert response.status_code == 409, response.text
     error = _error(response)
@@ -1339,6 +1378,17 @@ def given_fake_manager_when_checked_then_satisfies_the_facade_protocol(
     assert facade.bus.subscriber_names[:3] == ["audit_log", "execution_tracker", "telemetry"]
 
 
+def given_the_real_facade_when_compared_to_the_protocol_then_every_member_exists() -> None:
+    """The API is served over the real ``ConversationManager`` through the protocol, which type
+    checking never sees (the wiring hands it over as an ``ApplicationLike``): a member declared
+    here and missing there would only show as an ``AttributeError`` on a request."""
+    from agentic_local_app.orchestration import ConversationManager
+
+    declared = {name for name in dir(ConversationManagerLike) if not name.startswith("_")}
+    assert "paused_reason" in declared and "resume_session" in declared
+    assert [name for name in sorted(declared) if not hasattr(ConversationManager, name)] == []
+
+
 # ================================================================================================
 # SSE broker (interfaces/sse.py)
 # ================================================================================================
@@ -1852,3 +1902,1054 @@ async def given_unknown_session_or_task_when_sse_route_requested_then_404(
     sid = await _start(manager)
     assert (await client.get(_url("/sessions/nope/events"))).status_code == 404
     assert (await client.get(_url(f"/sessions/{sid}/tasks/t9/output/live"))).status_code == 404
+
+
+# ================================================================================================
+# machine identity and model catalogue (ADR-024)
+# ================================================================================================
+@asynccontextmanager
+async def _client_for(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """A client on an application the test built itself (identity, environment, configuration)."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        yield client
+
+
+def _models_config(**profiles: TransportSection) -> AppConfig:
+    return AppConfig(
+        api=ApiSection(),
+        models=ModelsSection(active="claude", profiles=dict(profiles)),
+    )
+
+
+async def given_wired_identity_when_whoami_requested_then_user_source_and_host(
+    manager: FakeConversationManager,
+) -> None:
+    identity = UserIdentity(user_id="alice", source="env:USER", host="workstation")
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, identity=identity)
+    async with _client_for(app) as client:
+        response = await client.get(_url("/whoami"))
+    assert response.status_code == 200
+    assert response.json() == {"user_id": "alice", "source": "env:USER", "host": "workstation"}
+
+
+async def given_no_injected_identity_when_whoami_requested_then_resolved_from_the_environment(
+    manager: FakeConversationManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("USER", "resolved-user")  # POSIX
+    monkeypatch.setenv("USERNAME", "resolved-user")  # Windows (ADR-024 §5, step 1 either way)
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None)
+    async with _client_for(app) as client:
+        body = (await client.get(_url("/whoami"))).json()
+        again = (await client.get(_url("/whoami"))).json()
+    assert body["user_id"] == "resolved-user"
+    assert body["source"].startswith("env:")
+    assert set(body) == {"user_id", "source", "host"}
+    assert again == body  # resolved once, kept
+
+
+async def given_two_profiles_when_models_requested_then_catalogue_active_first_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _models_config(
+        claude=TransportSection(
+            provider="templated_http",
+            codec="json_text",
+            token_env=TOKEN_ENV,
+            display_name="Claude (chat completions)",
+            description="the real model",
+            init_url="https://api.example.test/v1/conversations",
+            options={"api_key": "never-shown"},
+        ),
+        mock=TransportSection(token_env="", display_name="Mock local"),
+    )
+    manager = FakeConversationManager(config)
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, environ={})
+    async with _client_for(app) as client:
+        response = await client.get(_url("/models"))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["active"] == "claude"
+    assert body["models"] == [
+        {
+            "name": "claude",
+            "display_name": "Claude (chat completions)",
+            "description": "the real model",
+            "provider": "templated_http",
+            "codec": "json_text",
+            "requires_credentials": True,  # token_env named, nothing in the environment
+            # ADR-027 §1: no declaration, so the implicit access_token field of token_env
+            "credential_fields": [
+                {
+                    "key": "access_token",
+                    "label": "Access token",
+                    "placeholder": "Paste an access token",
+                    "secret": True,
+                }
+            ],
+            "active": True,
+        },
+        {
+            "name": "mock",
+            "display_name": "Mock local",
+            "description": None,
+            "provider": "generic_http",
+            "codec": "passthrough",
+            "requires_credentials": False,  # takes no token at all
+            "credential_fields": [],  # and nothing to render for it
+            "active": False,
+        },
+    ]
+    for leak in ("api.example.test", "never-shown", "api_key", TOKEN_ENV):
+        assert leak not in response.text
+
+
+async def given_token_in_the_environment_when_models_requested_then_profile_stops_asking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``requires_credentials`` is a read-time view (ADR-024 §4): the front must see it change."""
+    environ: dict[str, str] = {}
+    manager = FakeConversationManager(_models_config(claude=TransportSection(token_env=TOKEN_ENV)))
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, environ=environ)
+    async with _client_for(app) as client:
+        assert (await client.get(_url("/models"))).json()["models"][0]["requires_credentials"]
+        environ[TOKEN_ENV] = "s3cr3t"
+        assert not (await client.get(_url("/models"))).json()["models"][0]["requires_credentials"]
+
+
+async def given_declared_credential_fields_when_models_requested_then_rendered_without_env() -> (
+    None
+):
+    """ADR-027 §2: what the front draws travels; the variable behind a field never does."""
+    manager = FakeConversationManager(
+        _models_config(
+            claude=TransportSection(token_env=TOKEN_ENV, credential_fields=TWO_CREDENTIAL_FIELDS)
+        )
+    )
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, environ={})
+    async with _client_for(app) as client:
+        response = await client.get(_url("/models"))
+    entry = response.json()["models"][0]
+    assert entry["credential_fields"] == [
+        {
+            "key": "access_token",
+            "label": "Access token",
+            "placeholder": "Paste it",
+            "secret": True,
+        },
+        {"key": "chat_id", "label": "Chat id", "placeholder": None, "secret": False},
+    ]
+    assert entry["requires_credentials"] is True
+    for leak in ("env", TOKEN_ENV, CHAT_ENV):
+        assert leak not in response.text
+
+
+async def given_declared_fields_when_only_one_is_provided_then_the_profile_still_asks() -> None:
+    """``requires_credentials`` covers every declared field, not only the first (ADR-027 §1)."""
+    environ: dict[str, str] = {}
+    manager = FakeConversationManager(
+        _models_config(
+            claude=TransportSection(token_env=TOKEN_ENV, credential_fields=TWO_CREDENTIAL_FIELDS)
+        )
+    )
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, environ=environ)
+    async with _client_for(app) as client:
+        environ[TOKEN_ENV] = "s3cr3t"
+        assert (await client.get(_url("/models"))).json()["models"][0]["requires_credentials"]
+        environ[CHAT_ENV] = "chat-42"
+        assert not (await client.get(_url("/models"))).json()["models"][0]["requires_credentials"]
+
+
+# ================================================================================================
+# credentials (ADR-025 §6): the token goes in, nothing comes out
+# ================================================================================================
+def _credentials_app(
+    token_env: str = TOKEN_ENV,
+    credential_fields: list[CredentialField] | None = None,
+) -> tuple[FakeConversationManager, FastAPI, dict[str, str]]:
+    manager = FakeConversationManager(
+        AppConfig(
+            api=ApiSection(),
+            transport=TransportSection(token_env=token_env, credential_fields=credential_fields),
+        )
+    )
+    environ: dict[str, str] = {}
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, environ=environ)
+    return manager, app, environ
+
+
+async def given_token_posted_when_credentials_set_then_204_and_variable_written(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, app, environ = _credentials_app()
+    with caplog.at_level(0):
+        async with _client_for(app) as client:
+            response = await client.post(_url("/credentials"), json={"token": "  s3cr3t-token  "})
+    assert response.status_code == 204
+    assert response.content == b""
+    assert environ == {TOKEN_ENV: "s3cr3t-token"}  # stripped, written where the transport reads it
+    assert "s3cr3t-token" not in caplog.text
+
+
+async def given_a_token_when_anything_is_read_back_then_the_value_is_nowhere(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ADR-025 §6: the value never reaches a response, a log line, an event or an error detail."""
+    manager, app, environ = _credentials_app()
+    secret = "s3cr3t-token"
+    with caplog.at_level(0):
+        async with _client_for(app) as client:
+            assert (await client.post(_url("/credentials"), json={"token": secret})).content == b""
+            # a misspelled field: pydantic would hand the whole body back in the validation error
+            wrong = await client.post(_url("/credentials"), json={"tok": secret})
+            nested = await client.post(_url("/credentials"), json={"token": {"value": secret}})
+            extra = await client.post(_url("/credentials"), json={"token": secret, "x": 1})
+            broken = await client.post(
+                _url("/credentials"), content=secret.encode(), headers={"content-type": "app/json"}
+            )
+            seen = [
+                (await client.get(_url("/config"))).text,
+                (await client.get(_url("/models"))).text,
+                (await client.get(_url("/sessions"))).text,
+                (await client.get(_url("/admin/events"))).text,
+                (await client.get(_url("/admin/audit"))).text,
+                (await client.get(_url("/metrics"))).text,
+            ]
+    assert wrong.status_code == 422 and nested.status_code == 422 and broken.status_code == 422
+    assert extra.status_code == 204  # an unknown key is ignored; the token is still taken
+    for response in (wrong, nested, extra, broken):
+        assert secret not in response.text
+    assert all(secret not in text for text in seen)
+    assert secret not in caplog.text
+    assert environ[TOKEN_ENV] == secret
+    assert secret not in json.dumps(
+        [event.model_dump(mode="json") for event in manager.store.list_audit_events("sess-0001")],
+        default=str,
+    )
+
+
+async def given_an_undeclared_profile_when_the_implicit_field_is_posted_then_it_is_written() -> (
+    None
+):
+    """ADR-027 §1: with no declaration the profile still answers to ``access_token``."""
+    _, app, environ = _credentials_app()
+    async with _client_for(app) as client:
+        written = await client.post(
+            _url("/credentials"), json={"credentials": {"access_token": " tok "}}
+        )
+        unknown = await client.post(_url("/credentials"), json={"credentials": {"chat_id": "42"}})
+    assert written.status_code == 204, written.text
+    assert environ == {TOKEN_ENV: "tok"}
+    assert unknown.status_code == 400
+    assert _error(unknown)["details"] == {
+        "message": "the active model profile does not declare this credential",
+        "key": "chat_id",
+        "expected": ["access_token"],
+    }
+
+
+async def given_several_credentials_when_anything_is_read_back_then_no_value_is_anywhere(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """ADR-027 §3: the same rule, field by field — the refusals name a key, never a value."""
+    manager, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    token, chat = "s3cr3t-token", "s3cr3t-chat-id"
+    with caplog.at_level(0):
+        async with _client_for(app) as client:
+            written = await client.post(
+                _url("/credentials"),
+                json={"credentials": {"access_token": token, "chat_id": chat}},
+            )
+            # a key the profile does not declare: named back, with the declared ones
+            unknown = await client.post(
+                _url("/credentials"), json={"credentials": {"chat": chat, "access_token": token}}
+            )
+            blank = await client.post(
+                _url("/credentials"), json={"credentials": {"chat_id": "   "}}
+            )
+            nested = await client.post(
+                _url("/credentials"), json={"credentials": {"chat_id": {"value": chat}}}
+            )
+            not_an_object = await client.post(_url("/credentials"), json={"credentials": chat})
+            seen = [
+                (await client.get(_url("/config"))).text,
+                (await client.get(_url("/models"))).text,
+                (await client.get(_url("/admin/events"))).text,
+                (await client.get(_url("/admin/audit"))).text,
+            ]
+    assert written.status_code == 204 and written.content == b""
+    assert environ == {TOKEN_ENV: token, CHAT_ENV: chat}
+    assert unknown.status_code == 400 and blank.status_code == 400
+    assert nested.status_code == 422 and not_an_object.status_code == 422
+    # the wrong-key error names the key and what was expected, and nothing else
+    assert _error(unknown)["error_code"] == "CREDENTIAL_FIELD_UNKNOWN"
+    assert _error(unknown)["details"]["key"] == "chat"
+    assert _error(unknown)["details"]["expected"] == ["access_token", "chat_id"]
+    assert _error(blank)["details"]["key"] == "chat_id"
+    for response in (unknown, blank, nested, not_an_object):
+        assert token not in response.text and chat not in response.text
+    assert all(token not in text and chat not in text for text in seen)
+    assert token not in caplog.text and chat not in caplog.text
+    assert token not in json.dumps(
+        [event.model_dump(mode="json") for event in manager.store.list_audit_events("sess-0001")],
+        default=str,
+    )
+
+
+async def given_declared_fields_when_credentials_posted_then_each_value_lands_in_its_variable() -> (
+    None
+):
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        response = await client.post(
+            _url("/credentials"),
+            json={"credentials": {"access_token": "  tok  ", "chat_id": "chat-42"}},
+        )
+        models = (await client.get(_url("/models"))).json()["models"]
+    assert response.status_code == 204, response.text
+    assert environ == {TOKEN_ENV: "tok", CHAT_ENV: "chat-42"}  # stripped, one variable each
+    assert models[0]["requires_credentials"] is False  # both fields are now provided
+
+
+async def given_a_subset_of_the_fields_when_posted_then_accepted_and_still_incomplete() -> None:
+    """A partial form is not a protocol error: the catalogue keeps asking for the rest."""
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"credentials": {"chat_id": "42"}})
+        models = (await client.get(_url("/models"))).json()["models"]
+    assert response.status_code == 204, response.text
+    assert environ == {CHAT_ENV: "42"}
+    assert models[0]["requires_credentials"] is True
+
+
+async def given_the_token_alias_when_posted_then_it_fills_the_access_token_field() -> None:
+    """ADR-027 §3: the CLI and the older client keep posting ``{"token": …}``."""
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"token": "tok"})
+    assert response.status_code == 204, response.text
+    assert environ == {TOKEN_ENV: "tok"}
+
+
+async def given_a_refused_entry_when_posted_then_nothing_at_all_is_written() -> None:
+    """Validation runs on the whole form before the first write (ADR-027 §3)."""
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        unknown = await client.post(
+            _url("/credentials"), json={"credentials": {"access_token": "tok", "nope": "x"}}
+        )
+        blank = await client.post(
+            _url("/credentials"), json={"credentials": {"access_token": "tok", "chat_id": " "}}
+        )
+    assert unknown.status_code == 400 and blank.status_code == 400
+    assert _error(unknown)["error_code"] == "CREDENTIAL_FIELD_UNKNOWN"
+    assert _error(blank)["error_code"] == "CREDENTIALS_EMPTY"
+    assert environ == {}
+
+
+async def given_an_empty_credentials_object_when_posted_then_400_credentials_empty() -> None:
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"credentials": {}})
+    assert response.status_code == 400, response.text
+    error = _error(response)
+    assert error["error_code"] == "CREDENTIALS_EMPTY"
+    assert "key" not in error["details"]  # no entry at all: there is no key to name
+    assert environ == {}
+
+
+async def given_a_body_without_credentials_when_posted_then_422_naming_no_value() -> None:
+    _, app, environ = _credentials_app(credential_fields=TWO_CREDENTIAL_FIELDS)
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"creds": {"chat_id": "s3cr3t"}})
+    assert response.status_code == 422, response.text
+    assert _error(response)["error_code"] == "VALIDATION_ERROR"
+    assert "s3cr3t" not in response.text
+    assert environ == {}
+
+
+async def given_a_profile_declaring_nothing_when_credentials_posted_then_409() -> None:
+    """An explicitly empty declaration is a profile that takes no credential at all."""
+    _, app, environ = _credentials_app(credential_fields=[])
+    async with _client_for(app) as client:
+        response = await client.post(
+            _url("/credentials"), json={"credentials": {"access_token": "tok"}}
+        )
+    assert response.status_code == 409, response.text
+    assert _error(response)["error_code"] == "CREDENTIALS_NOT_CONFIGURED"
+    assert environ == {}
+
+
+async def given_blank_token_when_credentials_set_then_400_credentials_empty() -> None:
+    _, app, environ = _credentials_app()
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"token": "   "})
+    assert response.status_code == 400, response.text
+    error = _error(response)
+    assert error["error_code"] == "CREDENTIALS_EMPTY"
+    # ADR-027 §3: the refusal names the field the front drew, never the value and never ``env``
+    assert error["details"]["key"] == "access_token"
+    assert TOKEN_ENV not in response.text
+    assert environ == {}
+
+
+async def given_profile_without_token_variable_when_credentials_set_then_409() -> None:
+    _, app, environ = _credentials_app(token_env="")
+    async with _client_for(app) as client:
+        response = await client.post(_url("/credentials"), json={"token": "s3cr3t"})
+    assert response.status_code == 409, response.text
+    error = _error(response)
+    assert error["error_code"] == "CREDENTIALS_NOT_CONFIGURED"
+    assert error["details"] == {
+        "message": "the active model profile declares no credential field",
+        "field": "credential_fields",
+        "provider": "generic_http",
+    }
+    assert environ == {}
+
+
+# ================================================================================================
+# pause and resume (ADR-025)
+# ================================================================================================
+async def given_paused_session_when_pause_read_then_reason_code_operation_and_since(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.pause(sid, operation="GET")
+    response = await client.get(_url(f"/sessions/{sid}/pause"))
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "reason": "credentials_required",
+        "error_code": "HTTP_401",
+        "error_type": "AUTHN_ERROR",
+        "operation": "GET",
+        "since": manager.require_session(sid).model_dump(mode="json")["updated_at"],
+    }
+
+
+async def given_running_session_when_pause_read_then_404_not_paused(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    response = await client.get(_url(f"/sessions/{sid}/pause"))
+    assert response.status_code == 404, response.text
+    assert _error(response)["error_code"] == "NOT_PAUSED"
+    assert (await client.get(_url("/sessions/ghost/pause"))).status_code == 404
+
+
+async def given_paused_session_when_resumed_then_200_with_the_running_record(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.pause(sid)
+    response = await client.post(_url(f"/sessions/{sid}/resume"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["session_id"] == sid and body["status"] == "RUNNING"
+    assert ("resume_session", sid) in manager.calls
+    assert manager.require_session(sid).status is SessionState.RUNNING
+
+
+async def given_session_that_is_not_paused_when_resumed_then_409_not_resumable(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.complete(sid)
+    response = await client.post(_url(f"/sessions/{sid}/resume"))
+    assert response.status_code == 409, response.text
+    error = _error(response)
+    assert error["error_code"] == "SESSION_NOT_RESUMABLE"
+    assert error["details"]["session_id"] == sid
+    assert "not resumable" in error["details"]["message"]
+    assert (await client.post(_url("/sessions/ghost/resume"))).status_code == 404
+
+
+# ================================================================================================
+# chat view of a session
+# ================================================================================================
+def _exchange(manager: FakeConversationManager, sid: str) -> None:
+    """One full exchange: request, plan, result, correction, answer — one message of each kind."""
+    manager.add_message(
+        sid,
+        direction=MessageDirection.OUTBOUND,
+        message_type=MessageType.USER_REQUEST,
+        message_id="out-1",
+        payload={"type": "user_request", "content": {"user_message": "debug my build"}},
+    )
+    manager.add_message(
+        sid,
+        direction=MessageDirection.INBOUND,
+        message_type=MessageType.DISCOVERY_PLAN,
+        message_id="in-1",
+        payload={
+            "type": "discovery_plan",
+            "content": {"plan_id": "plan-1", "tasks": [{"task_id": f"t{i}"} for i in range(5)]},
+        },
+    )
+    manager.add_message(
+        sid,
+        direction=MessageDirection.OUTBOUND,
+        message_type=MessageType.EXECUTION_RESULT,
+        message_id="out-2",
+        payload={
+            "type": "execution_result",
+            "content": {
+                "plan_id": "plan-1",
+                "status": "completed",
+                "results": [{"task_id": "t0"}, {"task_id": "t1"}],
+            },
+        },
+    )
+    manager.add_message(
+        sid,
+        direction=MessageDirection.OUTBOUND,
+        message_type=MessageType.PROTOCOL_CORRECTION_REQUEST,
+        message_id="out-3",
+        payload={
+            "type": "protocol_correction_request",
+            "content": {"error_code": "UNPARSEABLE_REPLY", "attempt": 1, "max_attempts": 5},
+        },
+    )
+    manager.add_message(
+        sid,
+        direction=MessageDirection.INBOUND,
+        message_type=MessageType.FINAL_ANSWER,
+        message_id="in-2",
+        payload={
+            "type": "final_answer",
+            "content": {
+                "status": "success",
+                "diagnosis": "the target release is wrong",
+                "evidence": ["pom.xml line 12"],
+                "recommended_next_step": "set maven.compiler.source to 17",
+            },
+        },
+    )
+
+
+async def given_an_exchange_when_chat_read_then_every_message_type_is_mapped_to_a_turn(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    _exchange(manager, sid)
+    response = await client.get(_url(f"/sessions/{sid}/chat"))
+    assert response.status_code == 200, response.text
+    turns = response.json()["messages"]
+    assert [(t["id"], t["role"], t["text"]) for t in turns] == [
+        ("out-1", "user", "debug my build"),
+        ("in-1", "system", "plan-1 · 5 tâches"),
+        ("out-2", "system", "plan-1 · completed · 2 résultats"),
+        ("out-3", "system", "correction 1/5 · UNPARSEABLE_REPLY"),
+        ("in-2", "assistant", "the target release is wrong"),
+    ]
+    assert [t["message_type"] for t in turns] == [
+        "user_request",
+        "discovery_plan",
+        "execution_result",
+        "protocol_correction_request",
+        "final_answer",
+    ]
+    assert [t.get("plan_id") for t in turns] == [None, "plan-1", "plan-1", None, None]
+    assert all(t["created_at"] is not None for t in turns)
+    # ADR-022 / §12.7: the evidence and the next step stay in the record, out of the bubble
+    assert "pom.xml line 12" not in response.text
+    assert "maven.compiler.source" not in response.text
+
+
+async def given_a_user_response_when_chat_read_then_its_body_is_the_assistant_turn(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.add_cycle(sid)
+    manager.respond(sid, "## Analysis\n\nthe module does not compile", format="markdown")
+    turns = (await client.get(_url(f"/sessions/{sid}/chat"))).json()["messages"]
+    assert [(t["role"], t["text"], t["message_type"]) for t in turns] == [
+        ("assistant", "## Analysis\n\nthe module does not compile", "user_response")
+    ]
+
+
+async def given_include_system_false_when_chat_read_then_only_user_and_model_turns(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    _exchange(manager, sid)
+    response = await client.get(_url(f"/sessions/{sid}/chat?include_system=false"))
+    turns = response.json()["messages"]
+    assert [(t["role"], t["id"]) for t in turns] == [("user", "out-1"), ("assistant", "in-2")]
+    assert (await client.get(_url(f"/sessions/{sid}/chat?include_system=true"))).json()[
+        "messages"
+    ] == (await client.get(_url(f"/sessions/{sid}/chat"))).json()["messages"]
+
+
+async def given_a_rejected_reply_when_chat_read_then_it_is_not_a_turn(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """An inbound message the protocol refused never became a turn; the correction tells the story."""
+    sid = await _start(manager)
+    rejected = manager.add_message(
+        sid,
+        direction=MessageDirection.INBOUND,
+        message_type=MessageType.FINAL_ANSWER,
+        message_id="in-bad",
+        payload={"type": "final_answer", "content": {"diagnosis": "unusable"}},
+    )
+    manager.store.save_message(rejected.model_copy(update={"validation_status": "invalid"}))
+    turns = (await client.get(_url(f"/sessions/{sid}/chat"))).json()["messages"]
+    assert turns == []
+    assert (await client.get(_url("/sessions/ghost/chat"))).status_code == 404
+
+
+async def given_several_conversations_when_chat_read_then_turns_are_chronological(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """A rotation or an interruption opens a conversation; the exchange is still one thread."""
+    sid = await _start(manager)
+    manager.add_message(
+        sid,
+        direction=MessageDirection.OUTBOUND,
+        message_type=MessageType.USER_REQUEST,
+        message_id="out-1",
+        payload={"type": "user_request", "content": {"user_message": "first"}},
+    )
+    second = manager.lifecycle.create_conversation(sid, parent_conversation_id="conv-0001")
+    manager.add_message(
+        sid,
+        direction=MessageDirection.OUTBOUND,
+        message_type=MessageType.USER_REQUEST,
+        conversation_id=second.conversation_id,
+        message_id="out-2",
+        payload={"type": "user_request", "content": {"user_message": "second"}},
+    )
+    turns = (await client.get(_url(f"/sessions/{sid}/chat"))).json()["messages"]
+    assert [t["text"] for t in turns] == ["first", "second"]
+
+
+# ================================================================================================
+# administration: the whole store, and the gate on the destructive route
+# ================================================================================================
+async def given_several_sessions_when_admin_sessions_read_then_paginated_newest_first(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    first = await _start(manager, goal="first")
+    manager.clock.advance(1_000)
+    second = await _start(manager, goal="second")
+    page = (await client.get(_url("/admin/sessions"))).json()
+    assert [item["session_id"] for item in page["items"]] == [second, first]
+    assert (page["limit"], page["offset"], page["next_offset"]) == (100, 0, None)
+    head = (await client.get(_url("/admin/sessions?limit=1"))).json()
+    assert [item["session_id"] for item in head["items"]] == [second]
+    assert (head["limit"], head["offset"], head["next_offset"]) == (1, 0, 1)
+    tail = (await client.get(_url("/admin/sessions?limit=1&offset=1"))).json()
+    assert [item["session_id"] for item in tail["items"]] == [first]
+
+
+async def given_events_of_two_sessions_when_admin_events_read_then_flat_rows_without_hashes(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    first = await _start(manager)
+    manager.clock.advance(1_000)
+    second = await _start(manager)
+    manager.complete(second)
+    page = (await client.get(_url("/admin/events"))).json()
+    rows = page["items"]
+    assert {row["session_id"] for row in rows} == {first, second}
+    assert rows[0]["session_id"] == second  # newest first
+    assert set(rows[0]) == {
+        "event_id",
+        "sequence",
+        "session_id",
+        "conversation_id",
+        "cycle_id",
+        "plan_id",
+        "task_id",
+        "event_type",
+        "timestamp",
+        "payload",
+    }
+    assert "event_hash" not in json.dumps(page, default=str)
+    assert page["limit"] == 100 and page["offset"] == 0 and page["next_offset"] is None
+    first_page = (await client.get(_url("/admin/events?limit=2"))).json()
+    assert [row["event_id"] for row in first_page["items"]] == [r["event_id"] for r in rows[:2]]
+    assert first_page["next_offset"] == 2
+
+
+async def given_events_of_two_sessions_when_admin_audit_read_then_the_chain_with_its_hashes(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    manager.complete(sid)
+    rows = (await client.get(_url("/admin/audit"))).json()["items"]
+    stored = manager.store.list_audit_events(sid, limit=100)
+    assert len(rows) == len(stored)
+    assert [row["sequence"] for row in rows] == sorted(
+        (event.sequence for event in stored), reverse=True
+    )
+    assert all({"previous_event_hash", "event_hash"} <= set(row) for row in rows)
+    assert rows[-1]["event_hash"] == stored[0].event_hash
+
+
+async def given_destructive_admin_disabled_when_reset_requested_then_403_and_nothing_touched(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    sid = await _start(manager)
+    response = await client.post(_url("/admin/reset-database"))
+    assert response.status_code == 403, response.text
+    error = _error(response)
+    assert error["error_code"] == "ADMIN_DISABLED"
+    assert error["details"]["setting"] == "api.allow_destructive_admin"
+    assert manager.get_session(sid) is not None
+    assert manager.store.list_audit_events(sid, limit=10)
+
+
+async def given_destructive_admin_allowed_when_reset_requested_then_204_and_empty_store() -> None:
+    manager = FakeConversationManager(_config(allow_destructive_admin=True))
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None)
+    async with _client_for(app) as client:
+        sid = await _start(manager)
+        manager.add_plan(sid, "plan-1", [{"task_id": "t1"}])
+        manager.add_blob(sid, "t1", b"output")
+        manager.add_failure(sid)
+        response = await client.post(_url("/admin/reset-database"))
+        assert response.status_code == 204, response.text
+        assert response.content == b""
+        assert (await client.get(_url("/admin/sessions"))).json()["items"] == []
+        assert (await client.get(_url("/admin/events"))).json()["items"] == []
+        assert (await client.get(_url("/admin/audit"))).json()["items"] == []
+        assert (await client.get(_url(f"/sessions/{sid}"))).status_code == 404
+    assert manager.store.list_plans(sid) == []
+    assert manager.store.list_failures(sid) == []
+    assert manager.store.get_blob_for_task(sid, "t1", OutputStream.STDOUT) is None
+
+
+# ================================================================================================
+# working space (ADR-026) and the default CORS origins of the desktop front
+# ================================================================================================
+async def given_a_working_space_when_session_created_then_it_is_bound_to_the_session(
+    client: httpx.AsyncClient, manager: FakeConversationManager, tmp_path: Path
+) -> None:
+    response = await client.post(
+        _url("/sessions"),
+        json={"goal": "g", "user_message": "m", "working_space": str(tmp_path)},
+    )
+    assert response.status_code == 201, response.text
+    assert manager.working_spaces == {response.json()["session_id"]: str(tmp_path)}
+
+
+async def given_an_unusable_working_space_when_session_created_then_400_and_no_session(
+    client: httpx.AsyncClient, manager: FakeConversationManager, tmp_path: Path
+) -> None:
+    missing = tmp_path / "nowhere"
+    response = await client.post(
+        _url("/sessions"), json={"goal": "g", "user_message": "m", "working_space": str(missing)}
+    )
+    assert response.status_code == 400, response.text
+    error = _error(response)
+    assert error["error_code"] == "WORKING_SPACE_INVALID"
+    assert error["details"]["reason"] == "does_not_exist"
+    assert error["details"]["path"] == str(missing)
+    relative = await client.post(
+        _url("/sessions"), json={"goal": "g", "user_message": "m", "working_space": "./relative"}
+    )
+    assert _error(relative)["details"]["reason"] == "not_absolute"
+    assert manager.list_sessions() == []  # refused before anything was created
+    assert manager.working_spaces == {}
+
+
+async def given_the_default_configuration_when_a_desktop_origin_preflights_then_it_is_allowed() -> (
+    None
+):
+    manager = FakeConversationManager(AppConfig())
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None)
+    async with _client_for(app) as client:
+        for origin in (
+            # ADR-028 §3: the desktop front pins its Vite dev server to 1420 (strictPort)
+            "http://localhost:1420",
+            "http://127.0.0.1:1420",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "tauri://localhost",
+        ):
+            preflight = await client.options(
+                _url("/sessions"),
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "content-type",
+                },
+            )
+            assert preflight.status_code == 200, (origin, preflight.text)
+            assert preflight.headers["access-control-allow-origin"] == origin
+        denied = await client.get(_url("/health"), headers={"Origin": "http://evil.example"})
+        assert "access-control-allow-origin" not in denied.headers
+
+
+def given_the_code_defaults_when_read_then_the_front_dev_server_port_is_allowed() -> None:
+    """ADR-028 §3: 1420 on both spellings of the loopback, and nothing removed."""
+    origins = AppConfig().api.cors_origins
+    assert "http://localhost:1420" in origins and "http://127.0.0.1:1420" in origins
+    assert {
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "tauri://localhost",
+    } <= set(origins)
+
+
+# ================================================================================================
+# opening a session without a message, and the user it belongs to (ADR-028)
+# ================================================================================================
+async def given_no_goal_and_no_message_when_session_created_then_ready_and_nothing_sent(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """ADR-028 §1: the sign-in screen has nothing to say yet, so nothing is said."""
+    response = await client.post(_url("/sessions"), json={})
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    sid = body["session_id"]
+    assert body["status"] == "READY"
+    assert body["goal"] == "" and body["user_message"] == ""
+    assert body["current_conversation_id"] is None
+    assert body["started_at"] is None
+    # no conversation, hence no cycle and no message: nothing was posted to the model, and the
+    # only thing that ever happened to this session is its own creation
+    assert manager.store.list_conversations(sid) == []
+    assert [event.event_type for event in manager.store.list_audit_events(sid)] == [
+        EventType.SESSION_CREATED.value
+    ]
+    assert _created_payload(manager, sid)["goal"] == ""
+    # the budget is the one of the configuration, exactly as for a session that starts at once
+    assert body["budget"] == {"max_cycles": 7, "max_plans": 3, "max_total_duration_ms": 300_000}
+
+
+async def given_an_empty_session_when_the_first_message_arrives_then_it_opens_the_first_cycle(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """ADR-028 §1: the first message takes the path of a message after an interruption."""
+    sid = (await client.post(_url("/sessions"), json={})).json()["session_id"]
+
+    response = await client.post(
+        _url(f"/sessions/{sid}/messages"), json={"user_message": "debug my build"}
+    )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["status"] == "RUNNING"
+    assert body["user_message"] == "debug my build"
+    assert body["goal"] == "debug my build"  # the first message becomes the goal
+    conversations = manager.store.list_conversations(sid)
+    assert len(conversations) == 1
+    assert conversations[0].parent_conversation_id is None
+    assert body["current_conversation_id"] == conversations[0].conversation_id
+
+
+async def given_a_session_opened_with_a_goal_when_a_follow_up_arrives_then_the_goal_is_kept(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """The promotion of ADR-028 §1 only fills a goal that is missing; it never rewrites one."""
+    sid = (
+        await client.post(_url("/sessions"), json={"goal": "fix the build", "user_message": "m"})
+    ).json()["session_id"]
+    await manager.interrupt(sid)
+
+    body = (
+        await client.post(_url(f"/sessions/{sid}/messages"), json={"user_message": "and now this"})
+    ).json()
+
+    assert body["goal"] == "fix the build"
+    assert body["user_message"] == "and now this"
+
+
+async def given_an_empty_session_when_interrupted_and_listed_then_idle_and_visible(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """A session with no conversation is an ordinary idle session: nothing to interrupt, listed."""
+    sid = (await client.post(_url("/sessions"), json={})).json()["session_id"]
+
+    report = await client.post(_url(f"/sessions/{sid}/interrupt"))
+    assert report.status_code == 200, report.text
+    assert report.json()["nothing_to_interrupt"] is True
+    assert report.json()["conversation_id"] is None
+    assert report.json()["session_status"] == "READY"
+
+    listed = (await client.get(_url("/sessions"), params={"status": "ready"})).json()
+    assert [item["session_id"] for item in listed["items"]] == [sid]
+    single = (await client.get(_url(f"/sessions/{sid}"))).json()
+    assert single["conversation"] is None
+    snapshot = (await client.get(_url(f"/sessions/{sid}/snapshot"))).json()
+    assert snapshot["conversation"] is None and snapshot["conversations"] == []
+    assert snapshot["session"]["status"] == "READY"
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "field"),
+    [
+        ({"user_message": "m"}, "GOAL_REQUIRED", "goal"),
+        ({"goal": "g"}, "USER_MESSAGE_REQUIRED", "user_message"),
+    ],
+    ids=["message_without_goal", "goal_without_message"],
+)
+async def given_half_an_opening_message_when_session_created_then_400_and_no_session(
+    client: httpx.AsyncClient,
+    manager: FakeConversationManager,
+    body: dict[str, Any],
+    code: str,
+    field: str,
+) -> None:
+    """ADR-028 §1: the opening message is a pair; half of one is refused before anything exists."""
+    response = await client.post(_url("/sessions"), json=body)
+
+    assert response.status_code == 400, response.text
+    error = _error(response)
+    assert error["error_code"] == code
+    assert error["details"]["field"] == field
+    assert error["details"]["expected"] == ["goal", "user_message"]
+    assert manager.list_sessions() == []
+    assert manager.calls == []  # refused by the route, the façade never saw it
+
+
+async def given_a_user_id_when_session_created_then_the_session_carries_it(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    response = await client.post(_url("/sessions"), json={"user_id": "alice"})
+    assert response.status_code == 201, response.text
+    assert response.json()["user_id"] == "alice"
+    assert manager.require_session(response.json()["session_id"]).user_id == "alice"
+
+
+async def given_no_user_id_when_session_created_then_the_one_whoami_reports(
+    manager: FakeConversationManager,
+) -> None:
+    """ADR-028 §2: the two routes answer the same name, whatever the configuration says."""
+    identity = UserIdentity(user_id="alice", source="env:USER", host="workstation")
+    app = create_app(manager, clock=manager.clock, sse_heartbeat_s=None, identity=identity)
+    async with _client_for(app) as client:
+        whoami = (await client.get(_url("/whoami"))).json()
+        created = (await client.post(_url("/sessions"), json={})).json()
+        started = (
+            await client.post(_url("/sessions"), json={"goal": "g", "user_message": "m"})
+        ).json()
+
+    assert whoami["user_id"] == "alice"
+    assert created["user_id"] == "alice" == started["user_id"]
+    assert manager.config.transport.user_id == "local-user"  # the constant it used to contradict
+
+
+# ================================================================================================
+# skills and the two sign-in extras of a session (ADR-027 §4)
+# ================================================================================================
+def _skills_app(**skills: Any) -> tuple[FakeConversationManager, FastAPI]:
+    manager = FakeConversationManager(AppConfig(api=ApiSection(), skills=SkillsSection(**skills)))
+    return manager, create_app(manager, clock=manager.clock, sse_heartbeat_s=None)
+
+
+async def given_a_skills_root_when_skills_requested_then_the_notes_sorted_by_name(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "review.md").write_text("review", encoding="utf-8")
+    (tmp_path / "deploy.md").write_text("deploy", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text("not a skill", encoding="utf-8")
+    (tmp_path / "java").mkdir()
+    (tmp_path / "java" / "build.md").write_text("build", encoding="utf-8")
+    _, app = _skills_app(root=str(tmp_path))
+    async with _client_for(app) as client:
+        response = await client.get(_url("/skills"))
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "skills": [
+            {"name": "build", "path": str(tmp_path / "java" / "build.md")},
+            {"name": "deploy", "path": str(tmp_path / "deploy.md")},
+            {"name": "review", "path": str(tmp_path / "review.md")},
+        ]
+    }
+
+
+@pytest.mark.parametrize(
+    "section",
+    [{}, {"root": "  "}, {"root": "/nowhere-at-all/agentic-skills"}, {"enabled": False}],
+)
+async def given_no_usable_root_when_skills_requested_then_200_and_an_empty_list(
+    section: dict[str, Any], tmp_path: Path
+) -> None:
+    """The sign-in screen must degrade quietly: never an error, always a list."""
+    if section.get("enabled") is False:
+        (tmp_path / "deploy.md").write_text("deploy", encoding="utf-8")
+        section = {**section, "root": str(tmp_path)}
+    _, app = _skills_app(**section)
+    async with _client_for(app) as client:
+        response = await client.get(_url("/skills"))
+    assert response.status_code == 200, response.text
+    assert response.json() == {"skills": []}
+
+
+def _created_payload(manager: FakeConversationManager, sid: str) -> dict[str, Any]:
+    events = [
+        event
+        for event in manager.store.list_audit_events(sid)
+        if event.event_type == EventType.SESSION_CREATED.value
+    ]
+    assert len(events) == 1
+    return dict(events[0].payload)
+
+
+async def given_skills_and_effort_when_session_created_then_traced_in_the_created_event(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    """ADR-027 §4: recorded in the event payload, and acted upon nowhere."""
+    response = await client.post(
+        _url("/sessions"),
+        json={
+            "goal": "g",
+            "user_message": "m",
+            "skills": ["deploy", "/home/user/skills/review.md"],
+            "effort": "high",
+        },
+    )
+    assert response.status_code == 201, response.text
+    sid = response.json()["session_id"]
+    payload = _created_payload(manager, sid)
+    assert payload["skills"] == ["deploy", "/home/user/skills/review.md"]
+    assert payload["effort"] == "high"
+    assert manager.session_extras[sid] == (["deploy", "/home/user/skills/review.md"], "high")
+    # nothing else carries them: the record is untouched (no column, ADR-027 §4)
+    assert "skills" not in response.json() and "effort" not in response.json()
+
+
+async def given_no_extras_when_session_created_then_the_payload_still_carries_both_keys(
+    client: httpx.AsyncClient, manager: FakeConversationManager
+) -> None:
+    response = await client.post(_url("/sessions"), json={"goal": "g", "user_message": "m"})
+    assert response.status_code == 201, response.text
+    payload = _created_payload(manager, response.json()["session_id"])
+    assert payload["skills"] == [] and payload["effort"] is None
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+async def given_a_known_effort_level_when_session_created_then_accepted(
+    client: httpx.AsyncClient, manager: FakeConversationManager, effort: str
+) -> None:
+    response = await client.post(
+        _url("/sessions"), json={"goal": "g", "user_message": "m", "effort": effort}
+    )
+    assert response.status_code == 201, response.text
+    assert _created_payload(manager, response.json()["session_id"])["effort"] == effort
+
+
+@pytest.mark.parametrize("effort", ["HIGH", "extreme", "", "1"])
+async def given_an_unknown_effort_level_when_session_created_then_400_and_no_session(
+    client: httpx.AsyncClient, manager: FakeConversationManager, effort: str
+) -> None:
+    response = await client.post(
+        _url("/sessions"), json={"goal": "g", "user_message": "m", "effort": effort}
+    )
+    assert response.status_code == 400, response.text
+    error = _error(response)
+    assert error["error_code"] == "EFFORT_INVALID"
+    assert error["details"] == {
+        "message": "unknown effort level",
+        "effort": effort,
+        "expected": ["low", "medium", "high"],
+    }
+    assert manager.list_sessions() == []  # refused before anything was created

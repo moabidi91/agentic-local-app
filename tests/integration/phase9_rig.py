@@ -28,6 +28,7 @@ from agentic_local_app.config import (
     PayloadSection,
     ProtocolSection,
     RetrySection,
+    ScratchSection,
 )
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.events import Event, EventType
@@ -311,8 +312,15 @@ def make_config(
     breaker: dict[str, Any] | None = None,
     execution: dict[str, Any] | None = None,
     protocol: dict[str, Any] | None = None,
+    scratch: dict[str, Any] | None = None,
 ) -> AppConfig:
-    """The default configuration with short drains and optional section overrides."""
+    """The default configuration with short drains and optional section overrides.
+
+    ``[scratch]`` is **disabled** by default (ADR-026): the rig runs real plans through a double
+    executor, so the defaults of the section would create ``./data/scratch/<session_id>`` next to
+    the suite on every run. A test that wants a working space passes its own section, rooted under
+    its ``tmp_path`` — nothing this suite runs ever writes outside a temporary directory.
+    """
     exec_values: dict[str, Any] = {
         "interrupt_drain_timeout_ms": 500,
         "cancel_drain_timeout_ms": 500,
@@ -321,6 +329,7 @@ def make_config(
     return AppConfig(
         app=AppSection(data_dir=tmp_dir or "./data-phase9-unused"),
         execution=ExecutionSection(**exec_values),
+        scratch=ScratchSection(**(scratch if scratch is not None else {"enabled": False})),
         budget=BudgetSection(**(budget or {})),
         context=ContextSection(**(context or {})),
         payload=PayloadSection(**(payload or {})),

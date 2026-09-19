@@ -38,6 +38,29 @@ close_url = ""                          # optionnel ; vide = fermeture locale se
 close_method = "POST"                   # generic_http : méthode de close_url, POST ou DELETE
 token_env = "AGENTIC_TRANSPORT_TOKEN"   # variable d'environnement portant le jeton (facultatif)
 user_id   = "local-user"                # envoyé en en-tête X-User-Id et dans l'init
+# credential_fields : ce que l'interface doit demander avant d'appeler ce modèle (ADR-027). Absent,
+# le profil se comporte comme s'il déclarait exactement un champ implicite {key = "access_token",
+# label = "Access token", placeholder = "Paste an access token", secret = true, env = token_env} ;
+# et aucun champ du tout quand token_env est vide. Le déclarer sert dès qu'il faut autre chose
+# qu'un jeton (un identifiant de conversation, une organisation, un espace de travail) ou quand la
+# variable lue par le provider n'est pas celle de token_env.
+#   key         identifiant renvoyé par l'interface dans POST /credentials (forme d'identifiant)
+#   label       libellé affiché au-dessus du champ
+#   placeholder facultatif
+#   secret      facultatif, VRAI par défaut : une valeur secrète n'est jamais retenue entre deux
+#               lancements par l'interface ; mettre false n'a de sens que pour une valeur publique
+#   env         variable d'environnement où la valeur est écrite ; elle n'est jamais exposée par
+#               GET /models, qui ne rend que key, label, placeholder et secret
+# [[transport.credential_fields]]
+# key = "access_token"
+# label = "Jeton d'accès"
+# placeholder = "Coller un jeton d'accès"
+# env = "CLAUDE_API_KEY"
+# [[transport.credential_fields]]
+# key = "chat_id"
+# label = "Identifiant de conversation"
+# secret = false                        # valeur publique : l'interface peut la retenir
+# env = "CLAUDE_CHAT_ID"
 request_timeout_ms = 15000              # timeout d'un appel HTTP
 poll_interval_ms   = 1000               # intervalle entre deux GET sans réponse
 reply_timeout_ms   = 120000             # attente maximale d'une réponse du modèle (MODEL_GET_TIMEOUT)
@@ -115,6 +138,51 @@ verify_tls = true
 # id_path = "choices[0].message.tool_calls[0].id"
 
 # --------------------------------------------------------------------------------------------
+# Profils de modèle nommés (ADR-024)
+#
+# Sans [models], la section [transport] ci-dessus EST le profil implicite nommé "default", et
+# c'est lui qui est actif : rien à faire pour une configuration existante.
+#
+# Avec [models], chaque sous-table est un profil complet — toutes les clés de [transport] y sont
+# valides, y compris [models.<nom>.options] et [models.<nom>.codec_options] — et models.active
+# nomme celui avec lequel CE processus tourne. Un profil n'hérite de rien : il part des valeurs
+# par défaut, pas de celles de [transport]. Le modèle est choisi une fois, au démarrage : changer
+# de modèle = redémarrer avec un autre models.active (AGENTIC__MODELS__ACTIVE=claude au lancement),
+# jamais en cours de session. Un active qui ne nomme aucun profil est une erreur de chargement
+# (MODEL_PROFILE_UNKNOWN, avec la liste des noms disponibles).
+#
+# display_name et description ne servent qu'à l'affichage (catalogue de modèles du front) ;
+# l'application ne les lit jamais. Le front sait aussi ce qu'un profil réclame et ce qui manque :
+# credential_fields (voir [transport] ci-dessus) énumère les champs à afficher, et
+# requires_credentials vaut vrai dès qu'un de ces champs n'a pas de valeur dans l'environnement.
+#
+# [models]
+# active = "mock"                                  # profil actif de ce processus
+#
+# [models.mock]                                    # le serveur mock local, aucun jeton
+# provider = "generic_http"
+# codec = "passthrough"
+# init_url = "http://127.0.0.1:9000/v1/conversations"
+# display_name = "Mock local"
+# description = "Serveur de test intégré (agentic-app mock-server)"
+#
+# [models.claude]                                  # une API de type chat-completions
+# provider = "templated_http"
+# codec = "json_text"
+# token_env = "CLAUDE_API_KEY"                     # le jeton reste dans l'environnement
+# display_name = "Claude (chat completions)"
+# [[models.claude.credential_fields]]                # ce que l'interface demande pour ce profil
+# key = "access_token"
+# label = "Jeton d'accès"
+# env = "CLAUDE_API_KEY"
+# [models.claude.options]
+# headers = { "Authorization" = "Bearer ${env:CLAUDE_API_KEY}" }
+# [models.claude.options.init]
+# url = "https://api.example.com/v1/threads"
+# body = { instructions = "{instructions}", user = "{user_id}" }
+# conversation_id_path = "id"
+
+# --------------------------------------------------------------------------------------------
 # Exécution des commandes (ADR-003, ADR-008, ADR-018)
 # --------------------------------------------------------------------------------------------
 [execution]
@@ -126,6 +194,47 @@ cancel_drain_timeout_ms = 5000          # drain après une stop condition (SIGTE
 interrupt_drain_timeout_ms = 5000       # drain après une interruption utilisateur (§2.9)
 live_output_chunk_bytes = 4096          # taille max d'un événement task.output (flux live)
 live_output_interval_ms = 250           # cadence max des événements task.output par tâche
+
+# --------------------------------------------------------------------------------------------
+# Espace de travail par session et fichiers temporaires (ADR-026)
+#
+# L'application n'écrit elle-même aucun fichier, mais les commandes du modèle en écrivent. Chaque
+# session reçoit un dossier où elles peuvent le faire, annoncé aux commandes par les variables
+# AGENTIC_SCRATCH_DIR et AGENTIC_WORKING_SPACE (même dossier, deux noms) et AGENTIC_SESSION_ID.
+# Le répertoire de travail des commandes reste [execution] cwd : le dossier est offert, pas imposé.
+# Un working_space fourni par l'utilisateur (champ « Working folder » du front) remplace le dossier
+# généré ; il lui appartient, donc il n'est jamais ni supprimé ni archivé, quelle que soit policy.
+# --------------------------------------------------------------------------------------------
+[scratch]
+enabled = true                          # false : aucun dossier créé, aucune variable exportée
+root = "./data/scratch"                 # parent des dossiers par session (<root>/<session_id>),
+                                        # créé à la première utilisation, en 0700 sur POSIX
+policy = "delete"                       # fin de session, pour un dossier généré par l'application :
+                                        # delete (supprimer l'arborescence), keep (la laisser),
+                                        # archive (la déplacer sous archive_root)
+archive_root = "./data/scratch-archive"  # destination de policy = "archive" :
+                                        # <archive_root>/<session_id>-<horodatage>
+                                        # doit rester en dehors de root
+keep_on_failure = true                  # une session en échec garde son dossier quoi que dise
+                                        # policy : c'est justement là qu'on veut regarder dedans
+max_inventory_entries = 200             # borne de l'inventaire rendu (« qu'as-tu laissé ? ») ;
+                                        # au-delà, l'inventaire est marqué tronqué
+
+# --------------------------------------------------------------------------------------------
+# Skills : les notes réutilisables proposées à la connexion (ADR-027)
+#
+# Une skill est un simple fichier Markdown écrit par l'utilisateur. L'application se contente de
+# les LISTER (GET /skills), pour qu'une interface propose un choix plutôt qu'une saisie libre :
+# rien n'est ouvert, rien n'est lu, rien n'est transmis au modèle. Les skills et le niveau d'effort
+# envoyés à la création d'une session sont journalisés dans l'événement session.created et s'y
+# arrêtent : ce qu'un modèle devrait en faire reste à décider (ADR-027, point ouvert).
+# La liste est bornée (200 entrées, 3 niveaux de profondeur) et ne rend jamais d'erreur : une
+# racine absente, vide ou illisible rend une liste vide.
+# --------------------------------------------------------------------------------------------
+[skills]
+enabled = true                          # false : GET /skills rend une liste vide sans rien parcourir
+root = ""                               # dossier parcouru à la recherche de *.md ; "" = aucun
+                                        # (exemple : "~/agentic-skills")
 
 # --------------------------------------------------------------------------------------------
 # Limites de payload (ADR-010, ADR-005)
@@ -194,14 +303,28 @@ open_duration_ms = 30000                # durée d'ouverture avant HALF_OPEN
 half_open_max_calls = 1
 
 # --------------------------------------------------------------------------------------------
-# API HTTP locale pour la CLI et le futur front (ADR-018)
+# API HTTP locale pour la CLI et le front de bureau (ADR-018, ADR-028)
 # --------------------------------------------------------------------------------------------
 [api]
 host = "127.0.0.1"
 port = 8765
-cors_origins = ["http://localhost:3000"]
+cors_origins = [                        # origines autorisées : le front de bureau Tauri et son
+    "http://localhost:1420",            # serveur de développement Vite, dont le port est épinglé
+    "http://127.0.0.1:1420",            # à 1420 (vite.config.ts, strictPort) ; les deux
+    "http://localhost:3000",            # orthographes de la boucle locale ne sont pas la même
+    "http://localhost:5173",            # origine pour un navigateur, il faut donc les deux à
+    "http://127.0.0.1:5173",            # chaque fois (5173 = port Vite par défaut, 3000 =
+    "tauri://localhost",                # port historique du front)
+]
 page_size = 100
 sse_queue_size = 1000                   # événements en attente par client SSE avant abandon du client
+allow_destructive_admin = false         # ATTENTION : true ouvre POST /admin/reset-database, qui
+                                        # VIDE la base (sessions, conversations, plans, tâches,
+                                        # messages, blobs, échecs ET chaîne d'audit) sans
+                                        # confirmation ni sauvegarde, et sans rien demander à
+                                        # personne. Irréversible. À ne mettre à true que sur une
+                                        # installation de démonstration ou de test ; à false, la
+                                        # route répond 403 ADMIN_DISABLED et ne touche à rien.
 
 [cli]
 refresh_interval_ms = 250

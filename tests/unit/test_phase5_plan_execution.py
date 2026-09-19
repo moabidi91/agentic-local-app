@@ -1,5 +1,5 @@
 """Phase 5 — plan execution (spec §2.4, §3.7, §5.2, §5.3, §8, §18.2 ; ADR-003, ADR-006, ADR-008,
-ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1).
+ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026).
 
 Everything runs on the doubles of §18.3 — ``FakeCommandExecutor`` (no process), ``FakeClock``,
 ``InMemoryConversationStore``, ``EventBus`` + ``RecordingSubscriber``, ``SequentialIdGenerator`` —
@@ -10,7 +10,8 @@ timeouts and budgets are the adapter's.
 Sections: harness · fake barrier · sequential nominal · stop conditions (ADR-009 table) · parallel
 (workers, order, depends_on, resource_lock, drain) · interruption · budget · chunk_request ·
 spawn error · pid / live output / truncation · counters · persistence before publication ·
-invalid transitions · determinism.
+invalid transitions · determinism. The working space of ADR-026 is checked where it enters the
+runner: the ``env`` overlay of the ``CommandSpec``.
 """
 
 from __future__ import annotations
@@ -19,11 +20,12 @@ import asyncio
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agentic_local_app.config import AppConfig
+from agentic_local_app.config import AppConfig, ScratchSection
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.errors import (
     ErrorType,
@@ -53,6 +55,12 @@ from agentic_local_app.execution import plan_runner as plan_runner_module
 from agentic_local_app.execution.executor import CancellationToken, CommandSpec, OutputChunk
 from agentic_local_app.execution.payload_guard import PayloadGuard
 from agentic_local_app.execution.plan_runner import PlanOutcome, PlanRunner
+from agentic_local_app.execution.scratch import (
+    ENV_SCRATCH_DIR,
+    ENV_SESSION_ID,
+    ENV_WORKING_SPACE,
+    ScratchManager,
+)
 from agentic_local_app.observability.audit_log import AuditLog
 from agentic_local_app.observability.event_bus import EventBus, RecordingSubscriber
 from agentic_local_app.observability.execution_tracker import ExecutionTracker
@@ -99,6 +107,11 @@ def _chunk(task_id: str, ref: str, offset: int, max_bytes: int, **fields: Any) -
 
 def _with_execution(config: AppConfig, **execution: Any) -> AppConfig:
     return config.model_copy(update={"execution": config.execution.model_copy(update=execution)})
+
+
+def _is_dir(path: Path) -> bool:
+    """Filesystem probe kept out of the async bodies (ruff ASYNC240 forbids them there)."""
+    return path.is_dir()
 
 
 async def _settle(rounds: int = 25) -> None:
@@ -152,6 +165,7 @@ class Harness:
         failure_manager: FailureManager | None = None,
         max_total_duration_ms: int = 60_000,
         session_started: bool = True,
+        scratch: ScratchManager | None = None,
     ) -> Harness:
         fake = FakeCommandExecutor(clock)
         runner = PlanRunner(
@@ -163,6 +177,7 @@ class Harness:
             ids,
             config,
             failure_manager=failure_manager,
+            scratch=scratch,
         )
         now = clock.now()
         session = SessionRecord(
@@ -543,6 +558,64 @@ async def given_default_shell_when_run_then_spec_shell_is_none(harness: Harness)
     await harness.run(plan, tasks)
     spec = harness.fake.calls[0]
     assert spec.shell is None and spec.cwd == "." and spec.timeout_ms == 60_000
+    assert spec.env is None  # ADR-026: no scratch manager wired, no overlay at all
+
+
+async def given_scratch_manager_when_cmd_task_runs_then_spec_env_carries_the_working_space(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    """ADR-026: the working space reaches the command through ``env``; ``cwd`` is left alone."""
+    scratch = ScratchManager(
+        ScratchSection(root=str(tmp_path / "scratch"), archive_root=str(tmp_path / "archive")),
+        clock,
+    )
+    harness = Harness.build(store, bus, recorder, clock, ids, config, scratch=scratch)
+    plan, tasks = harness.plan([_cmd("t1"), _cmd("t2")])
+
+    await harness.run(plan, tasks)
+
+    created = tmp_path / "scratch" / SESSION_ID
+    assert _is_dir(created)
+    folder = str(created)
+    for spec in harness.fake.calls:
+        assert spec.env == {
+            ENV_SCRATCH_DIR: folder,
+            ENV_WORKING_SPACE: folder,
+            ENV_SESSION_ID: SESSION_ID,
+        }
+        assert spec.cwd == config.execution.cwd  # the folder is offered, never imposed
+
+
+async def given_disabled_scratch_when_cmd_task_runs_then_spec_env_stays_empty(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+    tmp_path: Path,
+) -> None:
+    scratch = ScratchManager(
+        ScratchSection(
+            enabled=False,
+            root=str(tmp_path / "scratch"),
+            archive_root=str(tmp_path / "archive"),
+        ),
+        clock,
+    )
+    harness = Harness.build(store, bus, recorder, clock, ids, config, scratch=scratch)
+    plan, tasks = harness.plan([_cmd("t1")])
+
+    await harness.run(plan, tasks)
+
+    assert harness.fake.calls[0].env is None
+    assert not _is_dir(tmp_path / "scratch")  # nothing created at all
 
 
 # ================================================================================================

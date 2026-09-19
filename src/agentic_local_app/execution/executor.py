@@ -1,4 +1,5 @@
-"""``CommandExecutor`` — the shell boundary (§3.8, §18.3 ; ADR-003, ADR-008, ADR-016, ADR-018).
+"""``CommandExecutor`` — the shell boundary (§3.8, §18.3 ; ADR-003, ADR-008, ADR-016, ADR-018,
+ADR-026).
 
 One ABC, one real implementation and one double:
 
@@ -51,7 +52,13 @@ __all__ = [
 class CommandSpec:
     """What to run: the model's ``cmd`` as-is, the effective timeout (ADR-008, already capped by the
     caller), the working directory and interpreter of the application (ADR-003), extra environment
-    variables merged over the inherited environment."""
+    variables merged over the inherited environment.
+
+    ``env`` is the one overlay of the specification: it carries the working space of the session
+    (``AGENTIC_SCRATCH_DIR`` / ``AGENTIC_WORKING_SPACE`` / ``AGENTIC_SESSION_ID``, ADR-026) filled
+    in by the plan runner. ``cwd`` stays ``[execution] cwd`` — the folder is offered through the
+    variables, the command still runs where the user's project is (ADR-026 §2).
+    """
 
     task_id: str
     cmd: str

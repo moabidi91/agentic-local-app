@@ -103,6 +103,19 @@ def given_repo_config_toml_when_loaded_then_identical_to_the_code_defaults() -> 
     assert from_file == AppConfig()
 
 
+def given_repo_config_toml_when_loaded_then_transport_is_the_only_model_profile() -> None:
+    """ADR-024: the shipped file declares no ``[models]``, so ``[transport]`` is the active profile.
+
+    The named profiles are documented as a commented example: uncommenting them must be the user's
+    decision, and the file must keep matching the code defaults (test above).
+    """
+    root = Path(__file__).resolve().parents[2]
+    cfg = load_config(root / "config.toml", environ={}, load_env_file=False)
+    assert cfg.models.active == "default"
+    assert list(cfg.models.profiles) == ["default"]
+    assert cfg.active_transport is cfg.transport
+
+
 def given_protocol_section_when_config_loaded_then_direct_response_allowed_by_default() -> None:
     """ADR-022: ``[protocol] allow_direct_response`` defaults to true and can be turned off."""
     assert AppConfig().protocol.allow_direct_response is True

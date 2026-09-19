@@ -208,4 +208,14 @@ class ConversationStore(ABC):
 
     # ---- maintenance ----------------------------------------------------------------------
     @abstractmethod
+    def reset(self) -> None:
+        """Drop **every** record, atomically; the store stays open and its schema unchanged.
+
+        Destructive and irreversible: sessions, conversations, cycles, plans, tasks, messages,
+        blobs, failures, retry decisions, context summaries and the audit chain all go. Only the
+        one gated administration route (``POST /admin/reset-database``, ``api
+        .allow_destructive_admin``) and the tests call it; nothing in the protocol loop ever does.
+        """
+
+    @abstractmethod
     def close(self) -> None: ...

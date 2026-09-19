@@ -13,7 +13,13 @@ from typing import Any
 import httpx
 import pytest
 
-from agentic_local_app.config import AppConfig, AppSection, ExecutionSection, TransportSection
+from agentic_local_app.config import (
+    AppConfig,
+    AppSection,
+    ExecutionSection,
+    ScratchSection,
+    TransportSection,
+)
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.ids import SequentialIdGenerator
 from agentic_local_app.domain.states import (
@@ -55,6 +61,11 @@ def _config(tmp_dir: str, *, close: bool = True) -> AppConfig:
     return AppConfig(
         app=AppSection(data_dir=tmp_dir),
         execution=ExecutionSection(interrupt_drain_timeout_ms=500, cancel_drain_timeout_ms=500),
+        # ADR-026: the working spaces of the run live under the temporary directory of the test,
+        # never under the ``./data/scratch`` of the defaults
+        scratch=ScratchSection(
+            root=f"{tmp_dir}/scratch", archive_root=f"{tmp_dir}/scratch-archive"
+        ),
         transport=TransportSection(
             init_url=BASE,
             post_url=BASE + "/{conversation_id}/messages",

@@ -49,7 +49,10 @@ from unit.test_phase7_examples_plugin import EXAMPLE_CONFIG
 pytestmark = pytest.mark.phase9
 
 THREAD = "thr_0001"
-ENV = {"ACME_API_KEY": "k-secret"}
+#: ADR-026: the example configuration keeps the defaults of ``[scratch]``, whose root is
+#: ``./data/scratch``; the suite writes nothing outside its temporary directories, so the section
+#: is switched off here the way an operator would, with an environment override.
+ENV = {"ACME_API_KEY": "k-secret", "AGENTIC__SCRATCH__ENABLED": "false"}
 
 
 def fenced_chunks(message: dict[str, Any], size: int = 9) -> dict[str, Any]:
