@@ -1,6 +1,6 @@
 # ADR-011 — Troncature stderr/stdout, plages d'octets, `chunk_request` avec `stream`
 
-**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md)
+**Statut** : accepté (2026-09-18) — amendé par [ADR-019](ADR-019-consolidation-vague-1.md) et, pour la **règle 1 de l'algorithme de troncature**, par [ADR-029](ADR-029-echec-d-outil-comme-verdict.md) §1 : stderr ne prend plus tout le budget, chaque flux garde au moins `B // 2` octets et la part inutilisée va à l'autre
 
 ## Contexte
 
@@ -12,12 +12,12 @@
 
 Soit `B` le budget effectif (ADR-010), `E` la taille de stderr, `O` la taille de stdout :
 
-1. `stderr_kept = min(E, B)` octets, **fin** de stderr conservée (les messages d'erreur utiles sont en général les derniers).
-2. `stdout_kept = min(O, B - stderr_kept)` octets, **fin** de stdout conservée.
+1. ~~`stderr_kept = min(E, B)` octets~~, **fin** de stderr conservée (les messages d'erreur utiles sont en général les derniers). **Remplacée par [ADR-029](ADR-029-echec-d-outil-comme-verdict.md) §1** : `stderr_kept = min(E, B // 2)`, augmenté de ce que stdout ne consomme pas de sa propre moitié.
+2. ~~`stdout_kept = min(O, B - stderr_kept)` octets~~, **fin** de stdout conservée. **Remplacée par ADR-029 §1** : `stdout_kept = min(O, B // 2)`, augmenté du reliquat laissé par stderr.
 3. `truncated = (stderr_kept < E) or (stdout_kept < O)` ; `original_size_bytes = E + O` ; et par flux : `stdout_total`, `stderr_total`.
 4. La coupe se fait sur une frontière d'octets ; le décodage UTF-8 ultérieur utilise `errors="replace"` (ADR-003), et la première ligne conservée peut donc être partielle — la plage exacte est fournie pour lever toute ambiguïté.
 
-Quand `E ≥ B`, stdout n'est pas transmis du tout (`stdout_kept = 0`) : stderr garde la priorité, conformément à l'intention de la spec, mais de façon réalisable.
+~~Quand `E ≥ B`, stdout n'est pas transmis du tout (`stdout_kept = 0`) : stderr garde la priorité, conformément à l'intention de la spec, mais de façon réalisable.~~ **Supprimé par [ADR-029](ADR-029-echec-d-outil-comme-verdict.md) §1** : cette conséquence supprimait en silence les diagnostics des outils de compilation JVM, qui les écrivent sur stdout pendant que stderr recueille le bruit de la JVM. La priorité de stderr ne subsiste que pour l'arbitrage du reliquat.
 
 ### Résultat de tâche (extension compatible de §12.5)
 

@@ -1,5 +1,5 @@
 """``PlanRunner`` — execute one plan exactly as received (§3.7, §8 ; ADR-003, ADR-006, ADR-008,
-ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026).
+ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026, ADR-029).
 
 One runner, one ``run`` per plan. The runner owns every plan and task transition (module map §2,
 rule 5): each one is validated against the tables of :mod:`agentic_local_app.domain.transitions`,
@@ -20,6 +20,10 @@ Scheduling (§2.4, §8.2 amended by the ADRs), the same loop for both policies:
 - before every launch the runner looks at the interruption token, then at the session duration
   budget: after the deadline no new task starts, the running ones finish normally, the rest is
   ``SKIPPED`` (``budget_exceeded``) and the plan ``FAILED`` (ADR-012 §3);
+- a non-zero exit from one of the ``execution.verdict_programs`` — a compiler, a build tool, a test
+  runner, a linter that **ran** — does not stop the plan (ADR-029 §2): its answer is the result the
+  plan exists to produce. An explicit ``critical`` / ``stop_plan_on_failure`` on that task still
+  stops it, a spawn error or a timeout is untouched, and the dependants are skipped as always;
 - after every task the stop conditions of §8.3 / ADR-009 apply; a stop in parallel mode cancels
   the running tasks (``plan_stopped``) and drains them for ``cancel_drain_timeout_ms`` — the
   executor does the two-phase termination — before the plan goes terminal (§17.2); an interruption
@@ -41,6 +45,14 @@ timestamps come from ``clock.now()``, blob identifiers from ``ids.blob_id()``.
 An optional :class:`~agentic_local_app.execution.scratch.ScratchManager` (ADR-026) adds the working
 space of the session to the environment of every ``cmd`` task; without one the environment overlay
 stays empty and nothing changes.
+
+The dialect dictionary of ADR-030 §4 is consulted **here**, at the ``RUNNING`` transition and
+nowhere else: the runner is the only component that both knows the command and decides what runs.
+What it decided travels in the ``task.state_changed`` payload of that transition — the command that
+really ran, the rules that fired, or the reason nothing was rewritten — so the **hash-chained audit
+log** carries the durable proof of what executed. Nothing is added to the persisted records: the
+``execution_result`` re-derives the same decision from the same ``cmd`` (:class:`ResultCollector`),
+exactly as ADR-029 §4 derives ``execution`` and ``failure_is_verdict`` rather than storing them.
 """
 
 from __future__ import annotations
@@ -54,6 +66,8 @@ from typing import Any, Protocol, TypeVar
 
 from agentic_local_app.config import AppConfig, ExecutionSection
 from agentic_local_app.domain.clock import Clock
+from agentic_local_app.domain.commands import VerdictPrograms
+from agentic_local_app.domain.dialects import CommandTranslation, ShellTranslator
 from agentic_local_app.domain.errors import GenericSystemError, NormalizedError, TaskExecutionError
 from agentic_local_app.domain.events import Event, EventType, state_change_payload
 from agentic_local_app.domain.ids import IdGenerator
@@ -93,6 +107,7 @@ from agentic_local_app.execution.payload_guard import (
     PayloadGuard,
     TruncatedOutput,
 )
+from agentic_local_app.execution.platform import default_translator
 from agentic_local_app.execution.result_collector import ResultCollector
 from agentic_local_app.execution.scratch import ScratchManager
 from agentic_local_app.observability.event_bus import EventBus
@@ -203,6 +218,7 @@ class PlanRunner:
         failure_manager: FailureRecorder | None = None,
         result_collector: ResultCollector | None = None,
         scratch: ScratchManager | None = None,
+        translator: ShellTranslator | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
@@ -212,9 +228,18 @@ class PlanRunner:
         self.ids = ids
         self.config = config
         self.failure_manager = failure_manager
-        self.result_collector = result_collector or ResultCollector()
+        #: ADR-029 §2: the programs whose non-zero exit is a verdict, read once per runner.
+        self.verdict_programs = VerdictPrograms(config.execution.verdict_programs)
         #: ADR-026: the working spaces. ``None`` exports nothing, as before the ADR.
         self.scratch = scratch
+        #: ADR-030 §4: the dialect dictionary, aimed at the shell this machine actually runs.
+        #: Injected in tests so that no plan depends on the machine the suite runs on.
+        self.translator = (
+            translator if translator is not None else default_translator(config.execution)
+        )
+        self.result_collector = result_collector or ResultCollector(
+            self.verdict_programs, self.translator
+        )
 
     async def run(
         self,
@@ -263,6 +288,9 @@ class _PlanExecution:
         self._held_locks: set[str] = set()
         self._outputs: dict[str, TruncatedOutput] = {}
         self._chunks: dict[str, ChunkResult] = {}
+        #: ADR-030 §4: what the dialect dictionary decided, for the length of this run only —
+        #: it names the command handed to the executor and what the audit event reports.
+        self._translations: dict[str, CommandTranslation] = {}
         self._stop_reason: str | None = None
         self._interrupting = False
         self._budget_exceeded = False
@@ -478,12 +506,18 @@ class _PlanExecution:
 
     def _launch(self, task_id: str) -> None:
         """§8.2 steps 3–5: hold the lock, ``PENDING -> RUNNING`` persisted then published, then
-        hand the task to a worker coroutine."""
+        hand the task to a worker coroutine.
+
+        The dialect dictionary is consulted here (ADR-030 §4) and what it decided travels with the
+        transition: it is written in the same transaction, so a command can never run without its
+        record already saying which one ran.
+        """
         task = self._tasks[task_id]
         if task.resource_lock is not None:
             self._held_locks.add(task.resource_lock)
         token = CancellationToken()
         self._tokens[task_id] = token
+        self._decide_translation(task)
         self._apply_changes(
             [
                 _Change(
@@ -496,6 +530,21 @@ class _PlanExecution:
         self._started_monotonic[task_id] = self._clock.monotonic_ms()
         self._running[task_id] = asyncio.ensure_future(self._execute(task_id, token))
 
+    def _decide_translation(self, task: TaskRecord) -> None:
+        """Consult the dialect dictionary for this command, once, before it runs (ADR-030 §4).
+
+        The decision is kept for the length of the run: it names the command the executor receives
+        and it is published with the ``RUNNING`` transition, which the audit log chains. Nothing is
+        persisted on the record — the ``execution_result`` re-derives the same answer from the same
+        ``cmd``. No entry — the ordinary case — means the dictionary was not even consulted: the
+        command is dialect-neutral, the shell already speaks its dialect, or translation is off.
+        """
+        if task.type is not TaskType.CMD:
+            return
+        decided = self._runner.translator.translate(task.cmd)
+        if decided is not None:
+            self._translations[task.task_id] = decided
+
     async def _execute(self, task_id: str, token: CancellationToken) -> _Ended:
         task = self._tasks[task_id]
         if task.type is TaskType.CHUNK_REQUEST:
@@ -504,9 +553,10 @@ class _PlanExecution:
         # commands are about the user's project, the folder is offered, never imposed.
         scratch = self._runner.scratch
         env = scratch.environment(task.session_id) if scratch is not None else {}
+        decided = self._translations.get(task_id)
         spec = CommandSpec(
             task_id=task_id,
-            cmd=task.cmd or "",
+            cmd=decided.executed if decided is not None else (task.cmd or ""),
             timeout_ms=self._timeout_ms(task),
             cwd=self._config.cwd,
             shell=self._config.shell or None,
@@ -694,12 +744,31 @@ class _PlanExecution:
         if state is TaskState.COMPLETED and task.stop_plan_on_success:
             return PlanState.SHORT_CIRCUITED_ON_SUCCESS, f"{_STOP_ON_SUCCESS}:{task_id}"
         if state in FAILED_TASK_STATES and task.stops_plan_on_failure:
+            if self._failure_is_verdict(task, state) and not (
+                task.critical or task.stop_plan_on_failure
+            ):
+                return None
             critical, on_failure, plain = _STOP_LABELS
             label = (
                 critical if task.critical else on_failure if task.stop_plan_on_failure else plain
             )
             return PlanState.STOPPED_ON_FAILURE, f"{label}:{task_id}"
         return None
+
+    def _failure_is_verdict(self, task: TaskRecord, state: TaskState) -> bool:
+        """ADR-029 §2: a recognised program that **ran** and answered with a non-zero exit code.
+
+        Its answer is the result the plan was written to obtain, so the plan carries on reading it;
+        only an explicit ``critical`` / ``stop_plan_on_failure`` still stops it. A command that
+        could not be started or that timed out never produced an answer and is untouched by this.
+        """
+        return (
+            state is TaskState.FAILED
+            and task.type is TaskType.CMD
+            and self._runner.verdict_programs.is_verdict(
+                task.cmd, task.exit_code, timed_out=task.timed_out
+            )
+        )
 
     async def _drain(self, token_reason: str, timeout_ms: int) -> None:
         """Signal every running task, wait at most ``timeout_ms`` for the executor to come back,
@@ -795,6 +864,8 @@ class _PlanExecution:
         for current, record, change in applied:
             self._tasks[record.task_id] = record
             payload = state_change_payload(current.status.value, record.status.value, change.reason)
+            if record.status is TaskState.RUNNING:
+                payload.update(self._translation_payload(record.task_id))
             if current.status is TaskState.RUNNING:
                 payload["exit_code"] = record.exit_code
                 payload["duration_ms"] = record.duration_ms
@@ -803,6 +874,25 @@ class _PlanExecution:
             self._publish(
                 EventType.TASK_STATE_CHANGED, now, task_id=record.task_id, payload=payload
             )
+
+    def _translation_payload(self, task_id: str) -> dict[str, Any]:
+        """ADR-030 §4: what the audit trail says about the command of a task that starts.
+
+        The ``task.state_changed`` event is hash-chained by the audit log, so **this** is the
+        durable proof of what really executed — there is no column, and none is needed.
+        """
+        decided = self._translations.get(task_id)
+        if decided is None:
+            return {}
+        payload: dict[str, Any] = {
+            "translated_to": decided.target.value,
+            "translation_rules": list(decided.rules),
+        }
+        if decided.translated:
+            payload["cmd_executed"] = decided.executed
+        elif decided.reason is not None:
+            payload["translation_note"] = decided.reason
+        return payload
 
     def _persist_pid(self, task_id: str, pid: int, process_group_id: int | None) -> None:
         """ADR-016 §1: the process identity is written as soon as the process exists, silently."""

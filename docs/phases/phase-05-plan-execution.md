@@ -269,12 +269,13 @@ En mode `sequential`, `WAITING_DEPENDENCY` n'est jamais utilisé : les dépendan
 | `FAILED` / `TIMED_OUT` | `critical` | `STOPPED_ON_FAILURE` | `critical_task_failed:<id>` | idem | idem |
 | `FAILED` / `TIMED_OUT` | `stop_plan_on_failure` | `STOPPED_ON_FAILURE` | `stop_plan_on_failure:<id>` | idem | idem |
 | `FAILED` / `TIMED_OUT` | `not continue_on_error` | `STOPPED_ON_FAILURE` | `task_failed:<id>` | idem | idem |
+| `FAILED` | `not continue_on_error`, mais la commande **a tourné** et invoque un programme de `execution.verdict_programs` (ADR-029 §2) | le plan continue | — | — | dépendants `SKIPPED` `dependency_failed:<id>` |
 | `FAILED` / `TIMED_OUT` | `continue_on_error` seul | le plan continue | — | — | dépendants `SKIPPED` `dependency_failed:<id>` |
 | toutes terminales | — | `COMPLETED` | `null` | — | — |
 | interruption | jeton levé | `INTERRUPTED` | `user_interrupt` | `INTERRUPTED` `user_interrupt` | `INTERRUPTED` `user_interrupt` |
 | échéance de durée | avant un lancement | `FAILED` | `budget_exceeded:max_total_duration_ms` | finissent normalement | `SKIPPED` `budget_exceeded` |
 
-Les 16 combinaisons des quatre drapeaux × {succès, échec} sont la table paramétrée `given_flag_combination_…` (32 cas), plus le cas « aucun drapeau » (défauts d'ADR-009 §1 : l'échec arrête le plan).
+Les 16 combinaisons des quatre drapeaux × {succès, échec} sont la table paramétrée `given_flag_combination_…` (32 cas), plus le cas « aucun drapeau » (défauts d'ADR-009 §1 : l'échec arrête le plan). Elle porte sur des commandes ordinaires et n'est pas modifiée par ADR-029 : la ligne du verdict ne s'applique qu'à un programme reconnu, et jamais quand le modèle a écrit `critical` ou `stop_plan_on_failure`.
 
 **Issue de l'exécution → état terminal de la tâche (`_finish`)** :
 

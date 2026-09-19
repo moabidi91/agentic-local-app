@@ -1,7 +1,9 @@
 """ProtocolAdapter — build outbound messages, parse and validate inbound ones (spec §3.5).
 
-The adapter is **pure**: no I/O, no clock of its own (``plan_to_records`` receives the ``Clock``),
-no identifier generation (``message_id`` is passed in by the caller, ADR-017). It owns:
+The adapter is **pure**: no clock of its own (``plan_to_records`` receives the ``Clock``), no
+identifier generation (``message_id`` is passed in by the caller, ADR-017), and no I/O — with one
+named exception, :func:`render_instructions`, which looks the shell up on the ``PATH`` to announce
+it (ADR-030 §3) unless the caller passes the :class:`ExecutionEnvironment` itself. It owns:
 
 - the construction of the four outbound types (§12.1, §12.5, §12.8 + ADR-014, and the
   ``protocol_correction_request`` of ADR-023) as canonical JSON;
@@ -30,6 +32,7 @@ than serialised as ``null`` (the model reads absence as "no stop reason").
 from __future__ import annotations
 
 import re
+import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,6 +47,7 @@ from pydantic import BaseModel, ValidationError
 from agentic_local_app.config import AppConfig
 from agentic_local_app.domain.canonical import canonical_json, size_bytes
 from agentic_local_app.domain.clock import Clock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import NormalizedError, ProtocolError
 from agentic_local_app.domain.models import (
     ConversationRecord,
@@ -52,6 +56,12 @@ from agentic_local_app.domain.models import (
     SessionBudget,
     SessionRecord,
     TaskRecord,
+)
+from agentic_local_app.domain.shell import (
+    ExecutionEnvironment,
+    ShellDialect,
+    ShellSource,
+    describe_environment,
 )
 from agentic_local_app.domain.states import (
     INBOUND_MESSAGE_TYPES,
@@ -241,6 +251,16 @@ def situation_for(
             raise ValueError(f"{other.value} is not an outbound message type")
 
 
+def _resolve_continue_on_error(declared: bool | None, plan_default: bool | None) -> bool:
+    """ADR-029 §3: ``task ?? plan ?? false``, resolved exactly like ``default_max_output_bytes``
+    (ADR-010). The effective rule of ADR-009 §2 then runs verbatim on this value."""
+    if declared is not None:
+        return declared
+    if plan_default is not None:
+        return plan_default
+    return False
+
+
 # ------------------------------------------------------------------------------------------------
 # Instructions (ADR-004)
 # ------------------------------------------------------------------------------------------------
@@ -298,16 +318,109 @@ _CORRECTION_BUDGET_RULE_OFF = (
     "`protocol_correction_request`, and the first refused reply ends the session. This section is "
     "kept so that the protocol text reads the same everywhere."
 )
+_VERDICT_RULE_ON = (
+    "**One exception, and it is the important one.** Some programs answer by their exit code: a "
+    "compiler that refuses to compile, a test runner that reports a failing test, a linter that "
+    "finds a fault. Their non-zero exit is the **result** you asked for, not something that went "
+    "wrong. When the command of a task starts one of them — {verdict_programs} — and that command "
+    '**ran** (`execution: "ran"`), a non-zero exit does **not** stop the plan, and the result '
+    "carries `failure_is_verdict: true`. The rest of your plan runs, so you get the diagnosis in "
+    "one turn instead of one exit code. Write `critical: true` or `stop_plan_on_failure: true` on "
+    "that task when you do want the plan to stop there: an explicit instruction from you always "
+    "wins. A command that could not be started or that timed out never answered, so it is not a "
+    "verdict and stops the plan as usual."
+)
+_VERDICT_RULE_OFF = (
+    "This deployment recognises no program whose non-zero exit is a result rather than a failure "
+    "(`execution.verdict_programs` is empty), so the rule above applies to every command without "
+    "exception."
+)
+#: ADR-030 §3 — how the shell was decided, in the model's words.
+_SHELL_SOURCES: Mapping[ShellSource, str] = MappingProxyType(
+    {
+        ShellSource.CONFIGURED: "chosen by the operator",
+        ShellSource.DETECTED: "found on this machine",
+        ShellSource.DEFAULT: "the default, nothing else was found",
+    }
+)
+#: ADR-030 §3 — one line of concrete advice per detected dialect, next to the announcement.
+_DIALECT_HINTS: Mapping[ShellDialect, str] = MappingProxyType(
+    {
+        ShellDialect.POWERSHELL: (
+            "That means PowerShell: `Get-ChildItem` rather than `ls -la`, `Get-Content` rather "
+            "than `cat`, `$env:JAVA_HOME` rather than `$JAVA_HOME`, and `;` rather than `&&` "
+            "between two commands."
+        ),
+        ShellDialect.POSIX: (
+            "That means a POSIX shell: `ls -la` rather than `Get-ChildItem`, `cat` rather than "
+            "`Get-Content`, `$JAVA_HOME` rather than `$env:JAVA_HOME`."
+        ),
+        ShellDialect.CMD: (
+            "That means the Windows command interpreter: `dir` rather than `ls`, `type` rather "
+            "than `cat`, `%JAVA_HOME%` rather than `$JAVA_HOME`."
+        ),
+        ShellDialect.UNKNOWN: (
+            "The application does not recognise that interpreter, so it can give you no dialect: "
+            "confirm with a `discovery_plan` before relying on any syntax."
+        ),
+    }
+)
+_TRANSLATION_RULE_ON = (
+    "**If you write for the other dialect, the application may translate — and always tells you.** "
+    "A command is rewritten only when a small, fixed dictionary maps it *exactly*: the common "
+    "read-only utilities (`ls`, `cat`, `head`, `tail`, `pwd`, `echo`, `which`, `env`) and "
+    "environment-variable syntax (`$NAME` / `$env:NAME`). Whenever that dictionary is consulted, "
+    "the task result carries a `translation` object (section 2.2) with what you wrote, what "
+    "actually ran, and the rules that fired. When it cannot map the command with certainty — a "
+    "pipeline, a redirection, a wildcard, a substitution, anything that creates, moves or deletes, "
+    "anything whose pattern language or exit code differs between the two shells — your command "
+    "runs **exactly as you wrote it** and `translation.reason` says what stopped the dictionary. "
+    "Read that reason and rewrite the command yourself: nothing is ever guessed on your behalf."
+)
+_TRANSLATION_RULE_OFF = (
+    "This deployment never rewrites a command (`execution.translate_commands = false`): what you "
+    "write is what runs, character for character. A command written for another shell simply "
+    "fails, and no result carries a `translation` object."
+)
 
 
-def render_instructions(config: AppConfig) -> str:
+def render_instructions(
+    config: AppConfig, *, environment: ExecutionEnvironment | None = None
+) -> str:
     """The protocol text sent to the model at init, with the configured limits injected, the
-    first-message rule of ADR-022 rendered from ``protocol.allow_direct_response`` and the
-    correction policy of ADR-023 rendered from ``protocol.max_correction_attempts``."""
+    first-message rule of ADR-022 rendered from ``protocol.allow_direct_response``, the correction
+    policy of ADR-023 rendered from ``protocol.max_correction_attempts``, the verdict rule of
+    ADR-029 rendered from ``execution.verdict_programs`` and the environment announcement of
+    ADR-030 §3.
+
+    ``environment`` is the announcement to render; when it is not given it is detected from the
+    configuration (:func:`~agentic_local_app.domain.shell.describe_environment`, ``shutil.which``).
+    Passing it is how a test pins the announcement without depending on the machine it runs on.
+    """
     direct = config.protocol.allow_direct_response
     attempts = config.protocol.max_correction_attempts
     corrects = attempts > 0
+    programs = config.execution.verdict_programs
+    where = (
+        environment
+        if environment is not None
+        else describe_environment(
+            config.execution.shell, config.execution.cwd, platform=sys.platform
+        )
+    )
     values = {
+        "environment_os": where.operating_system,
+        "environment_shell": where.shell.program,
+        "environment_shell_source": _SHELL_SOURCES[where.shell.source],
+        "environment_dialect": where.dialect.value,
+        "environment_dialect_hint": _DIALECT_HINTS[where.dialect],
+        "environment_cwd": where.cwd,
+        # the translator itself is the authority on whether a table exists for this shell
+        "translation_rule": (
+            _TRANSLATION_RULE_ON
+            if ShellTranslator(where.dialect, enabled=config.execution.translate_commands).enabled
+            else _TRANSLATION_RULE_OFF
+        ),
         "default_max_output_bytes": config.payload.default_max_output_bytes,
         "hard_max_output_bytes": config.payload.hard_max_output_bytes,
         "max_message_bytes": config.payload.max_message_bytes,
@@ -329,6 +442,13 @@ def render_instructions(config: AppConfig) -> str:
             _CORRECTION_BUDGET_RULE_ON.format(max_correction_attempts=attempts)
             if corrects
             else _CORRECTION_BUDGET_RULE_OFF
+        ),
+        "verdict_rule": (
+            _VERDICT_RULE_ON.format(
+                verdict_programs=", ".join(f"`{program}`" for program in programs)
+            )
+            if programs
+            else _VERDICT_RULE_OFF
         ),
     }
 
@@ -1120,7 +1240,9 @@ class ProtocolAdapter:
         ):
             warnings.append("WORKERS_IGNORED_IN_SEQUENTIAL")
         for task in plan.tasks:
-            if task.critical and task.continue_on_error:
+            if task.critical and _resolve_continue_on_error(
+                task.continue_on_error, plan.default_continue_on_error
+            ):
                 warnings.append(f"CONTRADICTORY_FLAGS:{task.task_id}")
 
     def _validate_user_response(self, response: UserResponseContent, message_id: str) -> None:
@@ -1185,17 +1307,24 @@ class ProtocolAdapter:
             updated_at=now,
         )
         tasks = [
-            self._task_record(task, index, plan_record, now)
+            self._task_record(task, index, plan_record, now, plan.default_continue_on_error)
             for index, task in enumerate(plan.tasks)
         ]
         return plan_record, tasks
 
     def _task_record(
-        self, task: TaskMessage, index: int, plan: PlanRecord, now: datetime
+        self,
+        task: TaskMessage,
+        index: int,
+        plan: PlanRecord,
+        now: datetime,
+        default_continue_on_error: bool | None = None,
     ) -> TaskRecord:
         payload_cfg, exec_cfg = self.config.payload, self.config.execution
         critical = bool(task.critical)
-        continue_on_error = bool(task.continue_on_error)
+        continue_on_error = _resolve_continue_on_error(
+            task.continue_on_error, default_continue_on_error
+        )
         stop_plan_on_failure = bool(task.stop_plan_on_failure)
 
         declared_budget = task.max_output_bytes
@@ -1258,6 +1387,8 @@ class ProtocolAdapter:
 
     # -------------------------------------------------------------------------- instructions
     @staticmethod
-    def render_instructions(config: AppConfig) -> str:
+    def render_instructions(
+        config: AppConfig, *, environment: ExecutionEnvironment | None = None
+    ) -> str:
         """See :func:`render_instructions`."""
-        return render_instructions(config)
+        return render_instructions(config, environment=environment)

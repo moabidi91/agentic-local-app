@@ -8,7 +8,8 @@ message, the way a sign-in screen does, and nothing is sent to the model until t
 ``user_response``, ADR-022; ``credentials`` hands over a token and ``resume`` restarts a session
 paused on a 401, ADR-025), ``config show`` / ``config validate``, ``transport list`` /
 ``transport show`` (the pluggable transport providers of ADR-020; ``show`` also names the effective
-message codec), ``codec list`` / ``codec show`` (the message codecs of ADR-021), ``mock-server``
+message codec), ``codec list`` / ``codec show`` (the message codecs of ADR-021), ``shell show`` /
+``shell rules`` (the detected shell and the dialect dictionary of ADR-030), ``mock-server``
 (the scripted model), ``version``.
 
 Everything external is injectable through :class:`CliDependencies` (``ctx.obj``): the application
@@ -49,10 +50,12 @@ from rich.text import Text
 
 from agentic_local_app import __version__
 from agentic_local_app.config import AppConfig, load_config
+from agentic_local_app.domain.dialects import REFUSED_PROGRAMS, describe_dictionary
 from agentic_local_app.domain.errors import AppError, ConfigError, NormalizedError
 from agentic_local_app.domain.events import Event, EventType
 from agentic_local_app.domain.models import SessionBudget, SessionRecord
 from agentic_local_app.domain.states import SessionState
+from agentic_local_app.execution.platform import default_translator, select_platform
 from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
@@ -131,10 +134,14 @@ transport_app = typer.Typer(
     help="Transport providers: list the available ones, show the effective one (and its codec)."
 )
 codec_app = typer.Typer(help="Message codecs: list the available ones, show the effective one.")
+shell_app = typer.Typer(
+    help="Shell: show the detected one, list the dialect translation rules (ADR-030)."
+)
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
 app.add_typer(transport_app, name="transport")
 app.add_typer(codec_app, name="codec")
+app.add_typer(shell_app, name="shell")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", help="Path of config.toml (else AGENTIC_APP_CONFIG).")
@@ -1057,6 +1064,14 @@ def config_validate(ctx: typer.Context, config: ConfigOption = None) -> None:
 # ================================================================================================
 # transport list · transport show (ADR-020) · codec list · codec show (ADR-021)
 # ================================================================================================
+def _print_rows(rows: list[dict[str, str]], columns: tuple[str, ...]) -> None:
+    """A plain aligned table: the header, then one line per row, trailing padding stripped."""
+    widths = {key: max(len(key), *(len(row[key]) for row in rows)) for key in columns}
+    typer.echo("  ".join(key.upper().ljust(widths[key]) for key in columns).rstrip())
+    for row in rows:
+        typer.echo("  ".join(row[key].ljust(widths[key]) for key in columns).rstrip())
+
+
 def _print_plugin_table(infos: list[PluginInfo], json_output: bool) -> None:
     rows = [
         {"name": info.name, "class": info.qualified_name, "origin": info.origin} for info in infos
@@ -1064,11 +1079,7 @@ def _print_plugin_table(infos: list[PluginInfo], json_output: bool) -> None:
     if json_output:
         typer.echo(json.dumps(rows, indent=2, sort_keys=True))
         return
-    columns = ("name", "class", "origin")
-    widths = {key: max(len(key), *(len(row[key]) for row in rows)) for key in columns}
-    typer.echo("  ".join(key.upper().ljust(widths[key]) for key in columns).rstrip())
-    for row in rows:
-        typer.echo("  ".join(row[key].ljust(widths[key]) for key in columns).rstrip())
+    _print_rows(rows, ("name", "class", "origin"))
 
 
 def _describe_plugin(
@@ -1152,6 +1163,60 @@ def codec_show(
     for key in ("codec", "class", "origin", "options_model"):
         typer.echo(f"{key}: {_value(document[key])}")
     typer.echo(f"options: {json.dumps(document['options'], indent=2, sort_keys=True)}")
+
+
+# ================================================================================================
+# shell show · shell rules (ADR-030) — the sibling of ``transport list`` / ``codec list``
+# ================================================================================================
+def _shell_document(cfg: AppConfig) -> dict[str, Any]:
+    environment = select_platform(cfg.execution).environment()
+    translator = default_translator(cfg.execution)
+    return {
+        "operating_system": environment.operating_system,
+        "shell": environment.shell.program,
+        "shell_name": environment.shell.name,
+        "dialect": environment.shell.dialect.value,
+        "source": environment.shell.source.value,
+        "cwd": environment.cwd,
+        "translate_commands": cfg.execution.translate_commands,
+        "translation_enabled": translator.enabled,
+        "translates_from": translator.source.value if translator.enabled else None,
+    }
+
+
+@shell_app.command("show")
+def shell_show(
+    ctx: typer.Context, config: ConfigOption = None, json_output: JsonOption = False
+) -> None:
+    """Show the shell this machine will run commands with, and whether translation is on."""
+    document = _shell_document(_load(_config_path(ctx, config)))
+    if json_output:
+        typer.echo(json.dumps(document, indent=2, sort_keys=True, default=str))
+        return
+    for key, value in document.items():
+        typer.echo(f"{key}: {_value(value)}")
+
+
+@shell_app.command("rules")
+def shell_rules(json_output: JsonOption = False) -> None:
+    """List the dialect translation rules, and the programs deliberately left alone."""
+    rules = describe_dictionary()
+    refused = [
+        {
+            "program": entry.program,
+            "from": entry.source.value,
+            "to": entry.target.value,
+            "reason": entry.reason,
+        }
+        for entry in REFUSED_PROGRAMS
+    ]
+    if json_output:
+        typer.echo(json.dumps({"rules": rules, "refused": refused}, indent=2, sort_keys=True))
+        return
+    _print_rows(rules, ("rule", "from", "to", "source_form", "target_form"))
+    typer.echo("")
+    typer.echo("Recognised and deliberately NOT translated:")
+    _print_rows(refused, ("program", "from", "to", "reason"))
 
 
 @app.command()

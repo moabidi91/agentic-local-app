@@ -22,9 +22,11 @@ from typing import Any
 import pytest
 
 from agentic_local_app.domain.canonical import size_bytes
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ConfigError, ErrorType, TransportError
 from agentic_local_app.domain.events import EventType
 from agentic_local_app.domain.models import SessionBudget
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ContextWindowState,
     ConversationState,
@@ -160,6 +162,7 @@ async def given_scripted_java_scenario_when_session_runs_then_three_canonical_me
     assert t1 == {
         "task_id": "t1",
         "status": "completed",
+        "execution": "ran",  # ADR-029 §4
         "exit_code": 0,
         "stdout": decode_output(OUT_UNAME),
         "stderr": "",
@@ -643,6 +646,7 @@ async def given_truncated_output_when_chunk_request_received_then_range_served_f
     assert chunk == {
         "task_id": "t-chunk-1",
         "status": "completed",
+        "execution": "ran",  # ADR-029 §4: a local read always happens
         "stdout": "",
         "stderr": "",
         "truncated": False,
@@ -823,6 +827,44 @@ async def given_plan_running_when_user_interrupts_then_everything_interrupted_an
     assert kinds[-1] == ("interruption.completed", None)
     assert kinds[-2] == ("session.state_changed", "READY")
     assert rig.app.audit.verify(sid).valid is True
+
+
+async def given_powershell_machine_when_posix_command_planned_then_audit_and_result_agree() -> None:
+    """ADR-030 §4 end to end: nothing is persisted on the task, everything is traced and derived.
+
+    The trace of what really executed lives in the **hash-chained audit log**, the model reads the
+    same decision re-derived from the same command, and the schema knows nothing about either.
+    """
+    rig = make_rig(translator=ShellTranslator(ShellDialect.POWERSHELL))
+    rig.executor.script(cmd="Get-ChildItem -Force", stdout=b"Mode  LastWriteTime  Name")
+    rig.reply(REMOTE_1, discovery_plan(tasks=[cmd_task("t1", "ls -la")]))
+    rig.reply(REMOTE_1, final_answer())
+    session = await rig.start()
+    sid = session.session_id
+    await rig.wait(sid)
+
+    # the shell received the translated command, and the scripted output proves it matched
+    assert [call.cmd for call in rig.executor.calls] == ["Get-ChildItem -Force"]
+    # the record keeps the command the model wrote, and nothing else: no column was added
+    task = rig.store.list_tasks(session_id=sid)[0]
+    assert task.cmd == "ls -la"
+    assert not any(name.startswith("translat") for name in type(task).model_fields)
+    # the durable trace is the audit event of the RUNNING transition, inside a valid chain
+    running = [
+        event
+        for event in rig.store.list_audit_events(sid)
+        if event.event_type == EventType.TASK_STATE_CHANGED.value
+        and event.payload.get("to") == "RUNNING"
+    ]
+    assert running and running[0].payload["cmd_executed"] == "Get-ChildItem -Force"
+    assert running[0].payload["translation_rules"] == ["list-directory"]
+    assert rig.app.audit.verify(sid).valid is True
+    # and the model was told both forms, derived from the same command
+    posted = [p for _, p in rig.transport.posted if p["type"] == "execution_result"]
+    translation = posted[0]["content"]["results"][0]["translation"]
+    assert translation["original_cmd"] == "ls -la"
+    assert translation["executed_cmd"] == "Get-ChildItem -Force"
+    assert translation["status"] == "translated"
 
 
 async def given_interrupted_session_when_new_request_then_new_child_conversation_runs_to_final_answer(

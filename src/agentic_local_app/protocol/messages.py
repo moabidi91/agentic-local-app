@@ -6,6 +6,8 @@ Every extension is **optional** so that the examples of the specification valida
 - ``PlanContent.default_max_output_bytes`` (ADR-010), ``PlanContent.state_summary`` (ADR-005)
 - ``TaskResult.*_total``, ``*_range``, ``max_output_bytes_applied``, ``timed_out``, chunk fields (ADR-011)
 - ``ExecutionResultContent.skipped_tasks`` etc. carry ``{task_id, reason}`` objects (ADR-009)
+- ``PlanContent.default_continue_on_error`` (ADR-029 §3), ``TaskResult.execution`` /
+  ``TaskResult.failure_is_verdict`` / ``TaskRef.execution`` (ADR-029 §4)
 - ``ContextResumeRequestContent.pending_message_type`` (ADR-014)
 - ``UserResponseContent``, a new inbound type: the model's direct answer to the user (ADR-022)
 - ``ProtocolCorrectionRequestContent``, a new outbound type: the application asks the model to fix
@@ -112,6 +114,9 @@ class PlanContent(ProtocolModel):
     execution_policy: ExecutionPolicy
     max_parallel_workers: int | None = Field(default=None, ge=1)
     default_max_output_bytes: int | None = Field(default=None, gt=0)
+    #: ADR-029 §3: the plan-level default of the tasks that declare no ``continue_on_error``,
+    #: resolved exactly like ``default_max_output_bytes`` (``task ?? plan ?? false``).
+    default_continue_on_error: bool | None = None
     state_summary: StateSummary | None = None
     tasks: list[TaskMessage] = Field(min_length=1)
 
@@ -119,10 +124,40 @@ class PlanContent(ProtocolModel):
 # ------------------------------------------------------------------------------------------------
 # 12.5 execution_result (+ ADR-009 reasons, ADR-011 ranges and chunk results)
 # ------------------------------------------------------------------------------------------------
+#: What became of a task's command (ADR-029 §4). ``ran`` = it ran to the end and ``exit_code`` is
+#: its answer; ``not_started`` = no command ever ran, so there is no output to read; ``timed_out``
+#: and ``stopped`` = it started and the application ended it, so the output is partial.
+TaskExecution = Literal["ran", "not_started", "timed_out", "stopped"]
+
+
+class TaskTranslation(ProtocolModel):
+    """What the dialect dictionary did with this task's command (ADR-030 §4).
+
+    Present on a result **only** when a translation was attempted, that is when the command was
+    written in the other dialect than the shell that ran it. ``status`` says how it ended:
+    ``translated`` — ``executed_cmd`` is what really ran and ``rules`` names the rules that fired;
+    ``unchanged`` — the command ran exactly as written and ``reason`` says what stopped the
+    dictionary, so the model can rewrite it itself.
+    """
+
+    status: Literal["translated", "unchanged"]
+    from_dialect: str
+    to_dialect: str
+    original_cmd: str
+    executed_cmd: str
+    rules: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class TaskResult(ProtocolModel):
     task_id: str
     status: str  # lower-case TaskState (completed | failed | timed_out)
+    # ADR-029 §4: what became of the command, and whether its non-zero exit is a verdict
+    execution: TaskExecution = "ran"
     exit_code: int | None = None
+    failure_is_verdict: bool | None = None
+    #: ADR-030 §4, absent unless the command and the shell spoke different dialects
+    translation: TaskTranslation | None = None
     stdout: str = ""
     stderr: str = ""
     truncated: bool = False
@@ -148,6 +183,9 @@ class TaskResult(ProtocolModel):
 class TaskRef(ProtocolModel):
     task_id: str
     reason: str
+    #: ADR-029 §4: ``not_started`` for a skipped task, ``stopped`` for a cancelled or interrupted
+    #: one. The same vocabulary as ``TaskResult.execution``, so the whole message reads alike.
+    execution: TaskExecution = "not_started"
 
 
 class ExecutionResultContent(ProtocolModel):

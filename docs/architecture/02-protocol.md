@@ -2,7 +2,7 @@
 
 **Ce que dit la spec.** Le modèle n'est piloté qu'à travers une grammaire fermée de messages ([§2.2](../spec/SPEC-v1.1.md#22-protocol-model)) : `user_request → discovery_plan → execution_result → execution_plan → execution_result → final_answer`, avec la branche `priority_clarification`, et les dix types de [§3.5](../spec/SPEC-v1.1.md#35-protocoladapter) dont les schémas sont donnés en [§12](../spec/SPEC-v1.1.md#12-protocol-message-schemas). Le `ProtocolAdapter` construit les messages sortants, parse et valide les entrants, et « rejette les réponses malformées ou non déterministes ». La phase 2 (§18.2) doit tester le rejet des messages inattendus *par état protocolaire*.
 
-**Ce que précisent les ADR.** [ADR-007](../adr/ADR-007-amendements-machines-a-etats.md) écrit la **table des messages attendus**, la validation structurelle des plans, fait de `system_error` un objet interne et de `chunk_request` un type de tâche ; [ADR-004](../adr/ADR-004-contrat-de-transport.md) définit le bootstrap des instructions du protocole et l'idempotence par `message_id` ; [ADR-005](../adr/ADR-005-resume-de-contexte-par-le-modele.md) ajoute `state_summary` aux plans ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) `timeout_ms` ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) les défauts des drapeaux et les objets `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) `default_max_output_bytes` et `max_output_bytes_applied` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) les plages, `stream` et le résultat de chunk ; [ADR-014](../adr/ADR-014-continuation-apres-rotation.md) `pending_message_type` et la retransmission ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) la sérialisation canonique et les identifiants injectés ; [ADR-022](../adr/ADR-022-reponse-utilisateur.md) ajoute le type entrant `user_response` (réponse directe à l'utilisateur, corps opaque borné, question avec `expects_reply`) et le drapeau `protocol.allow_direct_response` sur la première réponse ; [ADR-023](../adr/ADR-023-politique-de-correction.md) ajoute le type **sortant** `protocol_correction_request` — une réponse inutilisable ne termine plus la session sur-le-champ, l'application cite la faute au modèle et relit — avec sa borne `protocol.max_correction_attempts`.
+**Ce que précisent les ADR.** [ADR-007](../adr/ADR-007-amendements-machines-a-etats.md) écrit la **table des messages attendus**, la validation structurelle des plans, fait de `system_error` un objet interne et de `chunk_request` un type de tâche ; [ADR-004](../adr/ADR-004-contrat-de-transport.md) définit le bootstrap des instructions du protocole et l'idempotence par `message_id` ; [ADR-005](../adr/ADR-005-resume-de-contexte-par-le-modele.md) ajoute `state_summary` aux plans ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) `timeout_ms` ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) les défauts des drapeaux et les objets `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) `default_max_output_bytes` et `max_output_bytes_applied` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) les plages, `stream` et le résultat de chunk ; [ADR-014](../adr/ADR-014-continuation-apres-rotation.md) `pending_message_type` et la retransmission ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) la sérialisation canonique et les identifiants injectés ; [ADR-022](../adr/ADR-022-reponse-utilisateur.md) ajoute le type entrant `user_response` (réponse directe à l'utilisateur, corps opaque borné, question avec `expects_reply`) et le drapeau `protocol.allow_direct_response` sur la première réponse ; [ADR-023](../adr/ADR-023-politique-de-correction.md) ajoute le type **sortant** `protocol_correction_request` — une réponse inutilisable ne termine plus la session sur-le-champ, l'application cite la faute au modèle et relit — avec sa borne `protocol.max_correction_attempts` ; [ADR-029](../adr/ADR-029-echec-d-outil-comme-verdict.md) ajoute `default_continue_on_error` au plan et, au résultat de tâche, `execution` (`ran` / `not_started` / `timed_out` / `stopped`) et `failure_is_verdict`.
 
 Les schémas pydantic sont dans [`protocol/messages.py`](../../src/agentic_local_app/protocol/messages.py) ; toutes les extensions sont **optionnelles**, de sorte que les exemples de §12 valident sans modification. L'adaptateur (`protocol/adapter.py`, phase 2) et le texte des instructions (`protocol/PROTOCOL_INSTRUCTIONS.md`) sont décrits ici par leur contrat.
 
@@ -43,10 +43,10 @@ Enveloppe commune (`Envelope`) : `type`, `conversation_id` (identifiant **distan
 | Type | Direction | Émetteur → récepteur | Contenu (§12) | Modèle pydantic | Extensions ADR | Cycle |
 |---|---|---|---|---|---|---|
 | `user_request` | sortant | application → modèle | `goal`, `user_message`, `session_budget {max_cycles, max_plans, max_total_duration_ms}` | `UserRequestContent` | — (le budget peut venir des défauts `[budget]`, ADR-012) | ouvre `discovery` (premier) ou le cycle du plan suivant (suivi) |
-| `discovery_plan` | entrant | modèle → application | `plan_id`, `objective`, `execution_policy`, `max_parallel_workers?`, `tasks[]` | `PlanContent` | `default_max_output_bytes` (ADR-010), `state_summary` (ADR-005), `Task.timeout_ms` (ADR-008), `Task.stream` (ADR-011) | `discovery` |
+| `discovery_plan` | entrant | modèle → application | `plan_id`, `objective`, `execution_policy`, `max_parallel_workers?`, `tasks[]` | `PlanContent` | `default_max_output_bytes` (ADR-010), `default_continue_on_error` (ADR-029), `state_summary` (ADR-005), `Task.timeout_ms` (ADR-008), `Task.stream` (ADR-011) | `discovery` |
 | `execution_plan` | entrant | modèle → application | idem | `PlanContent` | idem ; seul type qui porte des tâches `chunk_request` en pratique (§12.6) | `execution` |
 | `priority_clarification` | entrant | modèle → application | idem | `PlanContent` | idem | `clarification` |
-| `execution_result` | sortant | application → modèle | `plan_id`, `status`, `results[]`, `skipped_tasks[]`, `cancelled_tasks[]`, `interrupted_tasks[]`, `stop_reason` | `ExecutionResultContent`, `TaskResult`, `TaskRef` | `status` = statut du plan en minuscules (ADR-009) ; `TaskRef {task_id, reason}` (ADR-009) ; `*_total`, `*_range`, `max_output_bytes_applied`, `timed_out`, `timeout_ms_applied`, `duration_ms`, `reason`, champs de chunk (ADR-008/010/011) | clôt le cycle du plan, ouvre le suivant |
+| `execution_result` | sortant | application → modèle | `plan_id`, `status`, `results[]`, `skipped_tasks[]`, `cancelled_tasks[]`, `interrupted_tasks[]`, `stop_reason` | `ExecutionResultContent`, `TaskResult`, `TaskRef` | `status` = statut du plan en minuscules (ADR-009) ; `TaskRef {task_id, reason}` (ADR-009) ; `*_total`, `*_range`, `max_output_bytes_applied`, `timed_out`, `timeout_ms_applied`, `duration_ms`, `reason`, champs de chunk (ADR-008/010/011) ; `execution` ∈ {ran, not_started, timed_out, stopped} sur chaque résultat **et** sur chaque `TaskRef`, `failure_is_verdict: true` sur l'échec d'un outil reconnu (ADR-029 §4) | clôt le cycle du plan, ouvre le suivant |
 | `final_answer` | entrant | modèle → application | `status`, `diagnosis`, `evidence[]`, `recommended_next_step` | `FinalAnswerContent` (`extra = allow`) | — | clôt le cycle |
 | `user_response` | entrant | modèle → application | `format` (`text` \| `markdown` \| `json`, défaut `text`), `body` (chaîne non vide, **opaque** : jamais parsée), `status` (`completed` \| `partial` \| `failed`), `expects_reply` (défaut `false`) | `UserResponseContent` (`extra = forbid`) | type entier ajouté par ADR-022 (hors §12) ; `body` ≤ `payload.max_message_bytes` en UTF-8 (`USER_RESPONSE_TOO_LARGE`) | clôt le cycle, comme `final_answer` |
 | `context_resume_request` | sortant | application → modèle (conversation **enfant**) | `original_conversation_id`, `goal`, `context_summary` | `ContextResumeRequestContent` | `pending_message_type` (ADR-014) ; `context_summary` assemblé par le `ContextReducer` (ADR-005) | ouvre `resume` |
@@ -64,7 +64,8 @@ Ensembles utiles (`states.py`) : `PLAN_MESSAGE_TYPES` = {discovery_plan, executi
 | `task_id` | str non vide | — | unique dans le plan **et** dans la session | ADR-007 |
 | `type` | `cmd` \| `chunk_request` | `cmd` | — | §4.1 |
 | `cmd` | str | — | obligatoire et non vide pour `cmd`, interdit pour `chunk_request` | §2.3 |
-| `critical`, `continue_on_error`, `stop_plan_on_failure`, `stop_plan_on_success` | bool | `false` | règle effective `stops_plan_on_failure = critical or stop_plan_on_failure or not continue_on_error` | ADR-009 |
+| `critical`, `stop_plan_on_failure`, `stop_plan_on_success` | bool | `false` | règle effective `stops_plan_on_failure = critical or stop_plan_on_failure or not continue_on_error` | ADR-009 |
+| `continue_on_error` | bool | plan `default_continue_on_error`, sinon `false` | résolu `tâche ?? plan ?? false`, puis la règle effective ci-dessus verbatim | ADR-009, ADR-029 §3 |
 | `depends_on` | list[str] | `[]` | tâches du plan, sans cycle, antérieures en `sequential` | §2.4, ADR-007 |
 | `resource_lock` | str | `null` | deux tâches de même clé ne tournent jamais en parallèle | §2.4 |
 | `max_output_bytes` | int > 0 | plan `default_max_output_bytes`, sinon `payload.default_max_output_bytes` | plafonné par `payload.hard_max_output_bytes` | ADR-010 |
@@ -316,14 +317,16 @@ Le modèle n'apprend le protocole que par le champ `instructions` de l'`init`. L
 | Enveloppe et schémas | les douze types, l'enveloppe, les exemples JSON (§12 avec les champs ajoutés, plus `user_response` et `protocol_correction_request`) | §12, ADR-007, ADR-022, ADR-023 |
 | Réponse directe | section « Answering the user directly: user_response » : quand l'utiliser (explication, analyse, question à l'utilisateur), les champs, `body` opaque borné à `max_message_bytes`, `expects_reply`, le suivi possible | ADR-022 |
 | Correction | section « If you receive a protocol_correction_request » : ce que porte la demande, la consigne (corriger exactement ce que `errors` liste, ne pas renvoyer le message refusé tel quel, un `message_id` neuf), et la borne — rendue d'après `protocol.max_correction_attempts` (`{rejection_policy_rule}`, `{correction_budget_rule}`, `{max_correction_attempts}`), la valeur `0` annonçant au modèle que la première réponse refusée termine la session | ADR-023 |
-| Tâches | drapeaux et leurs défauts (`continue_on_error` absent ⇒ le plan s'arrête à l'échec), `depends_on`, `resource_lock`, `max_parallel_workers` | ADR-009, §2.4 |
-| Sorties et tailles | `max_output_bytes` par tâche, `default_max_output_bytes` par plan, défaut et plafond de l'application, troncature stderr-d'abord / fin-de-stdout, plages `[début, fin)`, `chunk_request` avec `stream` | ADR-010, ADR-011 |
+| Tâches | drapeaux et leurs défauts (`continue_on_error` absent ⇒ le plan s'arrête à l'échec, sauf verdict d'un programme reconnu), `default_continue_on_error` du plan, `depends_on`, `resource_lock`, `max_parallel_workers` | ADR-009, ADR-029, §2.4 |
+| Sorties et tailles | `max_output_bytes` par tâche, `default_max_output_bytes` par plan, défaut et plafond de l'application, troncature à part garantie par flux (au moins `B // 2` chacun, reliquat redistribué) et fin de flux conservée, plages `[début, fin)`, `chunk_request` avec `stream` | ADR-010, ADR-011, ADR-029 |
 | Temps | `timeout_ms` par tâche, défaut et plafond, `TIMED_OUT` rapporté avec `exit_code = null` | ADR-008 |
+| Environnement | section 3.6 « The machine your commands run on » : le système d'exploitation, l'interpréteur détecté (et comment il a été choisi), le dialecte, le répertoire de travail, plus une ligne de conseil propre au dialecte. **Trois faits, pas un de plus** : c'est l'amendement d'ADR-003 §3, et le texte redit à cet endroit que le `discovery_plan` reste la façon d'apprendre tout le reste | ADR-030 §3 |
+| Traduction | ce que fait le dictionnaire entre dialectes quand la commande et le shell ne s'accordent pas, ce qu'il refuse, et ce que le champ `translation` d'un résultat contient (`original_cmd`, `executed_cmd`, `rules`, ou `status: "unchanged"` avec son `reason`) — rendu d'après `execution.translate_commands` et le dialecte détecté (`{translation_rule}`) | ADR-030 §4 |
 | `state_summary` | à tenir à jour dans chaque plan, borne `max_state_summary_bytes` | ADR-005 |
 | Rotation | `context_resume_request` avec `pending_message_type`, `context_resume_ack` attendu **seul**, puis retransmission du message en attente | ADR-014 |
 | Budget | les trois bornes de la session et leur effet | §2.8, ADR-012 |
 
-Le texte annonce les valeurs **effectives** de la configuration (`payload`, `execution`) : il est rendu à partir d'un gabarit au démarrage, ce qui garantit que ce que le modèle lit est ce que l'application applique.
+Le texte annonce les valeurs **effectives** de la configuration (`payload`, `execution`) : il est rendu à partir d'un gabarit au démarrage, ce qui garantit que ce que le modèle lit est ce que l'application applique. Depuis ADR-030 §3 il annonce aussi l'**environnement d'exécution** (`render_instructions(config, environment=…)`, l'`ExecutionEnvironment` étant détecté depuis la configuration quand l'appelant ne le fournit pas) : c'est la seule I/O de l'adaptateur, et la seule information d'environnement que le protocole transporte.
 
 ## 8. Exemples JSON avec les champs ajoutés
 
@@ -359,7 +362,7 @@ Les exemples de §12 restent valides tels quels ; ceux-ci montrent les extension
 
 `t6` ne déclare pas `max_output_bytes` : budget effectif `min(4096, hard_max)` = 4 096 ; `t7` : 2 048.
 
-### 8.2 `execution_result` étendu (§12.5 + ADR-008/009/011)
+### 8.2 `execution_result` étendu (§12.5 + ADR-008/009/011/029/030)
 
 ```json
 {
@@ -370,17 +373,17 @@ Les exemples de §12 restent valides tels quels ; ceux-ci montrent les extension
     "plan_id": "plan-0",
     "status": "stopped_on_failure",
     "results": [
-      { "task_id": "t1", "status": "completed", "exit_code": 0,
+      { "task_id": "t1", "status": "completed", "execution": "ran", "exit_code": 0,
         "stdout": "Linux dev 5.15.0 x86_64\n/bin/bash\n/workspace/project", "stderr": "",
         "truncated": false, "original_size_bytes": 55, "stdout_total": 55, "stderr_total": 0,
         "stdout_range": [0, 55], "stderr_range": [0, 0],
         "max_output_bytes_applied": 2048, "timed_out": false, "timeout_ms_applied": 60000, "duration_ms": 12 },
-      { "task_id": "t4", "status": "completed", "exit_code": 0,
+      { "task_id": "t4", "status": "completed", "execution": "ran", "exit_code": 0,
         "stdout": "...fin du pom.xml...", "stderr": "",
         "truncated": true, "original_size_bytes": 48211, "stdout_total": 48211, "stderr_total": 0,
         "stdout_range": [31827, 48211], "stderr_range": [0, 0],
         "max_output_bytes_applied": 16384, "timed_out": false, "timeout_ms_applied": 60000, "duration_ms": 31 },
-      { "task_id": "t5", "status": "timed_out", "exit_code": null,
+      { "task_id": "t5", "status": "timed_out", "execution": "timed_out", "exit_code": null,
         "stdout": "[INFO] Scanning for projects...", "stderr": "",
         "truncated": false, "original_size_bytes": 32, "stdout_total": 32, "stderr_total": 0,
         "stdout_range": [0, 32], "stderr_range": [0, 0],
@@ -395,6 +398,19 @@ Les exemples de §12 restent valides tels quels ; ceux-ci montrent les extension
 ```
 
 `*_range` est l'intervalle `[début, fin)` en octets du flux tel que reçu ; les listes de `TaskRef` sont ordonnées comme les tâches du plan (ADR-017).
+
+Un résultat porte en plus `translation` **quand, et seulement quand**, le dictionnaire entre dialectes a été consulté — c'est-à-dire quand la commande était écrite dans l'autre dialecte que le shell qui l'a exécutée (ADR-030 §4) :
+
+```json
+{ "task_id": "t2", "status": "completed", "execution": "ran", "exit_code": 0,
+  "translation": { "status": "translated", "from_dialect": "posix", "to_dialect": "powershell",
+                   "original_cmd": "head -n 20 build.log",
+                   "executed_cmd": "Get-Content build.log -TotalCount 20",
+                   "rules": ["head-lines"] },
+  "stdout": "...", "stderr": "", "truncated": false, "timed_out": false, "duration_ms": 18 }
+```
+
+Le champ est **dérivé** de `cmd` à la construction du message (comme `execution` et `failure_is_verdict`, ADR-029 §4) ; ce qui a réellement tourné est tracé, lui, dans l'événement d'audit de la transition `RUNNING`. `stdout` et `stderr` sont la sortie d'`executed_cmd`. Avec `"status": "unchanged"`, `executed_cmd` vaut `original_cmd` — la commande a tourné mot pour mot — et `reason` dit ce qui a arrêté le dictionnaire, pour que le modèle réécrive lui-même.
 
 ### 8.3 `chunk_request` et son résultat (§12.6 + ADR-011)
 

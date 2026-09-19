@@ -1,15 +1,18 @@
 """Phase 4 — task execution (spec §2.5, §3.8, §3.9, §3.10, §8.2, §8.5, §12.5, §12.6, §18.2 ;
-ADR-003, ADR-008, ADR-009, ADR-010, ADR-011, ADR-016, ADR-017, ADR-018).
+ADR-003, ADR-008, ADR-009, ADR-010, ADR-011, ADR-016, ADR-017, ADR-018, ADR-029).
 
-Four surfaces are pinned here, **without spawning a single process** (§18.3):
+Five surfaces are pinned here, **without spawning a single process** (§18.3):
 
 1. the executor contract (``CommandSpec``, ``CancellationToken``, ``RawExecution.outcome``) and the
    ``FakeCommandExecutor`` double that every later phase relies on;
 2. the platform adapters (shell resolution, launch argv, spawn kwargs, two-phase termination and
    orphan termination) on doubles: a fake process table and a fake process handle;
-3. ``PayloadGuard``: the pure truncation algorithm of ADR-011 as a parametrised (E, O, B) table,
-   the budget rule of ADR-010, ``fit_message`` and ``serve_chunk`` on the in-memory store;
-4. ``ResultCollector``: one ``execution_result`` per terminal plan, in plan order (ADR-017).
+3. ``PayloadGuard``: the pure truncation algorithm of ADR-011 as amended by ADR-029 §1 (a
+   guaranteed share per stream) as a parametrised (E, O, B) table, the budget rule of ADR-010,
+   ``fit_message`` and ``serve_chunk`` on the in-memory store;
+4. ``ResultCollector``: one ``execution_result`` per terminal plan, in plan order (ADR-017);
+5. ``VerdictPrograms``: which program a command line invokes and whose non-zero exit is a result
+   to interpret (ADR-029 §2), and what the task result then says about it (ADR-029 §4).
 
 The real ``SubprocessCommandExecutor`` is exercised in ``test_phase4_real_subprocess.py`` only.
 """
@@ -17,6 +20,7 @@ The real ``SubprocessCommandExecutor`` is exercised in ``test_phase4_real_subpro
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -25,10 +29,33 @@ from typing import Any
 
 import pytest
 
-from agentic_local_app.config import ExecutionSection, PayloadSection
+from agentic_local_app.config import DEFAULT_VERDICT_PROGRAMS, ExecutionSection, PayloadSection
 from agentic_local_app.domain.canonical import size_bytes
 from agentic_local_app.domain.clock import FakeClock, SystemClock
+from agentic_local_app.domain.commands import (
+    VerdictPrograms,
+    invoked,
+    normalise_program_entry,
+)
+from agentic_local_app.domain.dialects import (
+    REFUSED_PROGRAMS,
+    TRANSLATION_RULES,
+    ShellTranslator,
+    describe_dictionary,
+    source_dialect_for,
+)
 from agentic_local_app.domain.models import BlobRecord, PlanRecord, TaskRecord
+from agentic_local_app.domain.shell import (
+    DEFAULT_POSIX_SHELL,
+    DEFAULT_WINDOWS_SHELL,
+    DetectedShell,
+    ShellDialect,
+    ShellSource,
+    classify_shell,
+    describe_environment,
+    detect_shell,
+    shell_name,
+)
 from agentic_local_app.domain.states import (
     ExecutionPolicy,
     OutputStream,
@@ -57,13 +84,17 @@ from agentic_local_app.execution.payload_guard import (
 )
 from agentic_local_app.execution.platform import (
     ORPHAN_START_TOLERANCE_MS,
+    POWERSHELL_EXIT_CODE_EPILOGUE,
     LaunchSpec,
     PlatformAdapter,
     PosixPlatformAdapter,
     PosixProcessTable,
     ProcessTable,
     WindowsPlatformAdapter,
+    default_translator,
+    encode_powershell_command,
     parse_proc_stat_start_ticks,
+    powershell_script,
     select_platform,
 )
 from agentic_local_app.execution.result_collector import ResultCollector
@@ -143,7 +174,7 @@ def _task(
         conversation_id="conv-0001",
         order_index=order_index,
         type=type,
-        cmd="echo" if type is TaskType.CMD else None,
+        cmd=fields.pop("cmd", "echo" if type is TaskType.CMD else None),
         status=status,
         created_at=NOW,
         updated_at=NOW,
@@ -229,12 +260,20 @@ def _posix(
         ExecutionSection(**config),
         process_table=table or FakeProcessTable(),
         which=which or (lambda name: f"/usr/bin/{name}"),
+        platform="linux",
     )
 
 
-def _windows(table: ProcessTable | None = None, **config: Any) -> WindowsPlatformAdapter:
+def _windows(
+    which: Callable[[str], str | None] | None = None,
+    table: ProcessTable | None = None,
+    **config: Any,
+) -> WindowsPlatformAdapter:
     return WindowsPlatformAdapter(
-        ExecutionSection(**config), process_table=table or FakeProcessTable()
+        ExecutionSection(**config),
+        process_table=table or FakeProcessTable(),
+        which=which or (lambda name: None),
+        platform="win32",
     )
 
 
@@ -527,23 +566,31 @@ def given_windows_adapter_when_default_shell_resolved_then_powershell() -> None:
     assert _windows().default_shell() == "powershell"
 
 
+_PS_ARGS = ("-NoProfile", "-NonInteractive", "-EncodedCommand")
+
+
 @pytest.mark.parametrize(
-    ("shell", "expected_program", "expected_args"),
+    ("shell", "expected_program", "expected_args", "encoded"),
     [
-        (None, "powershell", ("-NoProfile", "-NonInteractive", "-Command")),
-        ("", "powershell", ("-NoProfile", "-NonInteractive", "-Command")),
-        ("pwsh", "pwsh", ("-NoProfile", "-NonInteractive", "-Command")),
-        ("cmd", "cmd", ("/c",)),
-        ("C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\cmd.exe", ("/c",)),
-        ("C:\\Git\\bin\\bash.exe", "C:\\Git\\bin\\bash.exe", ("-c",)),
+        (None, "powershell", _PS_ARGS, True),
+        ("", "powershell", _PS_ARGS, True),
+        ("pwsh", "pwsh", _PS_ARGS, True),
+        ("cmd", "cmd", ("/c",), False),
+        ("C:\\Windows\\System32\\cmd.exe", "C:\\Windows\\System32\\cmd.exe", ("/c",), False),
+        ("C:\\Git\\bin\\bash.exe", "C:\\Git\\bin\\bash.exe", ("-c",), False),
+        ("C:\\tools\\nushell\\nu.exe", "C:\\tools\\nushell\\nu.exe", ("-c",), False),
     ],
 )
 def given_windows_shell_setting_when_launch_built_then_interpreter_flags_match(
-    shell: str | None, expected_program: str, expected_args: tuple[str, ...]
+    shell: str | None, expected_program: str, expected_args: tuple[str, ...], encoded: bool
 ) -> None:
     launch = _windows().build_launch("Get-ChildItem", shell)
     assert launch.program == expected_program
-    assert launch.args == (*expected_args, "Get-ChildItem")
+    assert launch.args[:-1] == expected_args
+    if encoded:
+        assert launch.args[-1] == encode_powershell_command("Get-ChildItem")
+    else:
+        assert launch.args[-1] == "Get-ChildItem"
 
 
 def given_windows_adapter_when_spawn_kwargs_read_then_new_process_group_flag() -> None:
@@ -708,11 +755,12 @@ def given_impossible_pid_when_real_table_queried_then_none_and_no_signal() -> No
 
 
 # ================================================================================================
-# 4. PayloadGuard.apply — ADR-011 truncation table (E = stderr size, O = stdout size, B = budget)
+# 4. PayloadGuard.apply — truncation table (E = stderr size, O = stdout size, B = budget)
+#    ADR-011 §1 as amended by ADR-029 §1: a guaranteed share per stream, the rest redistributed
 # ================================================================================================
 TRUNCATION_TABLE = [
-    pytest.param(10, 10, 5, id="E>=B:stderr-only"),
-    pytest.param(5, 5, 5, id="E==B:stderr-only"),
+    pytest.param(10, 10, 5, id="both-too-big-odd-budget"),
+    pytest.param(5, 5, 5, id="E==B-both-share"),
     pytest.param(3, 4, 10, id="E+O<=B:nothing-truncated"),
     pytest.param(3, 7, 10, id="E+O==B:nothing-truncated"),
     pytest.param(0, 20, 8, id="O-alone-too-big"),
@@ -723,7 +771,21 @@ TRUNCATION_TABLE = [
     pytest.param(0, 3, 1, id="B=1-stdout-only"),
     pytest.param(2, 2, 0, id="B=0-everything-dropped"),
     pytest.param(4, 0, 2, id="stderr-only-stream"),
+    pytest.param(20, 3, 10, id="small-stdout-fully-kept-under-noisy-stderr"),
+    pytest.param(3, 20, 10, id="small-stderr-fully-kept-under-huge-stdout"),
 ]
+
+
+def _expected_keeps(stderr_size: int, stdout_size: int, budget: int) -> tuple[int, int]:
+    """ADR-029 §1: each stream keeps at least ``min(len, B // 2)``, the unused share going to the
+    other, stderr served first."""
+    half = budget // 2
+    stderr_keep, stdout_keep = min(stderr_size, half), min(stdout_size, half)
+    spare = budget - stderr_keep - stdout_keep
+    taken = min(spare, stderr_size - stderr_keep)
+    stderr_keep, spare = stderr_keep + taken, spare - taken
+    stdout_keep += min(spare, stdout_size - stdout_keep)
+    return stderr_keep, stdout_keep
 
 
 @pytest.mark.parametrize(("stderr_size", "stdout_size", "budget"), TRUNCATION_TABLE)
@@ -735,11 +797,13 @@ def given_streams_and_budget_when_applied_then_budget_respected_and_ranges_match
 
     assert isinstance(out, TruncatedOutput)
     assert len(out.stdout_kept) + len(out.stderr_kept) <= budget
-    # ADR-011 step 1 and 2: stderr first (end kept), then the end of stdout with what is left
-    expected_stderr_kept = min(stderr_size, budget)
-    expected_stdout_kept = min(stdout_size, budget - expected_stderr_kept)
+    expected_stderr_kept, expected_stdout_kept = _expected_keeps(stderr_size, stdout_size, budget)
+    # the guarantee itself: neither stream is ever cut below its half of the budget
+    assert expected_stderr_kept >= min(stderr_size, budget // 2)
+    assert expected_stdout_kept >= min(stdout_size, budget // 2)
     assert len(out.stderr_kept) == expected_stderr_kept
     assert len(out.stdout_kept) == expected_stdout_kept
+    # the end of each stream is what survives
     assert out.stderr_kept == stderr[stderr_size - expected_stderr_kept :]
     assert out.stdout_kept == stdout[stdout_size - expected_stdout_kept :]
     # ranges are [start, end) of the origin stream and reproduce the kept bytes
@@ -755,10 +819,43 @@ def given_streams_and_budget_when_applied_then_budget_respected_and_ranges_match
     assert (out.stdout_total, out.stderr_total) == (stdout_size, stderr_size)
 
 
-def given_stderr_at_least_budget_when_applied_then_stdout_not_transmitted_at_all() -> None:
+def given_stderr_larger_than_budget_when_applied_then_stdout_keeps_its_half() -> None:
+    """ADR-029 §1 against ADR-011 §1 literally: stderr no longer takes everything."""
     out = PayloadGuard(PayloadSection()).apply(b"x" * 100, b"error " * 20, 16)
-    assert out.stdout_kept == b"" and out.stdout_range == (100, 100)
-    assert out.stderr_kept == (b"error " * 20)[-16:] and out.truncated is True
+    assert out.stdout_kept == b"x" * 8 and out.stdout_range == (92, 100)
+    assert out.stderr_kept == (b"error " * 20)[-8:] and out.stderr_range == (112, 120)
+    assert out.truncated is True
+
+
+def given_noisy_stderr_and_maven_diagnostics_on_stdout_when_applied_then_verdict_survives() -> None:
+    """The case ADR-029 §1 exists for: a JVM build tool writes its `[ERROR]` lines and its
+    `BUILD FAILURE` banner to **stdout** while the JVM fills stderr with deprecation warnings.
+
+    Under ADR-011 §1 the whole 8 KB budget went to stderr and the model received the noise and
+    none of the verdict; now stdout is under its half of the budget and survives whole.
+    """
+    warning = (
+        b"OpenJDK 64-Bit Server VM warning: Options -Xverify:none and -noverify were "
+        b"deprecated in JDK 13 and will likely be removed in a future release.\n"
+    )
+    stderr = warning * 60  # ~8.6 KB of JVM noise, more than the whole default budget
+    diagnostics = (
+        b"[ERROR] /src/main/java/com/acme/Service.java:[42,13] cannot find symbol\n"
+        b"[ERROR] symbol:   method of(java.lang.String)\n"
+        b"[INFO] BUILD FAILURE\n"
+    )
+    stdout = b"[INFO] Scanning for projects...\n" * 100 + diagnostics
+    budget = PayloadSection().default_max_output_bytes
+
+    out = PayloadGuard(PayloadSection()).apply(stdout, stderr, budget)
+
+    assert len(stderr) > budget and len(stdout) < budget // 2
+    assert out.stdout_kept == stdout  # the whole verdict, not a byte cut
+    assert diagnostics in out.stdout_kept
+    assert len(out.stdout_kept) + len(out.stderr_kept) == budget
+    assert out.stderr_kept == stderr[-(budget - len(stdout)) :]  # stderr took the rest
+    # what the previous rule produced, for the record: stderr alone, stdout deleted
+    assert min(len(stderr), budget) == budget and budget - min(len(stderr), budget) == 0
 
 
 def given_negative_budget_when_applied_then_value_error() -> None:
@@ -1101,6 +1198,7 @@ def given_completed_plan_when_dumped_then_matches_spec_12_5_shape() -> None:
             {
                 "task_id": "t1",
                 "status": "completed",
+                "execution": "ran",  # ADR-029 §4
                 "exit_code": 0,
                 "stdout": "ok",
                 "stderr": "",
@@ -1354,13 +1452,18 @@ def given_interrupted_tasks_in_non_interrupted_plan_when_built_then_listed_with_
     plan = _plan(PlanState.FAILED, stop_reason="restart")
     tasks = [_task("t1", 0, TaskState.INTERRUPTED, reason="restart")]
     content = ResultCollector().build(plan, tasks, {}, {})
-    assert content.interrupted_tasks == [TaskRef(task_id="t1", reason="restart")]
+    # ADR-029 §4: a task the application ended is `stopped`, whichever list carries it
+    assert content.interrupted_tasks == [
+        TaskRef(task_id="t1", reason="restart", execution="stopped")
+    ]
 
 
 def given_task_without_reason_when_listed_as_skipped_then_state_name_used_as_reason() -> None:
     plan = _plan(PlanState.STOPPED_ON_FAILURE, stop_reason="task_failed:t0")
     content = ResultCollector().build(plan, [_task("t1", 0, TaskState.SKIPPED)], {}, {})
-    assert content.skipped_tasks == [TaskRef(task_id="t1", reason="skipped")]
+    assert content.skipped_tasks == [
+        TaskRef(task_id="t1", reason="skipped", execution="not_started")
+    ]
 
 
 def given_built_result_when_fitted_by_payload_guard_then_pipeline_composes() -> None:
@@ -1374,7 +1477,614 @@ def given_built_result_when_fitted_by_payload_guard_then_pipeline_composes() -> 
 
 
 # ================================================================================================
-# 9. Determinism guard (ADR-017, module map §2 rule 4)
+# 9. Verdict programs — the command a line invokes, and whose exit code is a result (ADR-029 §2)
+# ================================================================================================
+@pytest.mark.parametrize(
+    ("cmd", "expected"),
+    [
+        pytest.param("mvn clean install", ("mvn", "clean"), id="plain"),
+        pytest.param("/usr/bin/mvn -version", ("mvn", None), id="absolute-path"),
+        pytest.param("./mvnw test", ("mvnw", "test"), id="relative-wrapper"),
+        pytest.param(r"C:\tools\apache\bin\mvn.cmd -B install", ("mvn", "install"), id="windows"),
+        pytest.param(".\\gradlew.bat build", ("gradlew", "build"), id="windows-wrapper"),
+        pytest.param("MVN Clean", ("mvn", "clean"), id="case-folded"),
+        pytest.param("JAVA_HOME=/opt/jdk21 mvn test", ("mvn", "test"), id="leading-assignment"),
+        pytest.param("A=1 B=2 npm run build", ("npm", "run"), id="two-assignments"),
+        pytest.param("npm --silent run build", ("npm", "run"), id="options-skipped"),
+        pytest.param("mvn clean install 2>&1 | tail -80", ("mvn", "clean"), id="first-of-pipeline"),
+        pytest.param('"/opt/my tools/mvn" -v', ("mvn", None), id="quoted-path"),
+        pytest.param("mvn", ("mvn", None), id="program-alone"),
+        pytest.param("   ", ("", None), id="blank"),
+        pytest.param("", ("", None), id="empty"),
+        pytest.param("echo 'unbalanced", ("echo", "unbalanced"), id="unbalanced-quote-fallback"),
+    ],
+)
+def given_command_line_when_read_then_program_and_first_argument_extracted(
+    cmd: str, expected: tuple[str, str | None]
+) -> None:
+    assert invoked(cmd) == expected
+
+
+def given_none_command_when_read_then_no_program() -> None:
+    assert invoked(None) == ("", None)
+
+
+@pytest.mark.parametrize(
+    ("cmd", "matches"),
+    [
+        pytest.param("mvn clean install", True, id="maven"),
+        pytest.param("./mvnw -B verify", True, id="maven-wrapper"),
+        pytest.param("gradlew.bat assemble", True, id="gradle-wrapper"),
+        pytest.param("npm run build", True, id="npm-run"),
+        pytest.param("npm test", True, id="npm-test"),
+        pytest.param("npm install", False, id="npm-install-is-not-a-build"),
+        pytest.param("npm", False, id="npm-alone"),
+        pytest.param("yarn build", True, id="yarn"),
+        pytest.param("pytest -q", True, id="pytest"),
+        pytest.param("ruff check src", True, id="ruff"),
+        pytest.param("go build ./...", True, id="go"),
+        pytest.param("ls -la", False, id="plain-tool"),
+        pytest.param("grep -n foo pom.xml", False, id="grep"),
+        pytest.param("$BUILD_TOOL install", False, id="behind-a-shell-variable"),
+        pytest.param("./build.sh", False, id="wrapper-script"),
+        pytest.param(None, False, id="no-command"),
+    ],
+)
+def given_command_when_matched_against_default_programs_then_families_recognised(
+    cmd: str | None, matches: bool
+) -> None:
+    assert VerdictPrograms(DEFAULT_VERDICT_PROGRAMS).matches(cmd) is matches
+
+
+def given_empty_program_set_when_matched_then_nothing_is_a_verdict() -> None:
+    programs = VerdictPrograms()
+    assert bool(programs) is False and len(programs) == 0
+    assert programs.matches("mvn clean install") is False
+    assert programs.is_verdict("mvn clean install", 1, timed_out=False) is False
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "timed_out", "expected"),
+    [
+        pytest.param(1, False, True, id="ran-and-refused"),
+        pytest.param(2, False, True, id="ran-and-refused-other-code"),
+        pytest.param(0, False, False, id="ran-and-succeeded"),
+        pytest.param(None, False, False, id="never-started"),
+        pytest.param(None, True, False, id="timed-out"),
+        pytest.param(1, True, False, id="killed-with-a-code"),
+    ],
+)
+def given_recognised_program_when_asked_for_a_verdict_then_only_an_answered_failure_counts(
+    exit_code: int | None, timed_out: bool, expected: bool
+) -> None:
+    programs = VerdictPrograms(DEFAULT_VERDICT_PROGRAMS)
+    assert programs.is_verdict("mvn clean install", exit_code, timed_out=timed_out) is expected
+
+
+@pytest.mark.parametrize(
+    ("entry", "normalised"),
+    [
+        pytest.param(" MVN ", "mvn", id="trimmed-and-folded"),
+        pytest.param("/usr/local/bin/gradle", "gradle", id="path-stripped"),
+        pytest.param("mvn.cmd", "mvn", id="extension-stripped"),
+        pytest.param("npm   RUN", "npm run", id="sub-command"),
+    ],
+)
+def given_configured_entry_when_normalised_then_reduced_to_program_and_sub_command(
+    entry: str, normalised: str
+) -> None:
+    assert normalise_program_entry(entry) == normalised
+
+
+@pytest.mark.parametrize("entry", ["", "   ", "npm run build", "/", "  /  "])
+def given_impossible_entry_when_normalised_then_value_error(entry: str) -> None:
+    with pytest.raises(ValueError):
+        normalise_program_entry(entry)
+
+
+# ---- what the result says about it (ADR-029 §4) ------------------------------------------------
+def given_failed_build_tool_when_built_then_execution_ran_and_failure_marked_as_verdict() -> None:
+    plan = _plan(PlanState.COMPLETED)
+    tasks = [_task("t1", 0, TaskState.FAILED, exit_code=1, cmd="mvn clean install")]
+    collector = ResultCollector(VerdictPrograms(DEFAULT_VERDICT_PROGRAMS))
+
+    result = collector.build(
+        plan, tasks, {"t1": _output(b"[ERROR] cannot find symbol")}, {}
+    ).results[0]
+
+    assert (result.status, result.exit_code) == ("failed", 1)
+    assert result.execution == "ran"
+    assert result.failure_is_verdict is True
+    assert "failure_is_verdict" in result.model_dump(mode="json", exclude_none=True)
+
+
+@pytest.mark.parametrize(
+    ("cmd", "fields", "execution", "verdict"),
+    [
+        pytest.param("mvn install", {"exit_code": 0}, "ran", None, id="success-is-not-a-verdict"),
+        pytest.param("ls -la", {"exit_code": 1}, "ran", None, id="unrecognised-program"),
+        pytest.param(
+            "mvn install",
+            {"exit_code": None, "reason": "SPAWN_FAILED"},
+            "not_started",
+            None,
+            id="never-started",
+        ),
+        pytest.param(
+            "mvn install",
+            {"exit_code": None, "timed_out": True},
+            "timed_out",
+            None,
+            id="timed-out",
+        ),
+    ],
+)
+def given_task_result_when_built_then_execution_field_states_what_became_of_the_command(
+    cmd: str, fields: dict[str, Any], execution: str, verdict: bool | None
+) -> None:
+    status = TaskState.COMPLETED if fields.get("exit_code") == 0 else TaskState.FAILED
+    if fields.get("timed_out"):
+        status = TaskState.TIMED_OUT
+    plan = _plan(PlanState.COMPLETED)
+    tasks = [_task("t1", 0, status, cmd=cmd, **fields)]
+    collector = ResultCollector(VerdictPrograms(DEFAULT_VERDICT_PROGRAMS))
+
+    result = collector.build(plan, tasks, {}, {}).results[0]
+
+    assert result.execution == execution
+    assert result.failure_is_verdict is verdict
+    dumped = result.model_dump(mode="json", exclude_none=True)
+    assert "failure_is_verdict" not in dumped
+    assert dumped["execution"] == execution
+
+
+def given_default_collector_without_programs_then_no_failure_is_a_verdict() -> None:
+    """A collector built without a recogniser marks nothing: an operator who cleared
+    ``execution.verdict_programs`` gets exactly the behaviour that predates ADR-029."""
+    plan = _plan(PlanState.COMPLETED)
+    tasks = [_task("t1", 0, TaskState.FAILED, exit_code=1, cmd="mvn clean install")]
+    result = ResultCollector().build(plan, tasks, {}, {}).results[0]
+    assert result.execution == "ran" and result.failure_is_verdict is None
+
+
+def given_chunk_request_result_when_built_then_execution_is_ran() -> None:
+    plan = _plan(PlanState.COMPLETED)
+    tasks = [
+        _task("t-chunk-1", 0, TaskState.COMPLETED, type=TaskType.CHUNK_REQUEST, ref_task_id="t1"),
+        _task("t-chunk-2", 1, TaskState.FAILED, type=TaskType.CHUNK_REQUEST, ref_task_id="nope"),
+    ]
+    results = ResultCollector().build(plan, tasks, {}, {}).results
+    assert [r.execution for r in results] == ["ran", "ran"]
+    assert all(r.failure_is_verdict is None for r in results)
+
+
+# ================================================================================================
+# 11. Shell detection (ADR-030 §1) — an injected ``which``, never the machine of the test
+# ================================================================================================
+def _filesystem(*present: str) -> Callable[[str], str | None]:
+    """A ``which`` that only knows the programs named here, answering an absolute path."""
+    installed = {name: f"/usr/bin/{name}" for name in present}
+    return lambda name: installed.get(name)
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected_program"),
+    [
+        (("bash", "zsh", "sh"), "/usr/bin/bash"),
+        (("zsh", "sh"), "/usr/bin/zsh"),
+        (("sh",), "/usr/bin/sh"),
+    ],
+)
+def given_posix_filesystem_when_shell_detected_then_first_candidate_found(
+    installed: tuple[str, ...], expected_program: str
+) -> None:
+    detected = detect_shell("", windows=False, which=_filesystem(*installed))
+    assert detected == DetectedShell(
+        program=expected_program,
+        name=expected_program.rsplit("/", 1)[-1],
+        dialect=ShellDialect.POSIX,
+        source=ShellSource.DETECTED,
+    )
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected_name"),
+    [(("pwsh", "powershell"), "pwsh"), (("powershell",), "powershell")],
+)
+def given_windows_filesystem_when_shell_detected_then_powershell7_preferred(
+    installed: tuple[str, ...], expected_name: str
+) -> None:
+    detected = detect_shell("", windows=True, which=_filesystem(*installed))
+    assert detected.name == expected_name
+    assert detected.dialect is ShellDialect.POWERSHELL
+    assert detected.source is ShellSource.DETECTED
+
+
+@pytest.mark.parametrize(
+    ("windows", "expected"), [(False, DEFAULT_POSIX_SHELL), (True, DEFAULT_WINDOWS_SHELL)]
+)
+def given_empty_filesystem_when_shell_detected_then_documented_default(
+    windows: bool, expected: str
+) -> None:
+    detected = detect_shell("", windows=windows, which=_filesystem())
+    assert detected.program == expected and detected.source is ShellSource.DEFAULT
+
+
+def given_broken_path_when_shell_detected_then_default_and_no_raise() -> None:
+    def explode(name: str) -> str | None:
+        raise OSError("PATH is not readable")
+
+    assert detect_shell(None, windows=False, which=explode).source is ShellSource.DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("pinned", "expected_name", "expected_dialect"),
+    [
+        ("/bin/zsh", "zsh", ShellDialect.POSIX),
+        ("  bash  ", "bash", ShellDialect.POSIX),
+        ("pwsh", "pwsh", ShellDialect.POWERSHELL),
+        (
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "powershell",
+            ShellDialect.POWERSHELL,
+        ),
+        ("C:\\Windows\\System32\\cmd.exe", "cmd", ShellDialect.CMD),
+        ("C:\\tools\\nu.exe", "nu", ShellDialect.UNKNOWN),
+    ],
+)
+def given_pinned_shell_when_detected_then_taken_as_is_and_never_probed(
+    pinned: str, expected_name: str, expected_dialect: ShellDialect
+) -> None:
+    def never(name: str) -> str | None:
+        raise AssertionError("a pinned shell is never probed")
+
+    detected = detect_shell(pinned, windows=True, which=never)
+    assert detected.program == pinned.strip()
+    assert detected.name == expected_name
+    assert detected.dialect is expected_dialect
+    assert detected.source is ShellSource.CONFIGURED
+
+
+@pytest.mark.parametrize(
+    ("program", "expected"),
+    [
+        ("/usr/bin/bash", ShellDialect.POSIX),
+        ("SH", ShellDialect.POSIX),
+        ("dash", ShellDialect.POSIX),
+        ("pwsh.exe", ShellDialect.POWERSHELL),
+        ("cmd.bat", ShellDialect.CMD),
+        ("", ShellDialect.UNKNOWN),
+        ("fish", ShellDialect.UNKNOWN),
+    ],
+)
+def given_program_name_when_classified_then_dialect_or_unknown(
+    program: str, expected: ShellDialect
+) -> None:
+    assert classify_shell(program) is expected
+
+
+def given_windows_path_when_shell_name_read_then_both_separators_honoured() -> None:
+    assert shell_name("C:\\Program Files\\PowerShell\\7\\pwsh.exe") == "pwsh"
+    assert shell_name("'/usr/local/bin/bash'") == "bash"
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_os"),
+    [("win32", "Windows"), ("darwin", "macOS"), ("linux", "Linux"), ("freebsd14", "freebsd14")],
+)
+def given_platform_when_environment_described_then_os_named_and_cwd_absolute(
+    platform: str, expected_os: str
+) -> None:
+    environment = describe_environment("bash", ".", platform=platform, which=_filesystem())
+    assert environment.operating_system == expected_os
+    assert environment.dialect is ShellDialect.POSIX
+    assert os.path.isabs(environment.cwd)
+
+
+def given_adapters_when_environment_read_then_platform_and_shell_reported() -> None:
+    assert _posix().environment().operating_system == "Linux"
+    assert _windows().environment().dialect is ShellDialect.POWERSHELL
+    assert _windows().environment().shell.source is ShellSource.DEFAULT
+
+
+# ================================================================================================
+# 12. The Windows exit code (ADR-030 §2) — verified without Windows
+# ================================================================================================
+def given_powershell_script_when_built_then_command_untouched_and_epilogue_appended() -> None:
+    cmd = 'java -version; echo "a `b` $x" & foo'
+    script = powershell_script(cmd)
+    assert script.splitlines()[0] == cmd
+    assert script.splitlines()[1] == POWERSHELL_EXIT_CODE_EPILOGUE
+    assert "$LASTEXITCODE" in POWERSHELL_EXIT_CODE_EPILOGUE
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "mvn -version",
+        "echo \"double 'single' quotes\"",
+        "echo `backtick` and $dollar",
+        'python -c "import sys; sys.exit(42)"',
+        "line one\nline two",
+        "echo ; echo ; echo",
+        "echo é€漢",
+    ],
+)
+def given_hostile_command_when_encoded_then_it_survives_the_round_trip(cmd: str) -> None:
+    encoded = encode_powershell_command(cmd)
+    decoded = base64.b64decode(encoded).decode("utf-16-le")
+    assert decoded == powershell_script(cmd)
+    assert decoded.startswith(cmd)
+
+
+def given_windows_powershell_when_launch_built_then_encoded_command_carries_the_exit_code() -> None:
+    cmd = 'mvn -q verify "-Dtest=Foo$Bar"'
+    launch = _windows().build_launch(cmd, None)
+    assert launch.dialect is ShellDialect.POWERSHELL
+    assert launch.args[:3] == ("-NoProfile", "-NonInteractive", "-EncodedCommand")
+    assert base64.b64decode(launch.args[-1]).decode("utf-16-le") == powershell_script(cmd)
+    assert launch.argv[0] == "powershell"
+
+
+@pytest.mark.parametrize("shell", ["cmd", "C:\\Git\\bin\\bash.exe"])
+def given_cmd_or_posix_shell_on_windows_when_launch_built_then_command_passed_verbatim(
+    shell: str,
+) -> None:
+    """ADR-030 §2: only PowerShell is wrapped; ``cmd /c`` and the POSIX shells are untouched."""
+    launch = _windows().build_launch("dir /b", shell)
+    assert launch.args[-1] == "dir /b"
+    assert launch.dialect in (ShellDialect.CMD, ShellDialect.POSIX)
+
+
+def given_powershell_pinned_on_posix_when_launch_built_then_also_encoded() -> None:
+    """PowerShell 7 runs on Linux too: the fix follows the shell, not the operating system."""
+    launch = _posix().build_launch("uname -a", "pwsh")
+    assert launch.dialect is ShellDialect.POWERSHELL
+    assert launch.args[-1] == encode_powershell_command("uname -a")
+
+
+# ================================================================================================
+# 13. The dialect dictionary (ADR-030 §4)
+# ================================================================================================
+_TO_POWERSHELL = [
+    ("ls", "Get-ChildItem", "list-directory"),
+    ("ls -la", "Get-ChildItem -Force", "list-directory"),
+    ("ls -l src", "Get-ChildItem src", "list-directory"),
+    ("cat pom.xml", "Get-Content pom.xml", "print-file"),
+    ("head -n 20 build.log", "Get-Content build.log -TotalCount 20", "head-lines"),
+    ("head build.log", "Get-Content build.log -TotalCount 10", "head-lines"),
+    ("tail -50 build.log", "Get-Content build.log -Tail 50", "tail-lines"),
+    ("pwd", "Get-Location", "print-working-directory"),
+    ('echo "hello world"', 'Write-Output "hello world"', "print-text"),
+    ("which java", "Get-Command java", "locate-program"),
+    ("env", "Get-ChildItem Env:", "list-environment"),
+    ("printenv", "Get-ChildItem Env:", "list-environment"),
+    ("echo $JAVA_HOME", "Write-Output $env:JAVA_HOME", "environment-variable"),
+    ("cat ${CONFIG}", "Get-Content $env:CONFIG", "environment-variable"),
+]
+_TO_POSIX = [
+    ("Get-ChildItem", "ls", "list-directory"),
+    ("Get-ChildItem -Force", "ls -a", "list-directory"),
+    ("gci src", "ls src", "list-directory"),
+    ("Get-Content pom.xml", "cat pom.xml", "print-file"),
+    ("Get-Content build.log -TotalCount 20", "head -n 20 build.log", "head-lines"),
+    ("Get-Content build.log -Tail 50", "tail -n 50 build.log", "tail-lines"),
+    ("Get-Location", "pwd", "print-working-directory"),
+    ("Write-Output ok", "echo ok", "print-text"),
+    ("Get-Command java", "command -v java", "locate-program"),
+    ("Get-ChildItem Env:", "env", "list-environment"),
+    ("Write-Output $env:JAVA_HOME", "echo $JAVA_HOME", "environment-variable"),
+]
+
+
+@pytest.mark.parametrize(
+    ("cmd", "expected", "rule"), _TO_POWERSHELL, ids=[c[0] for c in _TO_POWERSHELL]
+)
+def given_posix_command_when_shell_is_powershell_then_translated_and_rule_named(
+    cmd: str, expected: str, rule: str
+) -> None:
+    decided = ShellTranslator(ShellDialect.POWERSHELL).translate(cmd)
+    assert decided is not None and decided.translated
+    assert decided.executed == expected and decided.original == cmd
+    assert rule in decided.rules
+    assert (decided.source, decided.target) == (ShellDialect.POSIX, ShellDialect.POWERSHELL)
+
+
+@pytest.mark.parametrize(("cmd", "expected", "rule"), _TO_POSIX, ids=[c[0] for c in _TO_POSIX])
+def given_powershell_command_when_shell_is_posix_then_translated_and_rule_named(
+    cmd: str, expected: str, rule: str
+) -> None:
+    decided = ShellTranslator(ShellDialect.POSIX).translate(cmd)
+    assert decided is not None and decided.translated
+    assert decided.executed == expected and decided.reason is None
+    assert rule in decided.rules
+    assert (decided.source, decided.target) == (ShellDialect.POWERSHELL, ShellDialect.POSIX)
+
+
+def given_several_simple_commands_when_translated_then_each_segment_and_every_rule_reported() -> (
+    None
+):
+    decided = ShellTranslator(ShellDialect.POWERSHELL).translate("cat pom.xml; pwd; ls -a")
+    assert decided is not None and decided.translated
+    assert decided.executed == "Get-Content pom.xml; Get-Location; Get-ChildItem -Force"
+    assert decided.rules == ("print-file", "print-working-directory", "list-directory")
+
+
+@pytest.mark.parametrize(
+    ("cmd", "expected_reason_fragment"),
+    [
+        ("ls -la | grep foo", "a pipeline"),
+        ("ls > out.txt", "a redirection"),
+        ("cat a && cat b", "a chaining or background operator"),
+        ("cat *.xml", "a wildcard"),
+        ("echo $(pwd)", "a command substitution"),
+        ("cat ~/x", "a home-directory shortcut"),
+        ("echo \\$HOME", "a backslash escape"),
+        ('cat "unbalanced', "leaves a quote open"),
+        ("rm -rf build", "only commands that read"),
+        ("mv a b", "only commands that read"),
+        ("mkdir -p out", "only commands that read"),
+        ("grep -n foo pom.xml", "pattern, field or expression language"),
+        ("sed -i s/a/b/ f", "pattern, field or expression language"),
+        ("test -f pom.xml", "do not agree on exit codes"),
+        ("uname -a", "no command that answers exactly the same question"),
+        ("ls -R", "covers `ls [-a|-A|-l] [PATH]` only"),
+        ("cat a b", "covers `cat FILE` only"),
+        ("echo one two", "covers `echo ARG` only"),
+        ("echo $HOME", "the shell itself provides"),
+        ("echo $1", "does not read as an environment variable"),
+        ("JAVA_HOME=/opt/jdk21 mvn test", "`NAME=value` prefix"),
+        ("pwd; rm -rf build", "only commands that read"),
+    ],
+)
+def given_command_beyond_the_dictionary_when_translated_then_unchanged_with_a_reason(
+    cmd: str, expected_reason_fragment: str
+) -> None:
+    decided = ShellTranslator(ShellDialect.POWERSHELL).translate(cmd)
+    assert decided is not None and not decided.translated
+    assert decided.executed == cmd == decided.original
+    assert decided.rules == ()
+    assert decided.reason is not None and expected_reason_fragment in decided.reason
+
+
+@pytest.mark.parametrize(
+    ("cmd", "fragment"),
+    [
+        ("Remove-Item -Recurse build", "only commands that read"),
+        ("Select-String -Pattern foo", "pattern, field or expression language"),
+        ("Test-Path pom.xml", "do not agree on exit codes"),
+        ("Get-Process", "no command that answers exactly the same question"),
+        (
+            "Get-ChildItem -Recurse",
+            "covers `Get-ChildItem Env:` or `Get-ChildItem [-Force] [PATH]` only",
+        ),
+        ("Write-Output $env:USERPROFILE", "the shell itself provides"),
+        ("Write-Output $PSVersionTable", "does not read as an environment variable"),
+    ],
+)
+def given_powershell_command_beyond_the_dictionary_when_translated_then_unchanged_with_a_reason(
+    cmd: str, fragment: str
+) -> None:
+    decided = ShellTranslator(ShellDialect.POSIX).translate(cmd)
+    assert decided is not None and not decided.translated and decided.reason is not None
+    assert fragment in decided.reason
+
+
+@pytest.mark.parametrize(
+    "cmd", ["mvn clean install", "./gradlew build", "java -version", "python3 setup.py", ""]
+)
+def given_dialect_neutral_command_when_translated_then_nothing_is_attempted(cmd: str) -> None:
+    assert ShellTranslator(ShellDialect.POWERSHELL).translate(cmd) is None
+    assert ShellTranslator(ShellDialect.POSIX).translate(cmd) is None
+
+
+def given_command_already_in_the_shell_dialect_when_translated_then_nothing_is_attempted() -> None:
+    assert ShellTranslator(ShellDialect.POWERSHELL).translate("Get-ChildItem -Force") is None
+    assert ShellTranslator(ShellDialect.POSIX).translate("ls -la") is None
+
+
+@pytest.mark.parametrize("target", list(ShellDialect))
+def given_translation_disabled_when_translating_then_never_attempted(target: ShellDialect) -> None:
+    translator = ShellTranslator(target, enabled=False)
+    assert translator.enabled is False
+    assert translator.translate("ls -la") is None
+    assert translator.translate("Get-ChildItem") is None
+
+
+@pytest.mark.parametrize("target", [ShellDialect.CMD, ShellDialect.UNKNOWN])
+def given_shell_without_a_rule_table_when_translating_then_never_attempted(
+    target: ShellDialect,
+) -> None:
+    assert ShellTranslator(target).enabled is False
+    assert ShellTranslator(target).translate("ls -la") is None
+
+
+def given_execution_section_when_default_translator_built_then_it_aims_at_the_detected_shell() -> (
+    None
+):
+    windows = default_translator(ExecutionSection(), platform="win32", which=_filesystem("pwsh"))
+    assert windows.target is ShellDialect.POWERSHELL and windows.enabled
+    assert windows.source is ShellDialect.POSIX
+    off = default_translator(
+        ExecutionSection(translate_commands=False), platform="win32", which=_filesystem("pwsh")
+    )
+    assert off.enabled is False and off.translate("ls -la") is None
+
+
+def given_the_dictionary_when_described_then_every_rule_and_refusal_is_listed() -> None:
+    described = describe_dictionary()
+    assert len(described) == len(TRANSLATION_RULES) + 2  # the two variable-syntax directions
+    assert {row["rule"] for row in described} >= {rule.rule_id for rule in TRANSLATION_RULES}
+    assert all(row["from"] != row["to"] for row in described)
+    assert REFUSED_PROGRAMS and all(entry.reason for entry in REFUSED_PROGRAMS)
+    assert all(entry.target is source_dialect_for(entry.source) for entry in REFUSED_PROGRAMS)
+
+
+# ================================================================================================
+# 14. The translation on a task result (ADR-030 §4) — derived, never stored
+# ================================================================================================
+def _collector(target: ShellDialect = ShellDialect.POWERSHELL) -> ResultCollector:
+    return ResultCollector(translator=ShellTranslator(target))
+
+
+def _cmd_task(cmd: str) -> TaskRecord:
+    return _task("t1", 0, TaskState.COMPLETED, cmd=cmd, exit_code=0)
+
+
+def given_translated_task_when_result_built_then_both_forms_and_rules_reach_the_model() -> None:
+    result = _collector().build(_plan(), [_cmd_task("ls -la")], {}, {}).results[0]
+    assert result.translation is not None
+    assert result.translation.status == "translated"
+    assert result.translation.original_cmd == "ls -la"
+    assert result.translation.executed_cmd == "Get-ChildItem -Force"
+    assert result.translation.rules == ["list-directory"]
+    assert (result.translation.from_dialect, result.translation.to_dialect) == (
+        "posix",
+        "powershell",
+    )
+    assert result.translation.reason is None
+
+
+def given_untranslated_task_when_result_built_then_the_reason_reaches_the_model() -> None:
+    result = _collector().build(_plan(), [_cmd_task("rm -rf build")], {}, {}).results[0]
+    assert result.translation is not None
+    assert result.translation.status == "unchanged"
+    assert result.translation.original_cmd == result.translation.executed_cmd == "rm -rf build"
+    assert result.translation.rules == []
+    assert result.translation.reason is not None
+    assert "only commands that read" in result.translation.reason
+
+
+def given_task_without_translation_when_result_built_then_the_field_is_absent() -> None:
+    result = _collector().build(_plan(), [_cmd_task("mvn -version")], {}, {}).results[0]
+    assert result.translation is None
+    assert "translation" not in result.model_dump(mode="json", exclude_none=True)
+
+
+def given_default_collector_when_result_built_then_nothing_is_ever_translated() -> None:
+    """No translator injected: the collector reports no translation rather than inventing one."""
+    result = ResultCollector().build(_plan(), [_cmd_task("ls -la")], {}, {}).results[0]
+    assert result.translation is None
+
+
+def given_chunk_request_when_result_built_then_no_translation_is_derived() -> None:
+    task = _task("tc", 0, TaskState.COMPLETED, type=TaskType.CHUNK_REQUEST, ref_task_id="t1")
+    result = _collector().build(_plan(), [task], {}, {}).results[0]
+    assert result.translation is None
+
+
+def given_the_same_record_when_the_result_is_built_twice_then_the_derivation_is_identical() -> None:
+    """The derivation is a pure function of ``cmd``: no column can drift from what really ran."""
+    task = _cmd_task("head -n 20 build.log")
+    first = _collector().build(_plan(), [task], {}, {}).results[0]
+    second = _collector().build(_plan(), [task], {}, {}).results[0]
+    assert first.translation == second.translation
+    assert first.translation is not None
+    assert first.translation.executed_cmd == "Get-Content build.log -TotalCount 20"
+
+
+# ================================================================================================
+# 10. Determinism guard (ADR-017, module map §2 rule 4)
 # ================================================================================================
 @pytest.mark.parametrize(
     "module",

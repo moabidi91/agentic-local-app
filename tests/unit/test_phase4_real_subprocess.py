@@ -1,4 +1,4 @@
-"""Phase 4 — ``SubprocessCommandExecutor`` against real processes (ADR-003, ADR-008, ADR-016, ADR-018).
+"""Phase 4 — ``SubprocessCommandExecutor`` against real processes (ADR-003, ADR-008, ADR-016, ADR-018, ADR-030).
 
 These are the **only** tests allowed to spawn a process (marker ``real_subprocess``). Every command
 runs the current interpreter (``sys.executable``) with a quote-free ``-c`` snippet so that the same
@@ -67,13 +67,20 @@ async def given_printing_command_when_executed_then_completed_with_stdout_hi() -
     assert raw.duration_ms >= 0 and raw.ended_monotonic_ms >= raw.started_monotonic_ms
 
 
-async def given_command_exiting_3_when_executed_then_failed_with_exit_code_3() -> None:
+@pytest.mark.parametrize("code", [2, 3, 42, 127])
+async def given_command_exiting_with_a_code_when_executed_then_that_exact_code_is_reported(
+    code: int,
+) -> None:
+    """ADR-030 §2: the real code survives the interpreter, PowerShell included.
+
+    Until the exit-code epilogue, ``powershell -Command`` mapped every code other than 0 and 1 onto
+    1 — a value the model could not trust, and one ADR-029 turned into a verdict.
+    """
     raw = await _executor().execute(
-        _spec(_python("import sys; sys.exit(3)")), cancel=CancellationToken()
+        _spec(_python(f"import sys; sys.exit({code})")), cancel=CancellationToken()
     )
-    assert raw.outcome is TaskState.FAILED and raw.exit_code not in (0, None)
-    if not IS_WINDOWS:  # ``powershell -Command`` maps any code other than 0/1 onto 1
-        assert raw.exit_code == 3
+    assert raw.outcome is TaskState.FAILED
+    assert raw.exit_code == code
 
 
 async def given_command_writing_stderr_when_executed_then_stderr_captured_separately() -> None:
@@ -81,8 +88,9 @@ async def given_command_writing_stderr_when_executed_then_stderr_captured_separa
     raw = await _executor().execute(_spec(_python(code)), cancel=CancellationToken())
     assert raw.outcome is TaskState.FAILED and raw.exit_code not in (0, None)
     assert b"eee" in raw.stderr and raw.stdout.strip() == b"o"  # PowerShell decorates stderr
+    assert raw.exit_code == 2  # ADR-030 §2
     if not IS_WINDOWS:
-        assert raw.stderr == b"eee" and raw.stdout == b"o" and raw.exit_code == 2
+        assert raw.stderr == b"eee" and raw.stdout == b"o"
 
 
 async def given_sleeping_command_when_timeout_300ms_then_timed_out_quickly() -> None:

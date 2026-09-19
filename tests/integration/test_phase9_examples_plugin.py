@@ -21,8 +21,10 @@ import pytest
 from acme_model_plugin import AcmeHttpProvider, StreamedTextCodec
 from agentic_local_app.config import load_config
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.events import EventType
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import SessionState
 from agentic_local_app.observability.event_bus import EventBus, RecordingSubscriber
 from agentic_local_app.orchestration import Application, build_application
@@ -140,6 +142,7 @@ def build(
         bus=bus,
         run_recovery=False,
         sleep=sleep,
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
     )
     assert isinstance(app.transport, CodecTransport)
     assert isinstance(app.transport.codec, StreamedTextCodec)

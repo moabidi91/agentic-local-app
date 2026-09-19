@@ -51,7 +51,7 @@ Chaque valeur peut être surchargée par une variable d'environnement `AGENTIC__
 |---|---|---|
 | `[app]` | dossier des données (`data_dir` : base SQLite, blobs de sortie, audit), niveau de log, fichier `.env` | pour déplacer les données |
 | `[transport]` | **le modèle** : provider, codec, endpoints, jeton, identifiant utilisateur, timeouts, polling, gzip, TLS ; `[transport.options]` et `[transport.codec_options]` | pour brancher un modèle (guide 02) |
-| `[execution]` | shell, répertoire de travail des commandes, timeouts de tâche, drains d'interruption, cadence du flux de sortie | pour adapter la machine cible |
+| `[execution]` | shell, répertoire de travail des commandes, timeouts de tâche, drains d'interruption, cadence du flux de sortie, `verdict_programs` (les programmes dont un code de sortie non nul est un résultat à interpréter, ADR-029) | pour adapter la machine cible |
 | `[payload]` | tailles maximales des sorties renvoyées au modèle et des messages | si le modèle a une fenêtre étroite |
 | `[context]` | budget d'octets d'une conversation, seuils d'alerte et de saturation, rotations | idem |
 | `[budget]` | budget par défaut d'une session (cycles, plans, durée) et fermeture automatique | pour borner les sessions |
@@ -153,9 +153,10 @@ La chaîne d'audit est vérifiable à tout moment (`agentic-app audit verify <si
 | `agentic-app config show`, `config validate` | la configuration effective, sa validation |
 | `agentic-app transport list`, `transport show` | les providers disponibles, celui qui est actif (et son codec) |
 | `agentic-app codec list`, `codec show` | les codecs disponibles, celui qui est actif |
+| `agentic-app shell show`, `shell rules` | le shell détecté (OS, dialecte, `cwd`, traduction) et le dictionnaire entre dialectes (ADR-030) |
 | `agentic-app version` | la version |
 
-Option globale `--config <chemin>` avant la commande ; `--json` sur `run`, `sessions`, `status`, `interrupt`, `audit verify`, `transport list/show` et `codec list/show`.
+Option globale `--config <chemin>` avant la commande ; `--json` sur `run`, `sessions`, `status`, `interrupt`, `audit verify`, `transport list/show`, `codec list/show` et `shell show/rules`.
 
 ## Et ensuite
 

@@ -312,6 +312,8 @@ Dictionnaires par famille, clés composites pour plans et tâches, ordre d'inser
 | Schéma | créé idempotemment (`CREATE TABLE IF NOT EXISTS`) et estampillé dans `schema_version` ; une base d'une autre version est **refusée** (pas de migration en v1) |
 | Horloge | aucune : tous les horodatages viennent des records (ADR-017) |
 
+**Ce que le journal d'audit porte et que les records ne portent pas (ADR-030 §4).** Quand le dictionnaire entre dialectes a réécrit la commande d'une tâche, la charge utile de son `task.state_changed` vers `RUNNING` nomme `cmd_executed`, `translation_rules` et `translated_to` (ou `translation_note` quand rien n'a été réécrit). C'est **la** trace durable de ce qui a réellement tourné : un événement est du JSON dans une chaîne de hachage, écrit une fois et jamais réécrit, là où une colonne aurait coûté une migration. La `TaskRecord` ne garde que la commande du modèle, et le champ `translation` du résultat est redérivé d'elle à la construction du message, comme `execution` et `failure_is_verdict` (ADR-029 §4).
+
 ## 4. Blobs et lecture par plage (§3.6, ADR-003, ADR-011)
 
 | Règle | Détail |

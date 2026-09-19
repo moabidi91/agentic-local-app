@@ -109,6 +109,7 @@ which you declared the tasks, whatever the order in which they finished.
       {
         "task_id": "t1",
         "status": "completed",
+        "execution": "ran",
         "exit_code": 0,
         "stdout": "Linux dev 5.15.0 x86_64\n/bin/bash\n/workspace/project",
         "stderr": "",
@@ -118,23 +119,38 @@ which you declared the tasks, whatever the order in which they finished.
       },
       {
         "task_id": "t4",
-        "status": "completed",
-        "exit_code": 0,
-        "stdout": "...last 16384 bytes of the output...",
-        "stderr": "",
+        "status": "failed",
+        "execution": "ran",
+        "exit_code": 1,
+        "failure_is_verdict": true,
+        "stdout": "...last kept bytes, [ERROR] invalid target release: 21 ... BUILD FAILURE...",
+        "stderr": "...JVM warnings...",
         "truncated": true,
-        "original_size_bytes": 48211,
-        "stdout_total": 48211,
-        "stderr_total": 0,
-        "stdout_range": [31827, 48211],
-        "stderr_range": [0, 0],
+        "original_size_bytes": 43867,
+        "stdout_total": 31827,
+        "stderr_total": 12040,
+        "stdout_range": [23635, 31827],
+        "stderr_range": [3848, 12040],
         "max_output_bytes_applied": 16384,
         "timed_out": false,
         "duration_ms": 40
       },
       {
         "task_id": "t5",
+        "status": "failed",
+        "execution": "not_started",
+        "exit_code": null,
+        "stdout": "",
+        "stderr": "",
+        "truncated": false,
+        "timed_out": false,
+        "reason": "SPAWN_FAILED",
+        "duration_ms": 2
+      },
+      {
+        "task_id": "t6",
         "status": "timed_out",
+        "execution": "timed_out",
         "exit_code": null,
         "stdout": "",
         "stderr": "",
@@ -145,11 +161,11 @@ which you declared the tasks, whatever the order in which they finished.
       }
     ],
     "skipped_tasks": [
-      { "task_id": "t6", "reason": "task_failed:t5" }
+      { "task_id": "t7", "reason": "task_failed:t6", "execution": "not_started" }
     ],
     "cancelled_tasks": [],
     "interrupted_tasks": [],
-    "stop_reason": "task_failed:t5"
+    "stop_reason": "task_failed:t6"
   }
 }
 ```
@@ -161,10 +177,45 @@ which you declared the tasks, whatever the order in which they finished.
   to the end.
 - Each task result has `status` `completed`, `failed` or `timed_out`, its `exit_code` (`null` when
   the command did not finish), and the captured `stdout` and `stderr`.
+- **`execution` says what became of the command.** It is the field to read before anything else,
+  because `status: "failed"` alone does not tell you whether a program answered you or never ran:
+
+  | `execution` | What happened | What to do with it |
+  |---|---|---|
+  | `ran` | The command ran to the end. `exit_code` is **its** answer, zero or not. | Read `stdout` and `stderr`: they are the evidence. |
+  | `not_started` | No command ever ran: it could not be started (unknown program, not executable, bad working directory — `reason` is `SPAWN_FAILED`), or the plan never reached this task. `exit_code` is `null`. | **This is the only case with no output to read.** Do not interpret the empty `stdout`: check the command line itself, or find the tool first. |
+  | `timed_out` | It started and was killed at its deadline. `exit_code` is `null` and the output is partial. | Re-plan with a larger `timeout_ms`, or a narrower command. |
+  | `stopped` | It started and the application ended it (the plan stopped, or the user interrupted). `exit_code` is `null` and the output is partial. | Nothing is wrong with the command; it simply did not finish. |
+
+- **`failure_is_verdict: true`** marks a failed task whose command **ran** and whose program is one
+  of those whose exit code is a *result*: a compiler, a build tool, a test runner, a linter (see
+  section 3.3). It is an answer to analyse, never an application failure, and by itself it does not
+  stop the plan. The field is absent in every other case.
+- **`translation`** is present only when your command and the shell that ran it were written in
+  different dialects (section 3.6). It is never a failure and never silent:
+
+  ```json
+  {
+    "status": "translated",
+    "from_dialect": "posix",
+    "to_dialect": "powershell",
+    "original_cmd": "head -n 20 build.log",
+    "executed_cmd": "Get-Content build.log -TotalCount 20",
+    "rules": ["head-lines"]
+  }
+  ```
+
+  `original_cmd` is what you wrote, `executed_cmd` is what actually ran — read `stdout` and
+  `stderr` as the output of `executed_cmd` — and `rules` names the dictionary entries that fired.
+  With `"status": "unchanged"`, `executed_cmd` equals `original_cmd`: the command ran exactly as
+  you wrote it and `reason` says what stopped the dictionary (`"no rule maps \`rm\`: the
+  dictionary translates only commands that read, never one that creates, moves or deletes"`).
+  A result with no `translation` field means no translation was needed or attempted.
 - `skipped_tasks`, `cancelled_tasks` and `interrupted_tasks` list the tasks that did not run to
-  completion, each as an object with a `task_id` and a `reason` (for example
+  completion, each as an object with a `task_id`, a `reason` (for example
   `dependency_failed:<task_id>`, `dependency_skipped:<task_id>`, `stop_plan_on_failure:<task_id>`,
-  `budget_exceeded`).
+  `budget_exceeded`) and the same `execution` field: `not_started` for a task that was skipped,
+  `stopped` for one that was cancelled or interrupted.
 - A task that exceeded its timeout is reported with `status` `timed_out`, `timed_out: true` and
   `timeout_ms_applied`. It counts as a failure for the stop rules. No command is ever retried
   automatically: if you want to retry, plan a new task.
@@ -361,6 +412,7 @@ before anything else; it is executed exactly like an `execution_plan`.
 | `execution_policy` | yes | `sequential` (tasks run one after the other, in declaration order) or `parallel`. |
 | `max_parallel_workers` | in `parallel` mode | Maximum number of tasks running at the same time (integer >= 1). If omitted in `parallel` mode the application applies 1. Ignored in `sequential` mode. |
 | `default_max_output_bytes` | no | Output budget applied to the tasks of this plan that do not declare `max_output_bytes` (section 4). |
+| `default_continue_on_error` | no | `continue_on_error` applied to the tasks of this plan that do not declare it. Say it once here instead of repeating it on every task of a diagnostic plan (section 3.3). |
 | `state_summary` | strongly recommended | Your running notes, described in section 6. |
 | `tasks` | yes, at least one | The tasks, executed exactly as written. |
 
@@ -372,7 +424,7 @@ before anything else; it is executed exactly like an `execution_plan`.
 | `type` | no | `cmd` | `cmd` (a shell command) or `chunk_request` (section 5). |
 | `cmd` | for `cmd` | — | The shell command line, run as-is in the user's default shell and working directory. Not allowed on a `chunk_request`. |
 | `critical` | no | `false` | A failure of this task stops the plan; the stop is reported as `critical_task_failed:<task_id>`. |
-| `continue_on_error` | no | `false` | When `true`, a failure of this task does **not** stop the plan. |
+| `continue_on_error` | no | plan `default_continue_on_error`, else `false` | When `true`, a failure of this task does **not** stop the plan. |
 | `stop_plan_on_failure` | no | `false` | A failure of this task stops the plan. |
 | `stop_plan_on_success` | no | `false` | A success of this task stops the plan early with status `short_circuited_on_success`. |
 | `depends_on` | no | `[]` | Ids of tasks **of the same plan** that must complete successfully before this task runs. |
@@ -387,6 +439,12 @@ A failed task (non-zero exit code, spawn error or timeout) stops the plan when
 `false`. Since every flag defaults to `false`, **a failure stops the plan unless you explicitly
 write `continue_on_error: true`** on that task. Declaring both `critical: true` and
 `continue_on_error: true` is contradictory: the plan stops anyway and the contradiction is logged.
+
+`continue_on_error` is read as `task ?? plan.default_continue_on_error ?? false`: a plan whose
+tasks are all meant to run to the end declares `default_continue_on_error: true` once, at plan
+level, instead of repeating it on every task. A task that declares its own value always wins.
+
+{verdict_rule}
 
 When a plan stops, running tasks are cancelled (they receive SIGTERM and are listed in
 `cancelled_tasks`), tasks not yet started are listed in `skipped_tasks`, and the plan status is
@@ -410,6 +468,27 @@ plan and every conversation, including after a rotation. A duplicate id is rejec
 error. Using a monotonically increasing suffix (`plan-0`, `plan-1`, ..., `t1`, `t2`, ...) is the
 simplest way to comply.
 
+### 3.6 The machine your commands run on
+
+The application does not interpret your commands, but it does know where it is about to run them,
+and telling you is cheaper than letting you discover it from a failure:
+
+| | |
+|---|---|
+| Operating system | **{environment_os}** |
+| Shell | `{environment_shell}` ({environment_shell_source}) |
+| Shell dialect | **{environment_dialect}** |
+| Working directory | `{environment_cwd}` |
+
+{environment_dialect_hint}
+
+This table is the **only** environment information the application ever gives you. Everything
+else — which tools are installed, their versions, what the project contains, what the files say —
+you still discover for yourself with a `discovery_plan`, and the answers still come from the output
+of the commands you ask for.
+
+{translation_rule}
+
 ## 4. Output limits and truncation
 
 Every task has an effective output budget:
@@ -427,12 +506,16 @@ effective = min(task.max_output_bytes, or plan.default_max_output_bytes, or {def
 
 When the output of a task exceeds its budget the application truncates it deterministically:
 
-1. `stderr` has priority: the **end** of stderr is kept, up to the whole budget.
-2. The remaining budget goes to the **end** of stdout (the last lines are usually the useful ones).
-3. The result carries `truncated: true`, `original_size_bytes` (stderr + stdout), `stdout_total`,
+1. Each stream is guaranteed its own share: `stdout` and `stderr` each keep at least half the
+   budget, or all of themselves if they are smaller.
+2. Whatever one stream does not use goes to the other. So a small stdout is never cut, a stream
+   alone gets the whole budget, and **a noisy stderr can never delete stdout**: build tools that
+   write their diagnostics to stdout and their warnings to stderr still reach you.
+3. In each stream the **end** is what is kept (the last lines are usually the useful ones).
+4. The result carries `truncated: true`, `original_size_bytes` (stderr + stdout), `stdout_total`,
    `stderr_total`, and the byte ranges `stdout_range` and `stderr_range` you actually received,
    each as `[start, end)` (end excluded). In the example of section 2.2, `stdout_range`
-   `[31827, 48211]` tells you that bytes `0` to `31827` of stdout are missing.
+   `[23635, 31827]` tells you that bytes `0` to `23635` of stdout are missing.
 
 Nothing is lost: the complete raw output of every task is stored for the whole session and can be
 read back by ranges with a `chunk_request` (section 5). Choose budgets deliberately: small for
@@ -476,7 +559,8 @@ in this session (in this conversation or a previous one).
 | `byte_offset` | yes | First byte to return (0-based). |
 | `max_bytes` | yes | Maximum number of bytes to return, capped at {hard_max_output_bytes} (and at the task's own `max_output_bytes` if declared). |
 
-The result of a `chunk_request` is a task result with `status` `completed`, `ref_task_id`,
+The result of a `chunk_request` is a task result with `status` `completed`, `execution` `ran`
+(the read is local: it always happens), `ref_task_id`,
 `stream`, `range` (`[offset, offset + returned]`), `total` (the full size of that stream),
 `eof` (`true` when the range reaches the end of the stream) and `data` (the bytes, decoded as
 UTF-8). An unknown `ref_task_id` or a `byte_offset` beyond `total` gives a `failed` task result

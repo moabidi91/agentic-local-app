@@ -29,6 +29,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from agentic_local_app.domain.commands import normalise_program_entry
 from agentic_local_app.domain.errors import ConfigError
 
 ENV_CONFIG_PATH = "AGENTIC_APP_CONFIG"
@@ -52,6 +53,48 @@ DEFAULT_CREDENTIAL_PLACEHOLDER = "Paste an access token"
 #: Option keys whose values are always masked by :meth:`AppConfig.masked` (substring match).
 SECRET_KEY_MARKERS: tuple[str, ...] = ("key", "token", "secret", "password", "authorization")
 MASK = "***"
+
+#: ADR-029 §2 — the programs whose non-zero exit is a **result to interpret**, not a task that went
+#: wrong: compilers, build tools, test runners and linters answer by their exit code. Grouped by
+#: family, in the order ``config.toml`` documents them. Entries are either a program (``mvn``) or a
+#: program and the sub-command that matters (``npm run``: ``npm install`` is not a build).
+DEFAULT_VERDICT_PROGRAMS: tuple[str, ...] = (
+    # JVM builds and their wrappers
+    "mvn",
+    "mvnw",
+    "gradle",
+    "gradlew",
+    "ant",
+    "sbt",
+    "javac",
+    # Node and TypeScript
+    "npm run",
+    "npm test",
+    "yarn",
+    "pnpm",
+    "npx",
+    "tsc",
+    "eslint",
+    # Rust, .NET, Go
+    "cargo",
+    "dotnet",
+    "go",
+    # C / C++ and the make family
+    "make",
+    "cmake",
+    "ninja",
+    "gcc",
+    "g++",
+    "clang",
+    "clang++",
+    # Python
+    "pytest",
+    "tox",
+    "ruff",
+    "mypy",
+    "flake8",
+    "pylint",
+)
 
 
 class _Section(BaseModel):
@@ -331,16 +374,39 @@ def requires_credentials(
 
 
 class ExecutionSection(_Section):
-    """ADR-003 (platform), ADR-008 (timeouts), ADR-018 (live output)."""
+    """ADR-003 (platform), ADR-008 (timeouts), ADR-018 (live output), ADR-029 (verdict programs),
+    ADR-030 (shell detection and dialect translation).
 
-    shell: str = ""  # "" = platform default (bash/sh on POSIX, PowerShell on Windows)
+    ``verdict_programs`` lists the programs whose non-zero exit is a **result to interpret** rather
+    than a task that went wrong (ADR-029 §2). Each entry is a program (``mvn``) or a program and
+    the sub-command that matters (``npm run``); paths, extensions and case are normalised away, so
+    ``/usr/bin/MVN`` and ``mvn.cmd`` are the same entry. An empty list turns the rule off.
+
+    ``translate_commands`` turns the dialect dictionary of ADR-030 §4 on or off. Left on, a command
+    written for the other dialect than the detected shell is rewritten **only** when the dictionary
+    maps it exactly, and both forms are persisted and reported. Turned off, every command reaches
+    the shell exactly as the model wrote it, which is the behaviour that predates the ADR.
+    """
+
+    shell: str = ""  # "" = detected (bash/zsh/sh on POSIX, pwsh/powershell on Windows)
     cwd: str = "."
+    translate_commands: bool = True
     default_task_timeout_ms: int = Field(default=60_000, gt=0)
     max_task_timeout_ms: int = Field(default=900_000, gt=0)
     cancel_drain_timeout_ms: int = Field(default=5_000, gt=0)
     interrupt_drain_timeout_ms: int = Field(default=5_000, gt=0)
     live_output_chunk_bytes: int = Field(default=4_096, gt=0)
     live_output_interval_ms: int = Field(default=250, ge=0)
+    verdict_programs: list[str] = Field(default_factory=lambda: list(DEFAULT_VERDICT_PROGRAMS))
+
+    @field_validator("verdict_programs")
+    @classmethod
+    def _normalise_verdict_programs(cls, value: list[str]) -> list[str]:
+        """Normalise every entry and drop the duplicates the normalisation creates, in order."""
+        unique: dict[str, None] = {}
+        for entry in value:
+            unique[normalise_program_entry(entry)] = None
+        return list(unique)
 
 
 def _as_absolute(value: str) -> Path:

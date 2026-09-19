@@ -39,7 +39,7 @@ classDiagram
         +expected_inbound(last_outbound, conversation) frozenset~MessageType~
         +parse_inbound(raw_messages, expected, conversation, known_message_ids, known_plan_ids, known_task_ids, stored_output_task_ids, expected_original_conversation_id) InboundMessage
         +plan_to_records(inbound, session, conversation, cycle_id, clock) tuple
-        +render_instructions(config) str
+        +render_instructions(config, environment) str
         -_outbound(message_type, conversation, message_id, content) OutboundMessage
         -_validate_content(envelope, model) ContentT
         -_validate_plan(plan, known_plan_ids, known_task_ids, stored_output_task_ids, warnings)
@@ -156,8 +156,8 @@ Choix de conception :
 | `chunk_request` projetée | `max_bytes = min(task.max_bytes, hard_max[, task.max_output_bytes si déclaré])` (ADR-011), et `max_output_bytes_applied = max_bytes` (un seul nombre gouverne la taille de `data`) ; `stream` effectif (`stdout` par défaut) ; `timeout_ms_applied = None` (lecture locale sans timeout, ADR-008 §5). | ADR-008, ADR-011 |
 | Règle d'arrêt | `stops_plan_on_failure = critical or stop_plan_on_failure or not continue_on_error`, drapeaux absents → `False`, calculée une fois et persistée. | ADR-009 |
 | Table des attendus | `EXPECTED_INBOUND` est un `MappingProxyType` (immuable) indexé par `OutboundSituation` (quatre lignes) ; `situation_for(last_outbound, conversation)` classe le dernier message sortant (`user_request` initial ou de suivi selon `conversation.final_answer_received`) et refuse (`ValueError`) un `MessageRecord` entrant. | ADR-007 |
-| Instructions | Fichier lu via `importlib.resources` (embarqué dans la roue), mis en cache ; les six placeholders `{nom}` sont remplacés par regex (les accolades des exemples JSON ne sont pas touchées) ; un placeholder inconnu lève `ValueError`. | ADR-004 |
-| Déterminisme | Aucun appel à `datetime.now`, `time.*`, `uuid`, `random` (test d'inspection du source) ; `render_instructions` et les constructions sont pures. | ADR-017 |
+| Instructions | Fichier lu via `importlib.resources` (embarqué dans la roue), mis en cache ; les placeholders `{nom}` sont remplacés par regex (les accolades des exemples JSON ne sont pas touchées) ; un placeholder inconnu lève `ValueError`. Depuis ADR-030 §3 le gabarit porte aussi l'annonce de l'environnement (`{environment_os}`, `{environment_shell}`, `{environment_shell_source}`, `{environment_dialect}`, `{environment_dialect_hint}`, `{environment_cwd}`) et la règle de traduction (`{translation_rule}`). | ADR-004, ADR-030 |
+| Déterminisme | Aucun appel à `datetime.now`, `time.*`, `uuid`, `random` (test d'inspection du source) ; les constructions sont pures. `render_instructions` l'est aussi **à environnement donné** : c'est la seule fonction de l'adaptateur qui touche au système (`shutil.which`, pour annoncer le shell), et l'appelant peut lui passer l'`ExecutionEnvironment` pour la rendre totalement pure. | ADR-017, ADR-030 |
 
 ### 3.2 Validation d'un message entrant
 

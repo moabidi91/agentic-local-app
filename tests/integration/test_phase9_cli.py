@@ -1132,6 +1132,66 @@ def given_invalid_config_file_when_transport_show_then_exit_1_config_invalid(
     assert "CONFIG_INVALID" in result.output and "transport.close_method" in result.output
 
 
+# ================================================================================================
+# shell show · shell rules (ADR-030)
+# ================================================================================================
+def given_pinned_shell_when_shell_show_then_the_detected_environment_is_printed(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "shell.toml"
+    path.write_text('[execution]\nshell = "pwsh"\ncwd = "."\n', encoding="utf-8")
+    result = runner.invoke(app, ["shell", "show", "--config", str(path), "--json"])
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["shell"] == "pwsh" and document["shell_name"] == "pwsh"
+    assert document["dialect"] == "powershell" and document["source"] == "configured"
+    assert document["translate_commands"] is True and document["translation_enabled"] is True
+    assert document["translates_from"] == "posix"
+    assert Path(document["cwd"]).is_absolute()
+
+
+def given_translation_disabled_when_shell_show_then_reported_as_off(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "shell.toml"
+    path.write_text('[execution]\nshell = "cmd"\ntranslate_commands = false\n', encoding="utf-8")
+    result = runner.invoke(app, ["shell", "show", "--config", str(path)])
+    assert result.exit_code == 0, result.output
+    assert "dialect: cmd" in result.output
+    assert "translate_commands: False" in result.output
+    assert "translation_enabled: False" in result.output
+    assert "translates_from: -" in result.output
+
+
+def given_cli_when_shell_rules_then_the_whole_dictionary_and_its_refusals_are_listed(
+    runner: CliRunner,
+) -> None:
+    result = runner.invoke(app, ["shell", "rules"])
+    assert result.exit_code == 0, result.output
+    assert "Get-ChildItem [-Force] [PATH]" in result.output
+    assert "environment-variable" in result.output
+    assert "Recognised and deliberately NOT translated:" in result.output
+    assert "only commands that read" in result.output
+
+
+def given_cli_when_shell_rules_json_then_machine_readable_rules_and_refusals(
+    runner: CliRunner,
+) -> None:
+    result = runner.invoke(app, ["shell", "rules", "--json"])
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert {row["rule"] for row in document["rules"]} >= {"list-directory", "print-file"}
+    assert all(row["from"] != row["to"] for row in document["rules"])
+    assert {entry["program"] for entry in document["refused"]} >= {"rm", "grep", "remove-item"}
+
+
+def given_cli_when_help_then_shell_command_listed(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0 and "shell" in result.output
+    sub = runner.invoke(app, ["shell", "--help"])
+    assert sub.exit_code == 0 and "show" in sub.output and "rules" in sub.output
+
+
 def given_cli_when_help_then_transport_command_listed(runner: CliRunner) -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0 and "transport" in result.output

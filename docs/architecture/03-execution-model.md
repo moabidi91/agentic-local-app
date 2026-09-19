@@ -2,7 +2,7 @@
 
 **Ce que dit la spec.** Un plan est exécuté « exactement comme reçu » ([§8.1](../spec/SPEC-v1.1.md#8-deterministic-plan-execution-rules)) par le `PlanRunner` (§3.7), séquentiellement ou en parallèle (§2.4), en suivant les onze étapes de [§8.2](../spec/SPEC-v1.1.md#82-task-execution-rules), les conditions d'arrêt de [§8.3](../spec/SPEC-v1.1.md#83-stop-conditions) et les règles d'interruption de [§8.4](../spec/SPEC-v1.1.md#84-interruption-during-execution). Le `CommandExecutor` (§3.8) lance les commandes, le `PayloadGuard` (§3.10, §2.5) borne les sorties, le `ResultCollector` (§3.9) produit **exactement un** `execution_result` par plan (§19.9).
 
-**Ce que précisent les ADR.** [ADR-003](../adr/ADR-003-plateformes-cibles.md) : couche plateforme POSIX / Windows, terminaison en deux temps, octets bruts ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : `timeout_ms`, aucun retry de tâche, `TIMED_OUT` = échec ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) : règle effective des drapeaux, `stop_reason`, `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) : quatre bornes de payload, `fit_message` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) : algorithme de troncature, plages, `chunk_request` avec `stream` ; [ADR-012](../adr/ADR-012-budget-de-session.md) : budget vérifié **entre deux tâches** ; [ADR-016](../adr/ADR-016-politique-de-reprise.md) : `pid` persisté avant le lancement ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : résultats dans l'ordre du plan ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : flux live `task.output`.
+**Ce que précisent les ADR.** [ADR-003](../adr/ADR-003-plateformes-cibles.md) : couche plateforme POSIX / Windows, terminaison en deux temps, octets bruts ; [ADR-008](../adr/ADR-008-timeout-et-retry-de-tache.md) : `timeout_ms`, aucun retry de tâche, `TIMED_OUT` = échec ; [ADR-009](../adr/ADR-009-drapeaux-d-arret.md) : règle effective des drapeaux, `stop_reason`, `{task_id, reason}` ; [ADR-010](../adr/ADR-010-limites-de-payload.md) : quatre bornes de payload, `fit_message` ; [ADR-011](../adr/ADR-011-troncature-et-chunks.md) : algorithme de troncature, plages, `chunk_request` avec `stream` ; [ADR-012](../adr/ADR-012-budget-de-session.md) : budget vérifié **entre deux tâches** ; [ADR-016](../adr/ADR-016-politique-de-reprise.md) : `pid` persisté avant le lancement ; [ADR-017](../adr/ADR-017-determinisme-des-resultats-et-identifiants.md) : résultats dans l'ordre du plan ; [ADR-018](../adr/ADR-018-api-pour-un-front-et-flux-live.md) : flux live `task.output` ; [ADR-029](../adr/ADR-029-echec-d-outil-comme-verdict.md) : part garantie par flux dans la troncature, code non nul d'un programme reconnu qui n'arrête pas le plan, `default_continue_on_error`, champs `execution` et `failure_is_verdict` ; [ADR-030](../adr/ADR-030-shell-detecte-et-traduction-de-dialectes.md) : shell **détecté** et exposé comme objet, code de sortie natif préservé sur Windows, environnement **annoncé** au modèle (amende ADR-003 §3), dictionnaire fermé entre dialectes appliqué seulement quand il est exact et tracé des deux côtés (champ `translation`).
 
 Les machines à états de plan et de tâche sont dans [01-state-machines](01-state-machines.md#6-plan-52-amendé-par-adr-007) ; les records `PlanRecord` / `TaskRecord` / `BlobRecord` dans [04-persistence-and-audit](04-persistence-and-audit.md). Modules : `execution/plan_runner.py`, `execution/executor.py`, `execution/platform.py`, `execution/payload_guard.py`, `execution/result_collector.py` (phases 4 et 5, voir [09-module-map](09-module-map.md)).
 
@@ -121,8 +121,9 @@ sequenceDiagram
 Calculée une fois à la validation du plan et persistée sur la `TaskRecord` (`stops_plan_on_failure`) ; champ absent ⇒ `false` (ADR-009 §1).
 
 ```
-stops_plan_on_failure = critical or stop_plan_on_failure or not continue_on_error
-stops_plan_on_success = stop_plan_on_success
+continue_on_error      = tâche ?? plan.default_continue_on_error ?? false   (ADR-029 §3)
+stops_plan_on_failure  = critical or stop_plan_on_failure or not continue_on_error
+stops_plan_on_success  = stop_plan_on_success
 ```
 
 | `critical` | `continue_on_error` | `stop_plan_on_failure` | `stops_plan_on_failure` | À l'échec (`FAILED` ou `TIMED_OUT`) | `stop_reason` |
@@ -135,6 +136,14 @@ stops_plan_on_success = stop_plan_on_success
 | true | false | true | **true** | le plan s'arrête | `critical_task_failed:<task_id>` |
 | true | true | false | **true** (avertissement `CONTRADICTORY_FLAGS`) | le plan s'arrête | `critical_task_failed:<task_id>` |
 | true | true | true | **true** (avertissement) | le plan s'arrête | `critical_task_failed:<task_id>` |
+
+**Verdict d'un outil reconnu (ADR-029 §2).** À l'exécution seulement, et uniquement pour une tâche
+`FAILED` dont la commande **a tourné** (elle a rendu un code de sortie : ni échec de lancement, ni
+dépassement de délai) et dont le premier mot nomme un programme de `[execution] verdict_programs`,
+le plan **continue** alors même que `stops_plan_on_failure` vaut `true`. La ligne du tableau
+ci-dessus qui est ainsi neutralisée est la première — le défaut implicite ; `critical` et
+`stop_plan_on_failure`, eux, arrêtent le plan comme indiqué. La tâche reste `FAILED`, compte dans
+`failed_task_count`, et ses dépendants passent en `SKIPPED` (ADR-009 §5) comme toujours.
 
 `stop_plan_on_success = true` et tâche `COMPLETED` ⇒ le plan s'arrête, `stop_reason = stop_plan_on_success:<task_id>`, quel que soit le reste. Quand plusieurs libellés s'appliquent à la même tâche, la **première ligne applicable** du tableau d'ADR-009 l'emporte (`critical_task_failed` avant `stop_plan_on_failure` avant `task_failed`). Les 16 combinaisons × {succès, échec} plus les cas « champ absent » sont la table paramétrée de la phase 5.
 
@@ -236,29 +245,39 @@ effective = min(task.max_output_bytes ?? plan.default_max_output_bytes ?? payloa
 | `payload.hard_max_output_bytes` | config | 262 144 | plafond absolu par tâche |
 | `payload.max_message_bytes` | config | 1 048 576 | taille maximale d'un message sortant sérialisé |
 
-### 6.2 `apply(stdout, stderr, budget)` — fonction pure (ADR-011)
+### 6.2 `apply(stdout, stderr, budget)` — fonction pure (ADR-011, amendé par ADR-029 §1)
 
-Soit `B` le budget, `E = len(stderr)`, `O = len(stdout)`.
+Soit `B` le budget, `E = len(stderr)`, `O = len(stdout)`. Chaque flux a une **part garantie** de
+`B // 2` ; ce qu'un flux ne consomme pas de sa part est donné à l'autre, stderr servi en premier.
 
 ```mermaid
 flowchart TD
-    A["Entrees : stdout O octets, stderr E octets, budget B"] --> S1["stderr_kept = min(E, B)<br/>fin de stderr conservee<br/>stderr_range = [E - stderr_kept, E)"]
-    S1 --> S2["stdout_kept = min(O, B - stderr_kept)<br/>fin de stdout conservee<br/>stdout_range = [O - stdout_kept, O)"]
-    S2 --> S3["truncated = stderr_kept < E ou stdout_kept < O<br/>original_size_bytes = E + O<br/>stdout_total = O, stderr_total = E"]
-    S3 --> S4["Coupe sur une frontiere d'octets ;<br/>decodage UTF-8 errors=replace au moment du message"]
-    S4 --> OUT["TruncatedOutput : stdout, stderr, truncated,<br/>original_size_bytes, totaux, plages, max_output_bytes_applied"]
+    A["Entrees : stdout O octets, stderr E octets, budget B"] --> S1["part garantie : stderr_kept = min(E, B // 2)<br/>stdout_kept = min(O, B // 2)"]
+    S1 --> S2["reliquat = B - stderr_kept - stdout_kept<br/>donne a stderr puis a stdout, dans la limite de ce qui leur reste"]
+    S2 --> S3["fin de chaque flux conservee<br/>stderr_range = [E - stderr_kept, E)<br/>stdout_range = [O - stdout_kept, O)"]
+    S3 --> S4["truncated = stderr_kept < E ou stdout_kept < O<br/>original_size_bytes = E + O<br/>stdout_total = O, stderr_total = E"]
+    S4 --> S5["Coupe sur une frontiere d'octets ;<br/>decodage UTF-8 errors=replace au moment du message"]
+    S5 --> OUT["TruncatedOutput : stdout, stderr, truncated,<br/>original_size_bytes, totaux, plages, max_output_bytes_applied"]
 ```
 
-Propriétés vérifiées en phase 4 : `stdout_kept + stderr_kept ≤ B` ; la concaténation des plages reçues et manquantes reconstitue le flux d'origine ; `E ≥ B` ⇒ `stdout_kept = 0` (stderr garde la priorité, de façon réalisable).
+Propriétés vérifiées en phase 4 : `stdout_kept + stderr_kept ≤ B` ; la concaténation des plages
+reçues et manquantes reconstitue le flux d'origine ; **aucun flux n'est jamais coupé sous
+`min(taille, B // 2)`** — un stderr bruyant ne peut plus supprimer stdout, où les outils de
+compilation JVM écrivent leurs diagnostics (ADR-029 §1).
 
 | E (stderr) | O (stdout) | B | `stderr_kept` | `stdout_kept` | `stderr_range` | `stdout_range` | `truncated` | `original_size_bytes` |
 |---|---|---|---|---|---|---|---|---|
 | 0 | 48 211 | 16 384 | 0 | 16 384 | [0, 0) | [31 827, 48 211) | true | 48 211 |
 | 300 | 10 000 | 8 192 | 300 | 7 892 | [0, 300) | [2 108, 10 000) | true | 10 300 |
-| 1 500 | 3 000 | 1 024 | 1 024 | 0 | [476, 1 500) | [3 000, 3 000) | true | 4 500 |
+| 8 640 | 3 294 | 8 192 | 4 898 | 3 294 | [3 742, 8 640) | [0, 3 294) | true | 11 934 |
+| 1 500 | 3 000 | 1 024 | 512 | 512 | [988, 1 500) | [2 488, 3 000) | true | 4 500 |
 | 100 | 500 | 2 048 | 100 | 500 | [0, 100) | [0, 500) | false | 600 |
 | 2 048 | 0 | 2 048 | 2 048 | 0 | [0, 2 048) | [0, 0) | false | 2 048 |
 | 0 | 0 | 512 | 0 | 0 | [0, 0) | [0, 0) | false | 0 |
+
+La troisième ligne est le cas d'ADR-029 : un `mvn clean install` dont la JVM remplit stderr de plus
+que le budget entier, et dont le `BUILD FAILURE` est sur stdout. L'ancienne règle rendait
+`stderr_kept = 8 192` et `stdout_kept = 0`.
 
 Une plage vide s'écrit `[T, T)` avec `T` la taille du flux (`[0, 0)` pour un flux vide, comme dans l'exemple d'ADR-011).
 
@@ -312,15 +331,37 @@ Ordre : `results[]`, `skipped_tasks[]`, `cancelled_tasks[]`, `interrupted_tasks[
 
 | | POSIX (Linux, macOS) | Windows |
 |---|---|---|
-| Lancement | `asyncio.create_subprocess_shell(cmd, executable=<shell>, start_new_session=True)` | `create_subprocess_shell(cmd, creationflags=CREATE_NEW_PROCESS_GROUP)` via `powershell.exe -NoProfile -Command` (défaut) ou `cmd.exe /c` |
-| Shell par défaut (`execution.shell = ""`) | `/bin/bash` s'il existe, sinon `/bin/sh` | PowerShell |
+| Détection du shell (`execution.shell = ""`) | `bash`, `zsh`, `sh` sur le `PATH` ; à défaut `/bin/sh` | `pwsh` puis `powershell` ; à défaut `powershell` |
 | Identité du processus | `pid` + `process_group_id` (= pid, nouveau groupe) | `pid` |
 | Terminaison douce | `SIGTERM` au groupe | `CTRL_BREAK_EVENT` au groupe |
 | Terminaison forcée | `SIGKILL` au groupe | `TerminateProcess` puis `taskkill /T /F` sur l'arbre |
 | Orphelin au redémarrage | `terminate_orphan(pid, started_at)` : vérifie que le processus a démarré après `started_at` avant de le terminer | idem |
 | Encodage | octets bruts capturés et stockés tels quels ; décodage UTF-8 `errors="replace"` seulement à la construction du message ; plages en **octets** | idem |
 
-Les deux seuls réglages d'environnement de l'application sont `execution.shell` et `execution.cwd` : ils ne sont **jamais** injectés dans le protocole, le modèle découvre l'environnement par son `discovery_plan` et une commande n'est jamais réécrite (§1, §17.5, ADR-003 §3). Le `FakeCommandExecutor` (`testing/fake_executor.py`) reproduit sorties, délais (`FakeClock`), échec de spawn, blocage jusqu'à annulation et tranches de sortie live sans processus ; les tests marqués `real_subprocess` valident le vrai comportement sur les deux OS.
+Le **lancement** suit le dialecte détecté, plus le système d'exploitation (ADR-030 §2) : PowerShell 7 épinglé sur Linux est lancé comme PowerShell, Git bash épinglé sur Windows comme un shell POSIX. Le processus est toujours créé par `create_subprocess_exec` (jamais `create_subprocess_shell` : celle-ci laisserait `argv[0] = /bin/sh` et bash passerait en mode POSIX).
+
+| Dialecte | `argv` | Commande |
+|---|---|---|
+| `posix`, `unknown` | `<shell> -c <cmd>` | verbatim |
+| `cmd` | `<shell> /c <cmd>` | verbatim |
+| `powershell` | `<shell> -NoProfile -NonInteractive -EncodedCommand <base64>` | le script `<cmd>\nif (Test-Path -LiteralPath variable:\LASTEXITCODE) { exit $LASTEXITCODE }`, encodé en Base64 d'UTF-16LE |
+
+L'épilogue PowerShell **rend le vrai code de sortie** d'un programme natif, que `powershell -Command` ramenait à 0 ou 1 (ADR-030 §2) — un défaut de correction depuis qu'ADR-029 fait du code de sortie un verdict. L'encodage supprime toute question de citation : la commande du modèle peut contenir guillemets, `$`, accents graves, points-virgules et sauts de ligne. Ce qui n'est **pas** couvert : le code rendu est celui du dernier programme *natif* du script, une commande sans programme natif garde le code de PowerShell, la forme encodée pèse ~2,7× la commande contre un plafond Windows de 32 767 caractères, et `cmd /c` n'est pas corrigé.
+
+**Shell détecté et environnement annoncé (ADR-030 §1, §3).** `domain/shell.py` répond « quel interpréteur, et pourquoi celui-là » sous forme d'un `DetectedShell` (`program`, `name`, `dialect` ∈ {`posix`, `powershell`, `cmd`, `unknown`}, `source` ∈ {`configured`, `detected`, `default`}) ; `ExecutionEnvironment` y ajoute l'OS et le `cwd` rendu absolu lexicalement. La sonde (`shutil.which`) est **injectée** : aucun test ne dépend de la machine qui l'exécute, la détection ne lève jamais et n'exécute jamais l'interpréteur. `execution.shell` renseigné est pris **tel quel**, sans recherche. `agentic-app shell show` imprime le résultat. Ces trois faits — et rien d'autre — sont annoncés au modèle dans les instructions (§3.6) : c'est l'amendement d'ADR-003 §3, le `discovery_plan` restant la façon d'apprendre tout le reste.
+
+**Dictionnaire entre dialectes (ADR-030 §4).** Consulté par le `PlanRunner` au moment du lancement, **uniquement** quand la commande est écrite dans l'autre dialecte que le shell détecté, et seulement si `execution.translate_commands` est vrai.
+
+| | |
+|---|---|
+| Ce qui est traduit | seize règles, huit par sens, **toutes en lecture seule** : `ls`, `cat`, `head`, `tail`, `pwd`, `echo`, `which`, `env` et la syntaxe `$NAME` / `$env:NAME` |
+| Ce qui ne l'est jamais | tout ce qui crée, déplace, écrase ou supprime ; tubes, redirections, `&&` / `||`, jokers, substitutions, échappements, préfixes `NAME=valeur` ; les programmes dont le langage de motifs (`grep`, `sed`, `awk`, `find`), la convention de code de sortie (`test`, `Test-Path`) ou l'effet diffèrent |
+| Tout ou rien | un seul segment qui résiste et **rien** n'est réécrit : une commande à moitié traduite serait un troisième dialecte |
+| Trace | la charge utile du `task.state_changed` vers `RUNNING` porte `cmd_executed`, `translated_to` et `translation_rules` (ou `translation_note`) : le journal d'audit chaîné par hachage est **la** preuve de ce qui a tourné. Aucune colonne, aucune migration ; `TaskResult.translation` est **redérivé** de `cmd` à la construction du message, comme `execution` et `failure_is_verdict` (ADR-029 §4) |
+| Refus | `status: "unchanged"` et un `reason` en clair, pour que le modèle se corrige lui-même |
+| Inspection | `agentic-app shell rules` imprime la table entière et les programmes délibérément écartés |
+
+Le `FakeCommandExecutor` (`testing/fake_executor.py`) reproduit sorties, délais (`FakeClock`), échec de spawn, blocage jusqu'à annulation et tranches de sortie live sans processus ; les tests marqués `real_subprocess` valident le vrai comportement sur les deux OS.
 
 ## 9. Flux live `task.output` (ADR-018)
 
@@ -351,8 +392,9 @@ Le `SubprocessCommandExecutor` lit stdout et stderr par morceaux (nécessaire po
 
 | Section | Clé | Défaut | Utilisée par | Réf. |
 |---|---|---|---|---|
-| `[execution]` | `shell` | `""` (défaut plateforme) | PlatformAdapter | ADR-003 |
-| `[execution]` | `cwd` | `"."` | PlatformAdapter | ADR-003 |
+| `[execution]` | `shell` | `""` (détecté) | PlatformAdapter, annonce, dictionnaire | ADR-003, ADR-030 |
+| `[execution]` | `cwd` | `"."` | PlatformAdapter, annonce | ADR-003, ADR-030 |
+| `[execution]` | `translate_commands` | `true` | PlanRunner (`ShellTranslator`) | ADR-030 |
 | `[execution]` | `default_task_timeout_ms` | 60 000 | PlanRunner / CommandExecutor | ADR-008 |
 | `[execution]` | `max_task_timeout_ms` | 900 000 | PlanRunner | ADR-008 |
 | `[execution]` | `cancel_drain_timeout_ms` | 5 000 | PlanRunner (stop condition, timeout), RecoveryCoordinator | ADR-003 |
@@ -371,6 +413,8 @@ Le `SubprocessCommandExecutor` lit stdout et stderr par morceaux (nécessaire po
 | 4 | CommandExecutor : succès, échec, timeout, annulation | `given_task_running_when_timeout_exceeded_then_task_marked_timed_out`, `given_declared_timeout_above_cap_when_task_runs_then_cap_applied_and_reported`, `given_running_command_when_cancelled_then_terminated_within_drain_timeout` |
 | 4 | PayloadGuard : table (E, O, B), propriétés, `fit_message`, `serve_chunk` | `given_stderr_larger_than_budget_when_applied_then_stdout_dropped_and_stderr_tail_kept`, `given_message_over_limit_when_fitted_then_longest_stdout_halved_until_fit`, `given_offset_beyond_total_when_chunk_served_then_task_failed_chunk_range_invalid` |
 | 4 | ResultCollector : complet, arrêté, sauté, ordre du plan | `given_parallel_completion_order_when_result_built_then_results_follow_plan_order` |
+| 4 | Shell détecté, code de sortie Windows, dictionnaire (ADR-030) | `given_posix_filesystem_when_shell_detected_then_first_candidate_found`, `given_pinned_shell_when_detected_then_taken_as_is_and_never_probed`, `given_hostile_command_when_encoded_then_it_survives_the_round_trip`, `given_windows_powershell_when_launch_built_then_encoded_command_carries_the_exit_code`, `given_command_beyond_the_dictionary_when_translated_then_unchanged_with_a_reason` |
+| 5 | Traduction exécutée, auditée et rendue (ADR-030) | `given_posix_command_and_powershell_shell_when_run_then_translated_executed_and_traced`, `given_unmappable_command_when_run_then_it_runs_verbatim_and_the_reason_is_reported`, `given_translation_disabled_when_run_then_nothing_is_rewritten_nor_reported` |
 | 5 | séquentiel, parallèle avec `max_parallel_workers`, `depends_on`, `resource_lock`, conditions d'arrêt (table 16 × 2), interruption dans le drain, budget entre tâches | `given_timed_out_task_with_stop_on_failure_when_plan_runs_then_plan_stopped_on_failure`, `given_running_plan_when_user_interrupts_then_all_tasks_marked_interrupted`, `given_deadline_passed_between_tasks_when_next_task_due_then_plan_failed_and_remaining_skipped`, `given_dependency_failed_with_continue_on_error_when_plan_runs_then_dependent_skipped_and_plan_completed` |
 
 ## 13. Points ouverts

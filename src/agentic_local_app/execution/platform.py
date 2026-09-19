@@ -1,13 +1,14 @@
-"""Platform layer of the executor (ADR-003, ADR-016): shell, launch, spawn flags, termination.
+"""Platform layer of the executor (ADR-003, ADR-016, ADR-030): shell, launch, spawn, termination.
 
 Two adapters, selected from ``sys.platform`` by :func:`select_platform` (and injectable in tests):
 
 +----------------------+-------------------------------------------+---------------------------------------------------+
 |                      | POSIX                                     | Windows                                           |
 +======================+===========================================+===================================================+
-| default shell        | ``bash`` if found, else ``sh``            | ``powershell``                                    |
-| launch               | ``<shell> -c <cmd>``                      | ``powershell -NoProfile -NonInteractive -Command`` |
-|                      |                                           | ``<cmd>`` · ``cmd /c <cmd>`` when the shell is cmd |
+| shell detection      | ``bash``, ``zsh``, ``sh`` on the ``PATH`` | ``pwsh``, then ``powershell``                     |
+| default shell        | else ``/bin/sh``                          | else ``powershell``                               |
+| launch               | ``<shell> -c <cmd>``                      | ``<powershell> -NoProfile -NonInteractive``       |
+|                      |                                           | ``-EncodedCommand <base64>`` · ``cmd /c <cmd>``   |
 | spawn                | ``start_new_session=True`` (own group)    | ``creationflags=CREATE_NEW_PROCESS_GROUP``        |
 | soft termination     | ``SIGTERM`` to the process group          | ``CTRL_BREAK_EVENT`` on the process handle        |
 | hard termination     | ``SIGKILL`` to the process group          | ``taskkill /T /F /PID`` + ``TerminateProcess``     |
@@ -15,13 +16,25 @@ Two adapters, selected from ``sys.platform`` by :func:`select_platform` (and inj
 
 The interpreter is launched with ``create_subprocess_exec(shell, "-c", cmd)`` rather than the
 ``create_subprocess_shell(cmd, executable=shell)`` wording of ADR-003: the latter keeps ``argv[0]``
-equal to ``/bin/sh``, and bash invoked under that name silently switches to POSIX mode. The command
-string itself is never rewritten (§1, §2.3).
+equal to ``/bin/sh``, and bash invoked under that name silently switches to POSIX mode.
 
-Known Windows PowerShell limitation: ``powershell -Command <cmd>`` reports exit code 1 for any
-native command that exited with a code other than 0 or 1, and decorates the stderr of native
-commands with error-record text. The command is still run untouched (§1); the model sees a failure
-with the real stderr content inside the decoration.
+**The Windows exit code (ADR-030 §2).** ``powershell -Command <cmd>`` answered 1 for any native
+command that exited with something other than 0 or 1: the code the model reads was not the code the
+program returned, which ADR-029 made a correctness defect the day a tool's exit code became a
+verdict. The interpreter is now handed a script that ends with ``exit $LASTEXITCODE`` and that
+script travels **Base64-encoded in UTF-16LE** (``-EncodedCommand``), the one form in which quotes,
+``$``, backticks, semicolons and newlines written by the model cross the command line untouched.
+:func:`powershell_script` and :func:`encode_powershell_command` build it, so the construction is
+verifiable on any platform. What it does **not** cover is written down in ADR-030 §2: the exit code
+reported is that of the last *native* command of the script, the encoded form is roughly 2.7 times
+the size of the command against a command line Windows caps at 32 767 characters, and PowerShell
+still decorates the stderr of a native command with error-record text — the real content is in
+there, wrapped.
+
+Which shell the machine actually runs is answered by :mod:`agentic_local_app.domain.shell`
+(:meth:`PlatformAdapter.detect_shell`, :meth:`PlatformAdapter.environment`), with ``which``
+injected so that no test depends on the machine it runs on. Detection never raises: it degrades to
+``/bin/sh`` or ``powershell``.
 
 Orphan termination after a crash (ADR-016) goes through a :class:`ProcessTable`, the only object
 that touches processes the executor did not spawn. It is injectable so that the two-phase mechanics
@@ -34,6 +47,7 @@ component here reads the wall clock (ADR-017): durations are counted in polling 
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shutil
 import signal
@@ -48,11 +62,21 @@ from pathlib import Path
 from typing import Any
 
 from agentic_local_app.config import ExecutionSection
+from agentic_local_app.domain.dialects import ShellTranslator
+from agentic_local_app.domain.shell import (
+    DetectedShell,
+    ExecutionEnvironment,
+    ShellDialect,
+    Which,
+    describe_environment,
+    detect_shell,
+)
 
 __all__ = [
     "CREATE_NEW_PROCESS_GROUP",
     "CTRL_BREAK_EVENT",
     "ORPHAN_START_TOLERANCE_MS",
+    "POWERSHELL_EXIT_CODE_EPILOGUE",
     "LaunchSpec",
     "ProcessTable",
     "PosixProcessTable",
@@ -60,7 +84,10 @@ __all__ = [
     "PlatformAdapter",
     "PosixPlatformAdapter",
     "WindowsPlatformAdapter",
+    "default_translator",
+    "encode_powershell_command",
     "parse_proc_stat_start_ticks",
+    "powershell_script",
     "select_platform",
 ]
 
@@ -78,14 +105,42 @@ ORPHAN_START_TOLERANCE_MS = 5_000
 #: Polling step of the bounded blocking waits.
 _POLL_STEP_MS = 50
 
+#: ADR-030 §2 — appended to every PowerShell script so that the exit code of a native command
+#: survives the interpreter. ``$LASTEXITCODE`` only exists once a native command has run: when the
+#: script called none (a pure cmdlet pipeline), the variable is absent and PowerShell's own code is
+#: left alone, which keeps the behaviour that predates the fix for those commands.
+POWERSHELL_EXIT_CODE_EPILOGUE = (
+    "if (Test-Path -LiteralPath variable:\\LASTEXITCODE) { exit $LASTEXITCODE }"
+)
+
+
+def powershell_script(cmd: str) -> str:
+    """The script handed to PowerShell: the command as written, then the exit-code epilogue.
+
+    The command is on its own line and is **not** quoted, escaped or otherwise touched: it is the
+    encoding of the whole script (:func:`encode_powershell_command`) that carries it safely.
+    """
+    return f"{cmd}\n{POWERSHELL_EXIT_CODE_EPILOGUE}\n"
+
+
+def encode_powershell_command(cmd: str) -> str:
+    """``cmd`` as the Base64 of the UTF-16LE script expected by ``-EncodedCommand``."""
+    return base64.b64encode(powershell_script(cmd).encode("utf-16-le")).decode("ascii")
+
 
 @dataclass(frozen=True)
 class LaunchSpec:
     """The interpreter invocation for one command: ``program`` is the interpreter executable and
-    ``args`` its arguments, the last of which is the untouched ``cmd``."""
+    ``args`` its arguments.
+
+    ``args`` ends with the command itself everywhere except PowerShell, where it ends with the
+    Base64 script of :func:`encode_powershell_command` (ADR-030 §2); ``dialect`` names which of the
+    two it is, so a reader never has to guess from the flags.
+    """
 
     program: str
     args: tuple[str, ...]
+    dialect: ShellDialect = ShellDialect.POSIX
 
     @property
     def argv(self) -> tuple[str, ...]:
@@ -262,22 +317,72 @@ class WindowsProcessTable(ProcessTable):
 # Platform adapters
 # ------------------------------------------------------------------------------------------------
 class PlatformAdapter(ABC):
+    """Everything that depends on the host: which shell, which argv, which signals.
+
+    Detection and the launch form live **here**, shared by both adapters, because they follow the
+    shell and not the operating system: PowerShell 7 runs on Linux and Git bash runs on Windows, and
+    both deserve the launch of their own dialect (ADR-030 §1, §2).
+    """
+
+    #: ``sys.platform`` this adapter stands for when the caller names none.
+    _DEFAULT_PLATFORM = "linux"
+    _POWERSHELL_ARGS = ("-NoProfile", "-NonInteractive", "-EncodedCommand")
+
     def __init__(
-        self, config: ExecutionSection, *, process_table: ProcessTable | None = None
+        self,
+        config: ExecutionSection,
+        *,
+        process_table: ProcessTable | None = None,
+        which: Which | None = None,
+        platform: str | None = None,
     ) -> None:
         self._config = config
         self._table = process_table or self._default_process_table()
+        self._which: Which = which if which is not None else shutil.which
+        #: ``sys.platform`` value announced to the model (ADR-030 §3).
+        self.platform_name = platform or self._DEFAULT_PLATFORM
 
     @abstractmethod
     def _default_process_table(self) -> ProcessTable: ...
 
-    @abstractmethod
+    def detect_shell(self, shell: str | None = None) -> DetectedShell:
+        """Which interpreter will receive the commands, and how that was decided (ADR-030 §1).
+
+        ``shell`` overrides ``execution.shell`` for one call (the plan runner passes the value of
+        the :class:`~agentic_local_app.execution.executor.CommandSpec`). Never raises.
+        """
+        configured = shell if shell is not None else self._config.shell
+        return detect_shell(configured, windows=self.platform_name == "win32", which=self._which)
+
+    def environment(self) -> ExecutionEnvironment:
+        """The operating system, the shell and the working directory, as announced (ADR-030 §3)."""
+        return describe_environment(
+            self._config.shell, self._config.cwd, platform=self.platform_name, which=self._which
+        )
+
     def default_shell(self) -> str:
         """The interpreter used when ``execution.shell`` is empty."""
+        return self.detect_shell("").program
 
-    @abstractmethod
     def build_launch(self, cmd: str, shell: str | None) -> LaunchSpec:
-        """The argv running ``cmd`` (untouched) under ``shell`` (or the default shell)."""
+        """The argv running ``cmd`` under ``shell`` (or the detected shell).
+
+        The command is rewritten in exactly one place and for exactly one reason: a PowerShell
+        script gains the exit-code epilogue of ADR-030 §2 and travels Base64-encoded. Nothing else
+        is ever added, removed or quoted here — a translation between dialects is a decision of the
+        plan runner, taken before the command reaches this layer and traced in the task record.
+        """
+        detected = self.detect_shell(shell)
+        if detected.dialect is ShellDialect.POWERSHELL:
+            return LaunchSpec(
+                program=detected.program,
+                args=(*self._POWERSHELL_ARGS, encode_powershell_command(cmd)),
+                dialect=ShellDialect.POWERSHELL,
+            )
+        if detected.dialect is ShellDialect.CMD:
+            return LaunchSpec(program=detected.program, args=("/c", cmd), dialect=ShellDialect.CMD)
+        # POSIX and anything unrecognised: ``-c`` is the convention every other interpreter follows
+        return LaunchSpec(program=detected.program, args=("-c", cmd), dialect=detected.dialect)
 
     @abstractmethod
     def spawn_kwargs(self) -> dict[str, Any]:
@@ -324,32 +429,12 @@ class PlatformAdapter(ABC):
 
 
 class PosixPlatformAdapter(PlatformAdapter):
-    """Linux / macOS: ``bash`` (else ``sh``) ``-c``, own session, signals to the process group."""
+    """Linux / macOS: ``bash`` (else ``zsh``, else ``sh``) ``-c``, own session, signals to the group."""
 
-    _FALLBACK_SHELL = "/bin/sh"
-
-    def __init__(
-        self,
-        config: ExecutionSection,
-        *,
-        process_table: ProcessTable | None = None,
-        which: Callable[[str], str | None] = shutil.which,
-    ) -> None:
-        super().__init__(config, process_table=process_table)
-        self._which = which
+    _DEFAULT_PLATFORM = "linux"
 
     def _default_process_table(self) -> ProcessTable:
         return PosixProcessTable()
-
-    def default_shell(self) -> str:
-        for name in ("bash", "sh"):
-            found = self._which(name)
-            if found:
-                return found
-        return self._FALLBACK_SHELL
-
-    def build_launch(self, cmd: str, shell: str | None) -> LaunchSpec:
-        return LaunchSpec(program=shell or self.default_shell(), args=("-c", cmd))
 
     def spawn_kwargs(self) -> dict[str, Any]:
         return {"start_new_session": True}
@@ -372,25 +457,13 @@ class PosixPlatformAdapter(PlatformAdapter):
 
 
 class WindowsPlatformAdapter(PlatformAdapter):
-    """Windows: PowerShell by default (``cmd /c`` when configured), new process group,
-    ``CTRL_BREAK_EVENT`` then ``taskkill /T /F`` + ``TerminateProcess``."""
+    """Windows: PowerShell 7 then Windows PowerShell (``cmd /c`` when configured), new process
+    group, ``CTRL_BREAK_EVENT`` then ``taskkill /T /F`` + ``TerminateProcess``."""
 
-    _POWERSHELL_ARGS = ("-NoProfile", "-NonInteractive", "-Command")
+    _DEFAULT_PLATFORM = "win32"
 
     def _default_process_table(self) -> ProcessTable:
         return WindowsProcessTable()
-
-    def default_shell(self) -> str:
-        return "powershell"
-
-    def build_launch(self, cmd: str, shell: str | None) -> LaunchSpec:
-        program = shell or self.default_shell()
-        name = Path(program).stem.lower()
-        if "cmd" in name:
-            return LaunchSpec(program=program, args=("/c", cmd))
-        if "powershell" in name or name == "pwsh":
-            return LaunchSpec(program=program, args=(*self._POWERSHELL_ARGS, cmd))
-        return LaunchSpec(program=program, args=("-c", cmd))  # e.g. Git bash
 
     def spawn_kwargs(self) -> dict[str, Any]:
         return {"creationflags": CREATE_NEW_PROCESS_GROUP}
@@ -419,8 +492,25 @@ def select_platform(
     *,
     platform: str | None = None,
     process_table: ProcessTable | None = None,
+    which: Which | None = None,
 ) -> PlatformAdapter:
-    """The adapter for ``platform`` (``sys.platform`` by default): ``win32`` → Windows, else POSIX."""
-    if (platform or sys.platform) == "win32":
-        return WindowsPlatformAdapter(config, process_table=process_table)
-    return PosixPlatformAdapter(config, process_table=process_table)
+    """The adapter for ``platform`` (``sys.platform`` by default): ``win32`` → Windows, else POSIX.
+
+    The resolved platform travels with the adapter: it is what the environment announcement names
+    (``linux`` → ``Linux``, ``darwin`` → ``macOS``, ``win32`` → ``Windows``, ADR-030 §3).
+    """
+    resolved = platform or sys.platform
+    kind = WindowsPlatformAdapter if resolved == "win32" else PosixPlatformAdapter
+    return kind(config, process_table=process_table, which=which, platform=resolved)
+
+
+def default_translator(
+    config: ExecutionSection, *, platform: str | None = None, which: Which | None = None
+) -> ShellTranslator:
+    """The dialect dictionary aimed at the shell this machine actually runs (ADR-030 §4).
+
+    ``execution.translate_commands = false`` yields a translator that never translates and never
+    reports anything, which is the behaviour that predates the ADR.
+    """
+    adapter = select_platform(config, platform=platform, which=which)
+    return ShellTranslator(adapter.detect_shell().dialect, enabled=config.translate_commands)

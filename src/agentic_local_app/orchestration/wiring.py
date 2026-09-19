@@ -9,6 +9,11 @@ terminate orphans, ADR-016), ``SystemClock``, ``UuidIdGenerator``. Tests inject 
 through the keyword arguments; an injected executor is a test double, so no platform adapter (and
 no orphan termination against the real process table) unless one is given explicitly.
 
+ADR-030 §4: ``translator`` is the dialect dictionary handed to the plan runner. Left out, it is
+built from the configuration and from the shell **this machine** runs — which is what production
+wants and what a test with scripted commands must not depend on, so the rigs inject the dialect
+their scripted machine speaks.
+
 Subscription order fixed by ADR-015: ``AuditLog`` (critical) → ``ExecutionTracker`` →
 ``TelemetryService`` (when ``telemetry.enabled``). The ``RecoveryCoordinator`` runs **after** the
 subscribers are registered so that its events are audited (ADR-016 §4), and its report is handed
@@ -42,6 +47,7 @@ from agentic_local_app.context.reducer import ContextReducer
 from agentic_local_app.context.rotation import RotationCoordinator
 from agentic_local_app.context.window import ContextWindowMonitor
 from agentic_local_app.domain.clock import Clock, SystemClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.ids import IdGenerator, UuidIdGenerator
 from agentic_local_app.execution.executor import CommandExecutor, SubprocessCommandExecutor
 from agentic_local_app.execution.payload_guard import PayloadGuard
@@ -150,6 +156,7 @@ def build_application(
     codec: MessageCodec | None = None,
     identity: UserIdentity | None = None,
     scratch: ScratchManager | None = None,
+    translator: ShellTranslator | None = None,
 ) -> Application:
     """Wire the application; ``None`` selects the production implementation of each boundary."""
     clock = clock if clock is not None else SystemClock()
@@ -209,6 +216,7 @@ def build_application(
         config,
         failure_manager=failure_manager,
         scratch=scratch,
+        translator=translator,
     )
     orchestrator_kwargs: dict[str, Any] = {}
     if sleep is not None:

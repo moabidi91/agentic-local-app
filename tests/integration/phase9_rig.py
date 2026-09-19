@@ -31,6 +31,7 @@ from agentic_local_app.config import (
     ScratchSection,
 )
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.events import Event, EventType
 from agentic_local_app.domain.ids import SequentialIdGenerator
 from agentic_local_app.domain.models import (
@@ -41,6 +42,7 @@ from agentic_local_app.domain.models import (
     SessionRecord,
     TaskRecord,
 )
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.observability.event_bus import EventBus, RecordingSubscriber
 from agentic_local_app.orchestration import Application, ConversationManager, build_application
 from agentic_local_app.persistence.interface import ConversationStore
@@ -464,6 +466,7 @@ def make_rig(
     instructions: str | None = None,
     reply_timeout_ms: int = 120_000,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    translator: ShellTranslator | None = None,
 ) -> Rig:
     """Assemble a full application on the §18.3 doubles and record every event of its bus."""
     cfg = config or make_config()
@@ -487,6 +490,9 @@ def make_rig(
         run_recovery=run_recovery,
         instructions=instructions,
         sleep=sleep if sleep is not None else advancing_sleep(clk),
+        # the scripted machine of this rig is POSIX (see OUT_UNAME): pinning the dialect
+        # keeps the suite identical on Windows, where the default would target PowerShell
+        translator=translator or ShellTranslator(ShellDialect.POSIX),
     )
     return Rig(
         app=app,

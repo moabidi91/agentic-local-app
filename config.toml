@@ -183,10 +183,14 @@ verify_tls = true
 # conversation_id_path = "id"
 
 # --------------------------------------------------------------------------------------------
-# Exécution des commandes (ADR-003, ADR-008, ADR-018)
+# Exécution des commandes (ADR-003, ADR-008, ADR-018, ADR-029, ADR-030)
 # --------------------------------------------------------------------------------------------
 [execution]
-shell = ""                              # "" = défaut plateforme : bash/sh (POSIX), PowerShell (Windows)
+shell = ""                              # "" = détecté : bash, zsh puis sh (POSIX) ; pwsh puis
+                                        # powershell (Windows) ; à défaut /bin/sh ou powershell.
+                                        # Renseigné, l'interpréteur nommé est pris tel quel, sans
+                                        # aucune recherche (ADR-030 §1). `agentic-app shell show`
+                                        # affiche ce qui a été retenu et comment.
 cwd = "."                               # répertoire de travail des commandes
 default_task_timeout_ms = 60000         # appliqué si la tâche ne déclare pas timeout_ms
 max_task_timeout_ms = 900000            # plafond d'une valeur déclarée
@@ -194,6 +198,60 @@ cancel_drain_timeout_ms = 5000          # drain après une stop condition (SIGTE
 interrupt_drain_timeout_ms = 5000       # drain après une interruption utilisateur (§2.9)
 live_output_chunk_bytes = 4096          # taille max d'un événement task.output (flux live)
 live_output_interval_ms = 250           # cadence max des événements task.output par tâche
+
+# Dictionnaire de traduction entre dialectes de shell (ADR-030 §4). Le système d'exploitation, le
+# shell détecté et le répertoire de travail sont ANNONCÉS au modèle dans les instructions : il
+# écrit donc normalement des commandes valides. Quand il se trompe de dialecte malgré tout, une
+# commande POSIX envoyée à PowerShell (ou l'inverse) est réécrite — mais UNIQUEMENT quand un petit
+# dictionnaire fermé la traduit exactement.
+#
+# Trois garanties, dans cet ordre :
+#   - jamais silencieux : la commande réellement exécutée et les règles qui ont joué entrent dans
+#     le journal d'audit (événement task.state_changed vers RUNNING, chaîné par hachage), et le
+#     modèle reçoit les deux formes dans le champ `translation` du résultat ;
+#   - seulement ce dont le dictionnaire est sûr : tout le reste passe TEL QUEL, et le résultat dit
+#     pourquoi, pour que le modèle se corrige lui-même ;
+#   - rien qui écrive : toutes les règles traduisent des commandes qui LISENT (ls, cat, head, tail,
+#     pwd, echo, which, env, et la syntaxe $NAME / $env:NAME). Rien qui crée, déplace ou supprime
+#     n'est jamais réécrit — c'est ainsi que « refuser plutôt que deviner » est garanti.
+#
+# Sont refusés d'office : tubes, redirections, opérateurs de chaînage, jokers, substitutions,
+# préfixes NAME=valeur, et les programmes dont le langage de motifs, la convention de code de
+# sortie ou l'effet diffèrent (grep, sed, awk, find, test, rm, mv, cp…).
+#
+# false : aucune commande n'est jamais réécrite (comportement d'avant l'ADR) et aucun résultat ne
+# porte de champ `translation`. La table complète est inspectable : `agentic-app shell rules`.
+translate_commands = true
+
+# Programmes dont un code de sortie non nul est un VERDICT, pas une tâche qui a mal tourné
+# (ADR-029 §2). Un compilateur qui refuse de compiler, un lanceur de tests qui rapporte un échec,
+# un linter qui trouve une faute : leur code de sortie EST le résultat que la boucle cherche. Quand
+# l'un d'eux a bien tourné (ni échec de lancement, ni timeout) et rend un code non nul, le plan
+# CONTINUE — sauf si le modèle a demandé l'arrêt sur cette tâche (`critical` ou
+# `stop_plan_on_failure`), une consigne explicite l'emportant toujours sur un défaut implicite.
+#
+# Chaque entrée est un programme (« mvn ») ou un programme et la sous-commande qui compte
+# (« npm run » : `npm install` n'est pas une compilation, et `npm build` n'existe pas). La
+# correspondance porte sur le PREMIER mot de la commande, chemin, extension et casse retirés
+# (« /usr/bin/MVN », « mvn.cmd » et « mvn » sont la même entrée), les affectations de tête
+# (« JAVA_HOME=… mvn test ») étant ignorées. Ce que cette lecture ne voit pas est listé en points
+# ouverts d'ADR-029 : une commande derrière une variable de shell, un tube dont le code de sortie
+# est celui de la dernière commande, un script maison au nom quelconque.
+#
+# Liste entièrement configurable : ajouter les outils de la maison, ou la vider ([]) pour revenir
+# au comportement d'avant l'ADR (tout échec arrête le plan, sauf continue_on_error).
+verdict_programs = [
+  # Compilations JVM et leurs wrappers
+  "mvn", "mvnw", "gradle", "gradlew", "ant", "sbt", "javac",
+  # Node et TypeScript
+  "npm run", "npm test", "yarn", "pnpm", "npx", "tsc", "eslint",
+  # Rust, .NET, Go
+  "cargo", "dotnet", "go",
+  # C / C++ et la famille make
+  "make", "cmake", "ninja", "gcc", "g++", "clang", "clang++",
+  # Python
+  "pytest", "tox", "ruff", "mypy", "flake8", "pylint",
+]
 
 # --------------------------------------------------------------------------------------------
 # Espace de travail par session et fichiers temporaires (ADR-026)

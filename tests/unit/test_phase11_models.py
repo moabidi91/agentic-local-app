@@ -39,8 +39,10 @@ from agentic_local_app.config import (
     requires_credentials,
 )
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ConfigError
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.identity import (
     SOURCE_CONFIG,
     SOURCE_UNKNOWN,
@@ -377,6 +379,7 @@ def _build(config: AppConfig, **kwargs: Any) -> Application:
         clock=clock,
         ids=SequentialIdGenerator(),
         run_recovery=False,
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
         **kwargs,
     )
 

@@ -4,8 +4,9 @@ ADR-010, ADR-011).
 Everything here is pure or reads the store; nothing is persisted. Four services:
 
 - :meth:`PayloadGuard.effective_budget` — ``min(task ?? plan ?? app default, hard max)`` (ADR-010);
-- :meth:`PayloadGuard.apply` — the truncation algorithm of ADR-011 on raw bytes, returning the kept
-  bytes and their ``[start, end)`` ranges in the original streams;
+- :meth:`PayloadGuard.apply` — the truncation algorithm of ADR-011, as amended by ADR-029 §1
+  (a guaranteed share per stream), on raw bytes, returning the kept bytes and their ``[start, end)``
+  ranges in the original streams;
 - :meth:`PayloadGuard.fit_message` — the deterministic re-truncation of an ``execution_result`` that
   exceeds ``max_message_bytes`` (ADR-010): longest ``stdout`` halved first, ``stderr`` last;
 - :meth:`PayloadGuard.serve_chunk` — a ``chunk_request`` answered from the stored blobs (ADR-011).
@@ -90,15 +91,25 @@ class PayloadGuard:
         )
         return min(declared, self._config.hard_max_output_bytes)
 
-    # ---- truncation (ADR-011) ------------------------------------------------------------
+    # ---- truncation (ADR-011, §1 amended by ADR-029 §1) ----------------------------------
     def apply(self, stdout: bytes, stderr: bytes, budget: int) -> TruncatedOutput:
-        """Keep the **end** of stderr up to ``budget`` bytes, then the **end** of stdout with what is
-        left. ``len(stdout_kept) + len(stderr_kept) <= budget`` by construction."""
+        """Keep the **end** of each stream, each guaranteed its own share of the budget.
+
+        ADR-029 §1, amending ADR-011 §1: each stream keeps at least ``min(len(stream), budget // 2)``
+        bytes, and whatever one stream does not use is given to the other — stderr first, which is
+        all that is left of the stderr priority ADR-011 gave it. A noisy stderr can therefore no
+        longer delete stdout entirely, which is where the verdict of a JVM build tool lives.
+        ``len(stdout_kept) + len(stderr_kept) <= budget`` by construction.
+        """
         if budget < 0:
             raise ValueError("budget must be >= 0")
         stderr_total, stdout_total = len(stderr), len(stdout)
-        stderr_keep = min(stderr_total, budget)
-        stdout_keep = min(stdout_total, budget - stderr_keep)
+        half = budget // 2
+        stderr_keep, stdout_keep = min(stderr_total, half), min(stdout_total, half)
+        spare = budget - stderr_keep - stdout_keep
+        taken = min(spare, stderr_total - stderr_keep)
+        stderr_keep, spare = stderr_keep + taken, spare - taken
+        stdout_keep += min(spare, stdout_total - stdout_keep)
         stderr_kept = stderr[stderr_total - stderr_keep :] if stderr_keep else b""
         stdout_kept = stdout[stdout_total - stdout_keep :] if stdout_keep else b""
         return TruncatedOutput(

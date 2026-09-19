@@ -12,7 +12,12 @@ from pathlib import Path
 
 import pytest
 
-from agentic_local_app.config import AppConfig, load_config, load_dotenv
+from agentic_local_app.config import (
+    DEFAULT_VERDICT_PROGRAMS,
+    AppConfig,
+    load_config,
+    load_dotenv,
+)
 from agentic_local_app.domain.canonical import GENESIS_HASH, canonical_json, chain_hash, size_bytes
 from agentic_local_app.domain.clock import FakeClock
 from agentic_local_app.domain.errors import ConfigError, PersistenceError
@@ -116,6 +121,18 @@ def given_repo_config_toml_when_loaded_then_transport_is_the_only_model_profile(
     assert cfg.active_transport is cfg.transport
 
 
+def given_execution_section_when_config_loaded_then_translation_on_and_shell_auto_detected() -> (
+    None
+):
+    """ADR-030: ``shell`` stays empty (detected) and the dialect dictionary is on by default."""
+    assert AppConfig().execution.shell == ""
+    assert AppConfig().execution.translate_commands is True
+    cfg = load_config(
+        None, environ={"AGENTIC__EXECUTION__TRANSLATE_COMMANDS": "false"}, load_env_file=False
+    )
+    assert cfg.execution.translate_commands is False
+
+
 def given_protocol_section_when_config_loaded_then_direct_response_allowed_by_default() -> None:
     """ADR-022: ``[protocol] allow_direct_response`` defaults to true and can be turned off."""
     assert AppConfig().protocol.allow_direct_response is True
@@ -158,6 +175,47 @@ def given_token_env_set_when_token_read_then_value_returned_and_masked_in_dump(
     monkeypatch.setenv(cfg.transport.token_env, "secret-token")
     assert cfg.transport.token == "secret-token"
     assert cfg.masked()["transport"]["token"] == "***"
+
+
+def given_default_config_when_loaded_then_verdict_programs_cover_the_documented_families() -> None:
+    """ADR-029 §2: the shipped list names the build tools, test runners and linters of five
+    families; each entry is a program, or a program and the sub-command that matters."""
+    programs = AppConfig().execution.verdict_programs
+    assert programs == list(DEFAULT_VERDICT_PROGRAMS)
+    for expected in ("mvn", "gradlew", "cargo", "dotnet", "go", "make", "pytest", "ruff", "tsc"):
+        assert expected in programs
+    assert "npm run" in programs and "npm" not in programs  # npm install is not a build
+    assert all(1 <= len(entry.split()) <= 2 for entry in programs)
+    assert len(programs) == len(set(programs))
+
+
+def given_verdict_programs_when_declared_then_paths_extensions_and_case_normalised() -> None:
+    cfg = load_config(
+        None,
+        environ={
+            "AGENTIC__EXECUTION__VERDICT_PROGRAMS": '["/usr/bin/MVN", "C:\\\\tools\\\\mvn.cmd", '
+            '" npm   RUN "]'
+        },
+        load_env_file=False,
+    )
+    assert cfg.execution.verdict_programs == ["mvn", "npm run"]
+
+
+def given_verdict_programs_when_cleared_then_the_rule_is_off() -> None:
+    cfg = load_config(
+        None, environ={"AGENTIC__EXECUTION__VERDICT_PROGRAMS": "[]"}, load_env_file=False
+    )
+    assert cfg.execution.verdict_programs == []
+
+
+def given_verdict_program_entry_with_three_words_when_loaded_then_config_error() -> None:
+    with pytest.raises(ConfigError) as exc:
+        load_config(
+            None,
+            environ={"AGENTIC__EXECUTION__VERDICT_PROGRAMS": '["npm run build"]'},
+            load_env_file=False,
+        )
+    assert exc.value.error.error_code == "CONFIG_INVALID"
 
 
 def given_dotenv_file_when_loaded_then_only_missing_variables_set(tmp_path: Path) -> None:

@@ -149,13 +149,13 @@ Choix de conception :
 | Sujet | Décision | Motif |
 |---|---|---|
 | Échec ≠ exception | `exit_code ≠ 0` **et** échec de spawn (`spawn_error`, `exit_code = None`) sont des `RawExecution`, jamais des exceptions. `TaskExecutionError` (`OUTPUT_READ_FAILED`) n'est levée que si l'exécuteur lui-même est défaillant. | §3.8, ADR-008 §4 |
-| Lancement | `create_subprocess_exec(shell, "-c", cmd)` et non `create_subprocess_shell(cmd, executable=shell)` : cette dernière forme laisse `argv[0] = /bin/sh` et **bash invoqué sous le nom `sh` passe en mode POSIX** (vérifié : `shopt -o posix` → `on`). La commande n'est jamais réécrite. | ADR-003 §2, §1 |
+| Lancement | `create_subprocess_exec(shell, "-c", cmd)` et non `create_subprocess_shell(cmd, executable=shell)` : cette dernière forme laisse `argv[0] = /bin/sh` et **bash invoqué sous le nom `sh` passe en mode POSIX** (vérifié : `shopt -o posix` → `on`). La forme suit le **dialecte détecté**, pas le système d'exploitation ; seul PowerShell reçoit un script enveloppé (épilogue `exit $LASTEXITCODE`, `-EncodedCommand`), `cmd /c` et les shells POSIX recevant la commande verbatim. | ADR-003 §2, ADR-030 §2 |
 | Horodatages | `started_monotonic_ms` / `ended_monotonic_ms` / `duration_ms` viennent de `clock.monotonic_ms()` ; seule l'**attente** passe par `asyncio.wait(timeout=…)`. Aucun `time.*`, `datetime.now`, `uuid`, `random` dans les cinq modules (test d'inspection). | ADR-017 |
 | `outcome` | `cancelled` > `timed_out` > `exit_code` : l'annulation est une décision du runner, le timeout une décision de l'exécuteur ; `exit_code == 0` → `COMPLETED`, sinon `FAILED` (y compris `spawn_error`). Sur timeout ou annulation `exit_code = None` (le code du signal n'est pas exposé). | ADR-008 §3 |
 | Annulation | Deux chemins : le **jeton** (`CancellationToken`, chemin gracieux : deux temps avec drain, `cancelled = True`) et l'**annulation asyncio** de la coroutine `execute` (arrêt dur, attente bornée, `CancelledError` propagée). Un jeton déjà levé à l'entrée ne lance rien (`pid = None`). | §2.4, §8.3, §8.4 |
 | Sortie live | Deux lecteurs concurrents ; tranches ≤ `live_output_chunk_bytes` ; au plus une émission par `live_output_interval_ms` **et par flux**, les octets intermédiaires étant regroupés puis vidés par minuterie ou à l'EOF (dernière tranche exemptée). Une émission peut contenir plusieurs tranches consécutives quand plus d'un chunk s'est accumulé. Une exception de `on_output` est comptée (`callback_errors`) et n'interrompt jamais la tâche : le blob reste la vérité. | ADR-018 |
 | `on_spawn` | Appelé juste après le spawn avec `(pid, pgid)` — `pgid = os.getpgid(pid)` sous POSIX (égal au pid grâce à `start_new_session=True`), `None` sous Windows. S'il lève (persistance impossible), le processus est tué et l'exception propagée : rien ne tourne sans trace. | ADR-016 §1 |
-| `env` | `os.environ` copié puis surchargé par `spec.env` ; `shell` = `spec.shell`, sinon `config.shell`, sinon le défaut plateforme. | ADR-003 §3 |
+| `env` | `os.environ` copié puis surchargé par `spec.env` ; `shell` = `spec.shell`, sinon `config.shell`, sinon le shell **détecté** (`bash`, `zsh`, `sh` / `pwsh`, `powershell`, à défaut `/bin/sh` ou `powershell`). | ADR-003 §3, ADR-030 §1 |
 | Orphelins | `terminate_orphan` n'agit que si le processus existe **et** a démarré à ± `ORPHAN_START_TOLERANCE_MS` (5 s) de `started_at` : un pid réattribué à un processus lancé plus tard, ou un processus antérieur à la tâche, n'est jamais signalé. Sous Linux le démarrage vient de `/proc/<pid>/stat` (champ 22) + `btime` ; sans `/proc` (macOS) il est inconnu → aucune action (limite documentée). Windows : `Get-Process … StartTime`, `taskkill /T` puis `/T /F`, en *best effort*. | ADR-016 §1, ADR-003 |
 | Attente bloquante | `ProcessTable.wait_exit` (API synchrone du `RecoveryCoordinator`) attend par pas de 50 ms avec `threading.Event().wait`, borné en nombre de pas : aucune lecture d'horloge. | ADR-017 |
 | Décodage | Uniquement dans `decode_output` (UTF-8, `errors="replace"`), appelé par le `ResultCollector` et `fit_message` ; budgets et plages sont toujours en **octets** du flux brut. | ADR-003 §4, ADR-011 |
@@ -227,16 +227,16 @@ sequenceDiagram
 
 Le chemin d'**annulation** est identique à partir de l'étape 11 : `cancel.wait()` se termine avant le timeout, la même terminaison en deux temps s'applique et le résultat porte `cancelled = True`. Si le processus finit de lui-même pendant la même itération de boucle que la levée du jeton, il est rapporté par son code de retour (seule une terminaison **effectuée** par l'exécuteur pose `timed_out` / `cancelled`).
 
-### 3.5 Algorithme de troncature (ADR-011)
+### 3.5 Algorithme de troncature (ADR-011, règle 1 amendée par ADR-029 §1)
 
 ```mermaid
 flowchart TD
     A([apply stdout O octets, stderr E octets, budget B]) --> B{B < 0 ?}
     B -- oui --> ERR[ValueError]
-    B -- non --> C[stderr_keep = min E, B]
-    C --> D[stderr_kept = E - stderr_keep derniers octets de stderr]
-    D --> E1[stdout_keep = min O, B - stderr_keep]
-    E1 --> F[stdout_kept = derniers stdout_keep octets de stdout]
+    B -- non --> C[part garantie : stderr_keep = min E, B // 2<br/>stdout_keep = min O, B // 2]
+    C --> D[reliquat = B - stderr_keep - stdout_keep]
+    D --> E1[reliquat donne a stderr puis a stdout,<br/>dans la limite de ce qui reste a chacun]
+    E1 --> F[stderr_kept / stdout_kept = derniers octets de chaque flux]
     F --> G[stderr_range = E - stderr_keep, E<br/>stdout_range = O - stdout_keep, O]
     G --> H{stderr_keep < E<br/>ou stdout_keep < O ?}
     H -- oui --> T1[truncated = true]
@@ -245,7 +245,7 @@ flowchart TD
     T0 --> R
 ```
 
-Propriétés vérifiées par la table paramétrée : `len(stdout_kept) + len(stderr_kept) ≤ B` ; `flux[start:end] == kept` pour chaque plage ; `truncated` exact ; quand `E ≥ B`, `stdout_kept` est vide et `stdout_range = (O, O)` (le modèle sait qu'il lui manque `[0, O)`).
+Propriétés vérifiées par la table paramétrée : `len(stdout_kept) + len(stderr_kept) ≤ B` ; `flux[start:end] == kept` pour chaque plage ; `truncated` exact ; **aucun flux n'est coupé sous `min(taille, B // 2)`**, donc un stderr plus gros que le budget ne supprime plus stdout — le cas des outils de compilation JVM, qui écrivent leurs `[ERROR]` et leur `BUILD FAILURE` sur stdout (ADR-029 §1).
 
 ### 3.6 Plafond message (`fit_message`, ADR-010)
 

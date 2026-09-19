@@ -30,8 +30,10 @@ from agentic_local_app.config import (
 )
 from agentic_local_app.domain.canonical import canonical_json
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ConfigError, ErrorType, TransportError
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.interfaces.cli import app as cli_app
 from agentic_local_app.orchestration import Application, build_application
 from agentic_local_app.persistence.memory import InMemoryConversationStore
@@ -1161,6 +1163,7 @@ def _build(config: AppConfig, **kwargs: Any) -> Application:
         clock=clock,
         ids=SequentialIdGenerator(),
         run_recovery=False,
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
         **kwargs,
     )
 

@@ -22,10 +22,12 @@ from agentic_local_app.config import AppConfig, TransportSection
 from agentic_local_app.context.window import ContextWindowMonitor
 from agentic_local_app.domain.canonical import canonical_json
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ErrorType
 from agentic_local_app.domain.events import EventType
 from agentic_local_app.domain.ids import SequentialIdGenerator
 from agentic_local_app.domain.models import MessageRecord
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ContextWindowState,
     ConversationState,
@@ -98,6 +100,7 @@ def codec_rig(attempts: int) -> Rig:
         bus=bus,
         run_recovery=False,
         sleep=advancing_sleep(clock),
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
     )
     return Rig(
         app=app,

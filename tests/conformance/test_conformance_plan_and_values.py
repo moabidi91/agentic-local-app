@@ -987,7 +987,11 @@ async def given_plan_with_stop_on_success_when_the_task_succeeds_then_plan_short
     assert result["status"] == "short_circuited_on_success"
     assert result["stop_reason"] == "stop_plan_on_success:t1"
     assert result["skipped_tasks"] == [
-        {"task_id": "t2", "reason": "plan_stopped:stop_plan_on_success:t1"}
+        {
+            "task_id": "t2",
+            "reason": "plan_stopped:stop_plan_on_success:t1",
+            "execution": "not_started",
+        }
     ]
 
 
@@ -2104,6 +2108,105 @@ async def given_failing_command_when_plan_stops_then_session_is_not_failed() -> 
     assert result["results"][0]["exit_code"] == 1
     assert result["results"][0]["stderr"] == "[ERROR] invalid target release: 21"
     assert rig.conversation(CONV).protocol_error_count == 0
+
+
+@case(
+    "licit-build-tool-verdict-continues",
+    category=UNUSUAL,
+    sends=(
+        "un plan de diagnostic dont la première tâche est `mvn clean install` : la compilation "
+        "échoue (code 1), les tâches suivantes lisent le fichier fautif et la version du JDK"
+    ),
+    expects=(
+        "le plan **continue** : un code non nul rendu par un outil reconnu est un verdict, pas une "
+        "tâche qui a mal tourné. Le plan finit `completed`, les trois résultats sont rapportés et "
+        'celui de la compilation porte `execution: "ran"` et `failure_is_verdict: true`'
+    ),
+    code="accepté",
+    policy="accepté (plan mené à son terme)",
+    ref="§8.3 · ADR-009 §1 · ADR-029 §2 · ADR-029 §4",
+)
+async def given_build_tool_that_fails_when_plan_runs_then_the_rest_of_the_diagnosis_still_runs() -> (
+    None
+):
+    rig = make_rig()
+    rig.executor.script(
+        cmd="mvn clean install",
+        stdout=b"[ERROR] Service.java:[42,13] cannot find symbol\n[INFO] BUILD FAILURE\n",
+        exit_code=1,
+    )
+
+    session = await run_accepted(
+        rig,
+        discovery_plan(
+            tasks=[
+                cmd_task("t1", "mvn clean install"),
+                cmd_task("t2", "sed -n '40,45p' Service.java"),
+                cmd_task("t3", "javac -version"),
+            ]
+        ),
+        final_answer(message_id="model-msg-0002"),
+    )
+    sid = session.session_id
+
+    assert session.status is SessionState.COMPLETED
+    plan = rig.plan(sid, "plan-0")
+    assert plan.status is PlanState.COMPLETED and plan.stop_reason is None
+    assert [rig.task(sid, t).status for t in ("t1", "t2", "t3")] == [
+        TaskState.FAILED,
+        TaskState.COMPLETED,
+        TaskState.COMPLETED,
+    ]
+    # ADR-009 §2 is untouched: the effective rule still says "stops", the runner reads the verdict
+    assert rig.task(sid, "t1").stops_plan_on_failure is True
+    result = rig.posted(1)["content"]
+    assert result["status"] == "completed" and "stop_reason" not in result
+    assert [item["task_id"] for item in result["results"]] == ["t1", "t2", "t3"]
+    first = result["results"][0]
+    assert (first["status"], first["exit_code"]) == ("failed", 1)
+    assert first["execution"] == "ran" and first["failure_is_verdict"] is True
+    assert "BUILD FAILURE" in first["stdout"]
+    assert result["skipped_tasks"] == []
+
+
+@case(
+    "licit-build-tool-verdict-explicit-stop",
+    category=UNUSUAL,
+    sends="la même compilation qui échoue, mais déclarée `critical: true` par le modèle",
+    expects=(
+        "le plan s'arrête : une consigne explicite du modèle l'emporte toujours sur le défaut "
+        "implicite, et le résultat marque quand même le verdict"
+    ),
+    code="accepté",
+    policy="accepté (plan arrêté sur consigne du modèle)",
+    ref="§8.3 · ADR-009 §3 · ADR-029 §2",
+)
+async def given_build_tool_verdict_with_critical_when_plan_runs_then_the_model_instruction_wins() -> (
+    None
+):
+    rig = make_rig()
+    rig.executor.script(cmd="mvn clean install", stdout=b"[INFO] BUILD FAILURE\n", exit_code=1)
+
+    session = await run_accepted(
+        rig,
+        discovery_plan(tasks=[cmd_task("t1", "mvn clean install", critical=True), cmd_task("t2")]),
+        final_answer(message_id="model-msg-0002"),
+    )
+    sid = session.session_id
+
+    plan = rig.plan(sid, "plan-0")
+    assert plan.status is PlanState.STOPPED_ON_FAILURE
+    assert plan.stop_reason == "critical_task_failed:t1"
+    assert rig.task(sid, "t2").status is TaskState.SKIPPED
+    result = rig.posted(1)["content"]
+    assert result["results"][0]["failure_is_verdict"] is True
+    assert result["skipped_tasks"] == [
+        {
+            "task_id": "t2",
+            "reason": "plan_stopped:critical_task_failed:t1",
+            "execution": "not_started",
+        }
+    ]
 
 
 @case(

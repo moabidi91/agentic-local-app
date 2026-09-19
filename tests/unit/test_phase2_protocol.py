@@ -54,6 +54,12 @@ from agentic_local_app.domain.models import (
     SessionRecord,
     TaskRecord,
 )
+from agentic_local_app.domain.shell import (
+    DetectedShell,
+    ExecutionEnvironment,
+    ShellDialect,
+    ShellSource,
+)
 from agentic_local_app.domain.states import (
     INBOUND_MESSAGE_TYPES,
     OUTBOUND_MESSAGE_TYPES,
@@ -452,12 +458,14 @@ def given_execution_result_content_when_built_then_canonical_json_equals_spec_12
     content = ExecutionResultContent.model_validate(example["content"])
     built = adapter.build_execution_result(_conversation(REMOTE_ID), "msg-005", content)
     expected = copy.deepcopy(example)
-    # Two documented differences with the text of §12.5:
+    # Three documented differences with the text of §12.5:
     # - exclude_none=True drops ``stop_reason: null`` (absence means "no stop reason");
-    # - ADR-008 adds the boolean ``timed_out`` to every task result (false unless it timed out).
+    # - ADR-008 adds the boolean ``timed_out`` to every task result (false unless it timed out);
+    # - ADR-029 §4 adds ``execution`` to every task result (``ran`` unless the command never did).
     del expected["content"]["stop_reason"]
     for result in expected["content"]["results"]:
         result["timed_out"] = False
+        result["execution"] = "ran"
     assert built.payload == expected
     assert built.canonical == canonical_json(expected)
     assert "stop_reason" not in built.payload["content"]
@@ -480,11 +488,12 @@ def given_execution_result_with_stop_reason_when_built_then_stop_reason_serialis
     assert built.payload["content"]["status"] == "stopped_on_failure"
     assert built.payload["content"]["stop_reason"] == "stop_plan_on_failure:t7"
     assert built.payload["content"]["skipped_tasks"] == [
-        {"task_id": "t8", "reason": "stop_plan_on_failure:t7"}
+        {"task_id": "t8", "reason": "stop_plan_on_failure:t7", "execution": "not_started"}
     ]
     assert built.payload["content"]["results"][0] == {
         "task_id": "t7",
         "status": "failed",
+        "execution": "ran",
         "exit_code": 1,
         "stdout": "",
         "stderr": "boom",
@@ -1795,6 +1804,46 @@ def given_flag_combination_when_projected_then_stops_plan_on_failure_is_or_of_ad
     assert ("CONTRADICTORY_FLAGS:t1" in inbound.warnings) is contradictory
 
 
+@pytest.mark.parametrize(
+    ("declared", "plan_default", "resolved"),
+    [
+        pytest.param(None, None, False, id="neither"),
+        pytest.param(None, True, True, id="plan-only-true"),
+        pytest.param(None, False, False, id="plan-only-false"),
+        pytest.param(True, None, True, id="task-only-true"),
+        pytest.param(False, None, False, id="task-only-false"),
+        pytest.param(True, False, True, id="task-wins-over-plan-false"),
+        pytest.param(False, True, False, id="task-wins-over-plan-true"),
+    ],
+)
+def given_plan_default_continue_on_error_when_projected_then_task_then_plan_then_false(
+    adapter: ProtocolAdapter,
+    clock: FakeClock,
+    declared: bool | None,
+    plan_default: bool | None,
+    resolved: bool,
+) -> None:
+    """ADR-029 §3: ``task ?? plan ?? false``, and the effective rule of ADR-009 §2 runs verbatim
+    on the resolved value."""
+    task_fields = {} if declared is None else {"continue_on_error": declared}
+    extra = {} if plan_default is None else {"default_continue_on_error": plan_default}
+    inbound = _parse(adapter, _plan([_task("t1", **task_fields)], **extra))
+    plan, (task,) = _records(adapter, inbound, clock)
+    assert inbound.content.default_continue_on_error is plan_default  # type: ignore[union-attr]
+    assert task.continue_on_error is resolved
+    assert task.stops_plan_on_failure is not resolved
+    # the plan-level default is resolved at validation time; no column is added to the record
+    assert "default_continue_on_error" not in plan.model_dump()
+
+
+def given_plan_default_continue_on_error_with_critical_task_when_parsed_then_contradiction_warned(
+    adapter: ProtocolAdapter,
+) -> None:
+    """The contradiction of ADR-009 §2 is read on the **resolved** value, not on the literal."""
+    inbound = _parse(adapter, _plan([_task("t1", critical=True)], default_continue_on_error=True))
+    assert inbound.warnings == ["CONTRADICTORY_FLAGS:t1"]
+
+
 def given_stop_plan_on_success_when_projected_then_flag_copied(
     adapter: ProtocolAdapter, clock: FakeClock
 ) -> None:
@@ -2034,6 +2083,112 @@ def given_custom_config_when_instructions_rendered_then_custom_values_replace_de
     assert "8192" not in text and "131072" not in text and "900000" not in text
 
 
+def given_configured_verdict_programs_when_instructions_rendered_then_the_list_is_named() -> None:
+    """ADR-029 §2: the model is told which programs the deployment reads as verdict-bearing."""
+    custom = AppConfig(execution=ExecutionSection(verdict_programs=["mvn", "npm run"]))
+    text = render_instructions(custom)
+    assert "`mvn`, `npm run`" in text
+    assert "`gradle`" not in text
+    assert "failure_is_verdict" in text
+
+
+def given_no_verdict_programs_when_instructions_rendered_then_the_rule_is_announced_as_off() -> (
+    None
+):
+    custom = AppConfig(execution=ExecutionSection(verdict_programs=[]))
+    text = render_instructions(custom)
+    assert "recognises no program" in text
+    assert "`mvn`" not in text
+
+
+def _environment(
+    dialect: ShellDialect = ShellDialect.POWERSHELL,
+    source: ShellSource = ShellSource.DETECTED,
+    program: str = "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+) -> ExecutionEnvironment:
+    return ExecutionEnvironment(
+        operating_system="Windows",
+        shell=DetectedShell(program=program, name="pwsh", dialect=dialect, source=source),
+        cwd="C:\\work\\project",
+    )
+
+
+def given_detected_environment_when_instructions_rendered_then_os_shell_and_cwd_announced(
+    config: AppConfig,
+) -> None:
+    """ADR-030 §3: the model is told where it is, next to the byte and timeout limits."""
+    text = render_instructions(config, environment=_environment())
+    section = text.split("### 3.6")[1].split("## 4.")[0]
+    assert "**Windows**" in section
+    assert "C:\\Program Files\\PowerShell\\7\\pwsh.exe" in section
+    assert "**powershell**" in section
+    assert "C:\\work\\project" in section
+    assert "found on this machine" in section
+    assert "`Get-ChildItem` rather than `ls -la`" in section
+    # the amendment stays narrow: the model still discovers everything else by itself
+    assert "`discovery_plan`" in section
+    assert re.findall(r"\{[a-z_]+\}", text) == []
+
+
+@pytest.mark.parametrize(
+    ("dialect", "hint"),
+    [
+        (ShellDialect.POSIX, "`ls -la` rather than `Get-ChildItem`"),
+        (ShellDialect.POWERSHELL, "`$env:JAVA_HOME` rather than `$JAVA_HOME`"),
+        (ShellDialect.CMD, "`%JAVA_HOME%` rather than `$JAVA_HOME`"),
+        (ShellDialect.UNKNOWN, "does not recognise that interpreter"),
+    ],
+)
+def given_each_dialect_when_instructions_rendered_then_its_own_advice_is_given(
+    config: AppConfig, dialect: ShellDialect, hint: str
+) -> None:
+    assert hint in render_instructions(config, environment=_environment(dialect))
+
+
+def given_pinned_shell_when_instructions_rendered_then_the_source_says_so(
+    config: AppConfig,
+) -> None:
+    text = render_instructions(config, environment=_environment(source=ShellSource.CONFIGURED))
+    assert "chosen by the operator" in text
+    text = render_instructions(config, environment=_environment(source=ShellSource.DEFAULT))
+    assert "the default, nothing else was found" in text
+
+
+def given_translation_enabled_when_instructions_rendered_then_the_result_fields_are_explained(
+    config: AppConfig,
+) -> None:
+    text = render_instructions(config, environment=_environment())
+    assert "may translate" in text
+    assert "`translation.reason` says what stopped the dictionary" in text
+    assert "original_cmd" in text and "executed_cmd" in text and "unchanged" in text
+
+
+@pytest.mark.parametrize(
+    ("section", "dialect"),
+    [
+        (ExecutionSection(translate_commands=False), ShellDialect.POWERSHELL),
+        (ExecutionSection(), ShellDialect.CMD),  # no rule table towards cmd
+    ],
+)
+def given_no_translation_when_instructions_rendered_then_the_rule_is_announced_as_off(
+    section: ExecutionSection, dialect: ShellDialect
+) -> None:
+    text = render_instructions(AppConfig(execution=section), environment=_environment(dialect))
+    assert "never rewrites a command" in text
+    assert "may translate" not in text
+
+
+def given_two_machines_when_instructions_rendered_then_only_the_announcement_differs(
+    config: AppConfig,
+) -> None:
+    windows = render_instructions(config, environment=_environment())
+    posix = render_instructions(
+        config, environment=_environment(ShellDialect.POSIX, program="/usr/bin/bash")
+    )
+    assert windows != posix
+    assert windows.split("### 3.6")[0] == posix.split("### 3.6")[0]
+
+
 def given_instructions_when_rendered_then_no_placeholder_left_unresolved(
     config: AppConfig,
 ) -> None:
@@ -2107,6 +2262,10 @@ def given_instructions_when_rendered_twice_then_identical(config: AppConfig) -> 
         "interrupted_tasks",
         "reason",
         "stop_reason",
+        # verdict of a recognised tool and plan-level default ADR-029
+        "default_continue_on_error",
+        "failure_is_verdict",
+        "not_started",
         # session budget ADR-012
         "session_budget",
         "max_cycles",

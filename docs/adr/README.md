@@ -8,7 +8,7 @@ Format : **Contexte** (ce que dit la spec, où ça coince) · **Décision** · *
 |---|---|---|---|
 | [ADR-001](ADR-001-stack-technique.md) | Stack technique : Python, asyncio, pydantic, SQLite, pytest | tout | accepté |
 | [ADR-002](ADR-002-interfaces-utilisateur.md) | Interfaces : CLI + API HTTP locale | §3.1, §4 | accepté |
-| [ADR-003](ADR-003-plateformes-cibles.md) | Plateformes : Windows + Linux/macOS, couche plateforme | §2.4, §3.8, §17.5 | accepté |
+| [ADR-003](ADR-003-plateformes-cibles.md) | Plateformes : Windows + Linux/macOS, couche plateforme | §2.4, §3.8, §17.5 | accepté (§3 amendé par ADR-030) |
 | [ADR-004](ADR-004-contrat-de-transport.md) | Contrat de transport : endpoints configurables, jeton, user id, mock | §2.1, §3.12 | accepté |
 | [ADR-005](ADR-005-resume-de-contexte-par-le-modele.md) | Résumé de contexte : `state_summary` porté par le modèle | §2.6, §3.11, §12.8 | accepté |
 | [ADR-006](ADR-006-interruption-nouvelle-conversation.md) | Interruption : INTERRUPTED terminal, nouvelle conversation ensuite | §2.9, §5.1, §9 | accepté |
@@ -34,6 +34,8 @@ Format : **Contexte** (ce que dit la spec, où ça coince) · **Décision** · *
 | [ADR-026](ADR-026-espace-de-travail-et-fichiers-temporaires.md) | Espace de travail par session et fichiers temporaires : section `[scratch]`, dossier par session, `working_space` fourni par l'utilisateur jamais supprimé, variables `AGENTIC_SCRATCH_DIR` / `AGENTIC_WORKING_SPACE` / `AGENTIC_SESSION_ID`, inventaire et politique de nettoyage | §3.4, ADR-003, ADR-018 | accepté |
 | [ADR-027](ADR-027-champs-d-identifiants-par-modele.md) | Champs d'identifiants déclarés par le profil (`credential_fields`, `secret` fermé par défaut, champ implicite `access_token`), `GET /models` sans `env`, `POST /credentials` en objet plat avec l'alias `token`, section `[skills]` et `GET /skills`, `skills` / `effort` tracés dans `session.created` sans être transmis au modèle | §3.12, §4, ADR-024, ADR-025 | accepté |
 | [ADR-028](ADR-028-ouverture-de-session-sans-message.md) | Ouverture de session sans message : `goal` et `user_message` facultatifs mais appariés (`400 GOAL_REQUIRED` / `USER_MESSAGE_REQUIRED`), session `READY` sans conversation ni cycle, premier message qui ouvre la première conversation et devient le but, `user_id` porté par la session et aligné sur `GET /whoami`, `agentic-app open`, origines CORS du front (1420) | §5, §16, ADR-006, ADR-016, ADR-018, ADR-024 | accepté |
+| [ADR-029](ADR-029-echec-d-outil-comme-verdict.md) | L'échec d'un outil est un verdict : troncature qui garantit une part à chaque flux (amende ADR-011 §1), `[execution] verdict_programs` dont l'échec n'arrête pas le plan sauf consigne explicite du modèle (précise ADR-009 §1), `default_continue_on_error` au niveau du plan, champs `execution` et `failure_is_verdict` du résultat de tâche | §2.5, §8.3, §12.5, ADR-009, ADR-010, ADR-011, ADR-017 | accepté |
+| [ADR-030](ADR-030-shell-detecte-et-traduction-de-dialectes.md) | Le shell de la machine détecté, annoncé et traduit : `DetectedShell` / `ExecutionEnvironment` (dialectes `posix` / `powershell` / `cmd` / `unknown`, `which` injecté), code de sortie natif préservé sur Windows (`-EncodedCommand` + `exit $LASTEXITCODE`), environnement annoncé dans les instructions et dictionnaire fermé entre dialectes appliqué seulement quand il est exact, tracé des deux côtés (`[execution] translate_commands`, champ `translation`, `agentic-app shell show` / `shell rules`) | §3.8, §17.5, ADR-003 §3, ADR-029 | accepté |
 
 ## Comment contester un ADR
 

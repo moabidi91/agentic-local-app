@@ -27,6 +27,7 @@ import pytest
 
 from agentic_local_app.config import AppConfig, ScratchSection
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import (
     ErrorType,
     InvalidTransitionError,
@@ -42,6 +43,7 @@ from agentic_local_app.domain.models import (
     SessionRecord,
     TaskRecord,
 )
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ConversationState,
     MessageType,
@@ -166,6 +168,7 @@ class Harness:
         max_total_duration_ms: int = 60_000,
         session_started: bool = True,
         scratch: ScratchManager | None = None,
+        translator: ShellTranslator | None = None,
     ) -> Harness:
         fake = FakeCommandExecutor(clock)
         runner = PlanRunner(
@@ -178,6 +181,8 @@ class Harness:
             config,
             failure_manager=failure_manager,
             scratch=scratch,
+            # ADR-030 §4: no plan of this suite depends on the shell of the machine running it
+            translator=translator or ShellTranslator(ShellDialect.UNKNOWN),
         )
         now = clock.now()
         session = SessionRecord(
@@ -228,6 +233,7 @@ class Harness:
         policy: str = "sequential",
         workers: int | None = None,
         default_max_output_bytes: int | None = None,
+        default_continue_on_error: bool | None = None,
         plan_id: str = PLAN_ID,
     ) -> tuple[PlanRecord, list[TaskRecord]]:
         """PENDING records exactly as the orchestrator gets them from the adapter, persisted."""
@@ -241,6 +247,8 @@ class Harness:
             raw["max_parallel_workers"] = workers
         if default_max_output_bytes is not None:
             raw["default_max_output_bytes"] = default_max_output_bytes
+        if default_continue_on_error is not None:
+            raw["default_continue_on_error"] = default_continue_on_error
         content = PlanContent.model_validate(raw)
         inbound = InboundMessage(
             envelope=Envelope(
@@ -553,6 +561,130 @@ async def given_cmd_task_when_run_then_command_spec_carries_applied_timeout_cwd_
     assert harness.task("t2").timeout_ms_applied == config.execution.max_task_timeout_ms
 
 
+# ---- the dialect dictionary at the launch (ADR-030 §4) -------------------------------------
+def _translating(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+    *,
+    enabled: bool = True,
+) -> Harness:
+    """A harness whose machine speaks PowerShell, whatever the machine running the test."""
+    return Harness.build(
+        store,
+        bus,
+        recorder,
+        clock,
+        ids,
+        config if enabled else _with_execution(config, translate_commands=False),
+        translator=ShellTranslator(ShellDialect.POWERSHELL, enabled=enabled),
+    )
+
+
+def _running_events(recorder: RecordingSubscriber) -> list[Event]:
+    return [
+        event
+        for event in recorder.of_type(EventType.TASK_STATE_CHANGED)
+        if event.payload.get("to") == "RUNNING"
+    ]
+
+
+async def given_posix_command_and_powershell_shell_when_run_then_translated_executed_and_traced(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+) -> None:
+    harness = _translating(store, bus, recorder, clock, ids, config)
+    plan, tasks = harness.plan([_cmd("t1", "ls -la"), _cmd("t2", "mvn -version")])
+
+    outcome = await harness.run(plan, tasks)
+
+    # what really ran is what the shell received
+    assert [call.cmd for call in harness.fake.calls] == ["Get-ChildItem -Force", "mvn -version"]
+    # ... what the audit trail keeps of it (the durable trace: no column, an event)
+    running = _running_events(recorder)
+    assert running[0].payload["cmd_executed"] == "Get-ChildItem -Force"
+    assert running[0].payload["translation_rules"] == ["list-directory"]
+    assert running[0].payload["translated_to"] == "powershell"
+    assert running[0].audited  # the trace is hash-chained by the audit log
+    assert "cmd_executed" not in running[1].payload
+    # ... and what the model reads, derived from the very same command
+    assert outcome.execution_result is not None
+    first, second = outcome.execution_result.results
+    assert first.translation is not None and first.translation.status == "translated"
+    assert first.translation.original_cmd == "ls -la"
+    assert first.translation.executed_cmd == "Get-ChildItem -Force"
+    assert first.translation.rules == ["list-directory"]
+    assert second.translation is None
+    # ... while the record itself is untouched: the schema does not know about any of this
+    assert [task.cmd for task in outcome.tasks] == ["ls -la", "mvn -version"]
+
+
+async def given_unmappable_command_when_run_then_it_runs_verbatim_and_the_reason_is_reported(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+) -> None:
+    harness = _translating(store, bus, recorder, clock, ids, config)
+    plan, tasks = harness.plan([_cmd("t1", "rm -rf build")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert [call.cmd for call in harness.fake.calls] == ["rm -rf build"]
+    assert outcome.execution_result is not None
+    translation = outcome.execution_result.results[0].translation
+    assert translation is not None and translation.status == "unchanged"
+    assert translation.executed_cmd == translation.original_cmd == "rm -rf build"
+    assert translation.rules == []
+    assert translation.reason is not None and "only commands that read" in translation.reason
+    running = _running_events(recorder)[0]
+    assert running.payload["translation_note"] == translation.reason
+    assert "cmd_executed" not in running.payload
+
+
+async def given_translation_disabled_when_run_then_nothing_is_rewritten_nor_reported(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+) -> None:
+    harness = _translating(store, bus, recorder, clock, ids, config, enabled=False)
+    plan, tasks = harness.plan([_cmd("t1", "ls -la")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert [call.cmd for call in harness.fake.calls] == ["ls -la"]
+    assert _running_events(recorder)[0].payload == {"from": "PENDING", "to": "RUNNING"}
+    assert outcome.execution_result is not None
+    assert outcome.execution_result.results[0].translation is None
+
+
+async def given_chunk_request_task_when_run_then_the_dictionary_is_never_consulted(
+    harness: Harness,
+) -> None:
+    """A ``chunk_request`` carries no command: there is nothing to translate."""
+    harness.runner.translator = ShellTranslator(ShellDialect.POWERSHELL)
+    _stored_blob(harness, "t0", b"0123456789")
+    plan, tasks = harness.plan([_chunk("tc", "t0", 4, 3)])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert _running_events(harness.recorder)[0].payload == {"from": "PENDING", "to": "RUNNING"}
+    assert outcome.execution_result is not None
+    assert outcome.execution_result.results[0].translation is None
+
+
 async def given_default_shell_when_run_then_spec_shell_is_none(harness: Harness) -> None:
     plan, tasks = harness.plan([_cmd("t1")])
     await harness.run(plan, tasks)
@@ -857,6 +989,219 @@ async def given_task_without_any_flag_when_it_fails_then_plan_stops_with_task_fa
     outcome = await harness.run(plan, tasks)
     assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
     assert outcome.stop_reason == "task_failed:t1"
+
+
+# ------------------------------------------------------------------------------------------------
+# 2b. A recognised tool's non-zero exit is a verdict, not a stop (ADR-029 §2)
+# ------------------------------------------------------------------------------------------------
+BUILD = "mvn clean install"
+DIAGNOSTICS = b"[ERROR] Service.java:[42,13] cannot find symbol\n[INFO] BUILD FAILURE\n"
+
+
+async def given_build_tool_failing_when_plan_runs_then_plan_continues_and_result_says_verdict(
+    harness: Harness,
+) -> None:
+    """The case the whole loop exists for: Maven refuses to compile, and the rest of the
+    diagnostic plan — read the failing file, check the toolchain — still runs."""
+    harness.fake.script(task_id="t1", stdout=DIAGNOSTICS, exit_code=1)
+    plan, tasks = harness.plan(
+        [
+            _cmd("t1", BUILD),
+            _cmd("t2", "sed -n '40,45p' Service.java"),
+            _cmd("t3", "javac -version"),
+        ]
+    )
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.COMPLETED
+    assert outcome.stop_reason is None
+    assert harness.statuses() == {
+        "t1": TaskState.FAILED,
+        "t2": TaskState.COMPLETED,
+        "t3": TaskState.COMPLETED,
+    }
+    assert harness.task("t1").stops_plan_on_failure is True  # ADR-009 §2 is untouched
+    assert outcome.plan.failed_task_count == 1
+    result = outcome.execution_result
+    assert result is not None and result.status == "completed"
+    first = result.results[0]
+    assert (first.status, first.exit_code) == ("failed", 1)
+    assert first.execution == "ran" and first.failure_is_verdict is True
+    assert "BUILD FAILURE" in first.stdout
+    assert [r.task_id for r in result.results] == ["t1", "t2", "t3"]
+
+
+@pytest.mark.parametrize(
+    ("flag", "label"),
+    [
+        pytest.param("critical", "critical_task_failed", id="critical"),
+        pytest.param("stop_plan_on_failure", "stop_plan_on_failure", id="stop_plan_on_failure"),
+    ],
+)
+async def given_build_tool_failing_with_an_explicit_stop_flag_then_the_model_instruction_wins(
+    harness: Harness, flag: str, label: str
+) -> None:
+    harness.fake.script(task_id="t1", stdout=DIAGNOSTICS, exit_code=1)
+    plan, tasks = harness.plan([_cmd("t1", BUILD, **{flag: True}), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == f"{label}:t1"
+    assert harness.statuses()["t2"] is TaskState.SKIPPED
+    result = outcome.execution_result
+    assert result is not None and result.results[0].failure_is_verdict is True
+
+
+async def given_build_tool_that_never_started_then_the_plan_stops_as_before(
+    harness: Harness,
+) -> None:
+    """A spawn error is not a verdict: nothing answered, and there is no output to read."""
+    harness.fake.script(task_id="t1", spawn_error="FileNotFoundError: mvn")
+    plan, tasks = harness.plan([_cmd("t1", BUILD), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == "task_failed:t1"
+    assert harness.statuses()["t2"] is TaskState.SKIPPED
+    assert harness.task("t1").reason == "SPAWN_FAILED"
+    result = outcome.execution_result
+    assert result is not None
+    assert result.results[0].execution == "not_started"
+    assert result.results[0].failure_is_verdict is None
+
+
+async def given_build_tool_that_timed_out_then_the_plan_stops_as_before(harness: Harness) -> None:
+    """A timeout is not a verdict either: the tool was killed before it could answer."""
+    harness.fake.script(task_id="t1", stdout=b"partial", duration_ms=10_000)
+    plan, tasks = harness.plan([_cmd("t1", BUILD, timeout_ms=300), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == "task_failed:t1"
+    result = outcome.execution_result
+    assert result is not None
+    assert result.results[0].execution == "timed_out"
+    assert result.results[0].failure_is_verdict is None
+
+
+async def given_unrecognised_program_failing_then_the_plan_stops_as_before(
+    harness: Harness,
+) -> None:
+    harness.fake.script(task_id="t1", exit_code=1)
+    plan, tasks = harness.plan([_cmd("t1", "grep -n symbol Service.java"), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == "task_failed:t1"
+    result = outcome.execution_result
+    assert result is not None
+    assert result.results[0].execution == "ran"
+    assert result.results[0].failure_is_verdict is None
+
+
+async def given_verdict_programs_cleared_when_build_tool_fails_then_behaviour_predating_adr_029(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+) -> None:
+    harness = Harness.build(
+        store, bus, recorder, clock, ids, _with_execution(config, verdict_programs=[])
+    )
+    harness.fake.script(task_id="t1", exit_code=1)
+    plan, tasks = harness.plan([_cmd("t1", BUILD), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == "task_failed:t1"
+    result = outcome.execution_result
+    assert result is not None and result.results[0].failure_is_verdict is None
+
+
+async def given_verdict_that_does_not_stop_the_plan_then_its_dependants_are_still_skipped(
+    harness: Harness,
+) -> None:
+    """ADR-009 §5 is untouched: a task whose dependency did not complete is skipped even when the
+    plan carries on."""
+    harness.fake.script(task_id="t1", exit_code=1)
+    plan, tasks = harness.plan(
+        [_cmd("t1", BUILD), _cmd("t2", depends_on=["t1"]), _cmd("t3")],
+    )
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.COMPLETED
+    assert harness.statuses() == {
+        "t1": TaskState.FAILED,
+        "t2": TaskState.SKIPPED,
+        "t3": TaskState.COMPLETED,
+    }
+    result = outcome.execution_result
+    assert result is not None
+    assert [(s.task_id, s.reason, s.execution) for s in result.skipped_tasks] == [
+        ("t2", "dependency_failed:t1", "not_started")
+    ]
+
+
+async def given_second_verdict_after_a_first_one_then_the_plan_still_runs_to_the_end(
+    harness: Harness,
+) -> None:
+    harness.fake.script(task_id="t1", exit_code=1)
+    harness.fake.script(task_id="t2", exit_code=2)
+    plan, tasks = harness.plan([_cmd("t1", BUILD), _cmd("t2", "pytest -q"), _cmd("t3")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.COMPLETED
+    assert outcome.plan.failed_task_count == 2
+    result = outcome.execution_result
+    assert result is not None
+    assert [r.failure_is_verdict for r in result.results] == [True, True, None]
+    assert [r.exit_code for r in result.results] == [1, 2, 0]
+
+
+# ------------------------------------------------------------------------------------------------
+# 2c. default_continue_on_error: the plan says it once (ADR-029 §3)
+# ------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("task_value", "plan_default", "resolved", "status"),
+    [
+        pytest.param(None, None, False, PlanState.STOPPED_ON_FAILURE, id="neither:false"),
+        pytest.param(None, True, True, PlanState.COMPLETED, id="plan-only:true"),
+        pytest.param(None, False, False, PlanState.STOPPED_ON_FAILURE, id="plan-only:false"),
+        pytest.param(True, None, True, PlanState.COMPLETED, id="task-only:true"),
+        pytest.param(True, False, True, PlanState.COMPLETED, id="task-wins-over-plan-false"),
+        pytest.param(False, True, False, PlanState.STOPPED_ON_FAILURE, id="task-wins-over-plan"),
+    ],
+)
+async def given_plan_default_continue_on_error_when_a_task_fails_then_task_then_plan_then_false(
+    harness: Harness,
+    task_value: bool | None,
+    plan_default: bool | None,
+    resolved: bool,
+    status: PlanState,
+) -> None:
+    harness.fake.script(task_id="t1", exit_code=1)
+    declared = {} if task_value is None else {"continue_on_error": task_value}
+    plan, tasks = harness.plan(
+        [_cmd("t1", "grep -n x pom.xml", **declared), _cmd("t2")],
+        default_continue_on_error=plan_default,
+    )
+
+    outcome = await harness.run(plan, tasks)
+
+    t1 = harness.task("t1")
+    assert t1.continue_on_error is resolved  # the resolved value is what is persisted
+    assert t1.stops_plan_on_failure is not resolved  # ADR-009 §2 runs verbatim on it
+    assert outcome.plan.status is status
 
 
 # ================================================================================================

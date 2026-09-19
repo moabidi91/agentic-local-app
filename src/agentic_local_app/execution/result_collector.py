@@ -1,5 +1,5 @@
 """``ResultCollector`` — one ``execution_result`` per terminal plan (§3.9, §8.4, §12.5 ; ADR-009,
-ADR-011, ADR-017).
+ADR-011, ADR-017, ADR-029).
 
 The collector is a pure mapping from persisted records to the protocol content:
 
@@ -11,15 +11,32 @@ The collector is a pure mapping from persisted records to the protocol content:
 - a ``cmd`` task result carries the decoded kept output and the truncation metadata of its
   :class:`~agentic_local_app.execution.payload_guard.TruncatedOutput`; a ``chunk_request`` result
   carries the served :class:`~agentic_local_app.execution.payload_guard.ChunkResult`;
+- every entry says plainly what became of its command (ADR-029 §4): ``execution`` is ``ran``,
+  ``not_started``, ``timed_out`` or ``stopped``, and ``failure_is_verdict`` marks the non-zero exit
+  of a recognised program — a result to interpret, not a task that went wrong;
+- a command the dialect dictionary was consulted about carries ``translation`` (ADR-030 §4): what
+  the model wrote, what actually ran, which rules fired — or, when nothing was rewritten, why. Like
+  ``execution`` and ``failure_is_verdict``, it is **derived** from the record rather than stored:
+  the translator is a pure function of the command, so re-asking it here gives the answer the
+  runner acted on, and no column can drift from what ran;
 - an ``INTERRUPTED`` plan has **no** ``execution_result`` (§8.4): ``build`` raises ``ValueError``.
 """
 
 from __future__ import annotations
 
+from agentic_local_app.domain.commands import VerdictPrograms
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.models import PlanRecord, TaskRecord
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import OutputStream, PlanState, TaskState, TaskType
 from agentic_local_app.execution.payload_guard import ChunkResult, TruncatedOutput, decode_output
-from agentic_local_app.protocol.messages import ExecutionResultContent, TaskRef, TaskResult
+from agentic_local_app.protocol.messages import (
+    ExecutionResultContent,
+    TaskExecution,
+    TaskRef,
+    TaskResult,
+    TaskTranslation,
+)
 
 __all__ = ["ResultCollector"]
 
@@ -29,9 +46,24 @@ _REFERENCE_LISTS: dict[TaskState, str] = {
     TaskState.CANCELLED: "cancelled_tasks",
     TaskState.INTERRUPTED: "interrupted_tasks",
 }
+#: ADR-029 §4 — a task the application ended before its command could answer.
+_STOPPED_STATES = frozenset({TaskState.CANCELLED, TaskState.INTERRUPTED})
 
 
 class ResultCollector:
+    """``verdict_programs`` is the recogniser of ADR-029 §2; an empty one marks no verdict, which
+    is what an operator who cleared ``execution.verdict_programs`` asked for. ``translator`` is the
+    dialect dictionary of ADR-030 §4, aimed at the shell that ran the commands; the default one
+    translates nothing, so a result then carries no ``translation`` field at all."""
+
+    def __init__(
+        self,
+        verdict_programs: VerdictPrograms | None = None,
+        translator: ShellTranslator | None = None,
+    ) -> None:
+        self._verdict_programs = verdict_programs or VerdictPrograms()
+        self._translator = translator or ShellTranslator(ShellDialect.UNKNOWN)
+
     def build(
         self,
         plan: PlanRecord,
@@ -70,7 +102,11 @@ class ResultCollector:
             elif task.status in _REFERENCE_LISTS:
                 reason = task.reason or task.status.protocol_value
                 references[_REFERENCE_LISTS[task.status]].append(
-                    TaskRef(task_id=task.task_id, reason=reason)
+                    TaskRef(
+                        task_id=task.task_id,
+                        reason=reason,
+                        execution="stopped" if task.status in _STOPPED_STATES else "not_started",
+                    )
                 )
             else:
                 raise ValueError(
@@ -95,8 +131,41 @@ class ResultCollector:
             return self._chunk_result(task, chunk)
         return self._cmd_result(task, output)
 
+    def _translation(self, task: TaskRecord) -> TaskTranslation | None:
+        """ADR-030 §4, **derived** from the command exactly as the plan runner derived it.
+
+        The translator is pure and the command is stored verbatim, so asking it again here answers
+        what the runner acted on a moment earlier — the ``execution_result`` is built at the end of
+        the very run that executed the commands, then persisted as a message and never rebuilt.
+        ``None`` — the ordinary case — means the dictionary was never consulted, and the result then
+        carries no field at all. The durable proof of what ran is the hash-chained
+        ``task.state_changed`` event of the ``RUNNING`` transition, not a column.
+        """
+        decided = self._translator.translate(task.cmd)
+        if decided is None:
+            return None
+        return TaskTranslation(
+            status="translated" if decided.translated else "unchanged",
+            from_dialect=decided.source.value,
+            to_dialect=decided.target.value,
+            original_cmd=decided.original,
+            executed_cmd=decided.executed,
+            rules=list(decided.rules),
+            reason=decided.reason,
+        )
+
     @staticmethod
-    def _cmd_result(task: TaskRecord, output: TruncatedOutput | None) -> TaskResult:
+    def _execution(task: TaskRecord) -> TaskExecution:
+        """ADR-029 §4, for a ``cmd`` task that reached a result state: a timeout is a timeout, an
+        absent ``exit_code`` means no command ever ran (a spawn error, or an executor that could
+        not carry it out), and everything else ran to the end."""
+        if task.timed_out or task.status is TaskState.TIMED_OUT:
+            return "timed_out"
+        if task.exit_code is None:
+            return "not_started"
+        return "ran"
+
+    def _cmd_result(self, task: TaskRecord, output: TruncatedOutput | None) -> TaskResult:
         if output is not None:
             stdout, stderr = decode_output(output.stdout_kept), decode_output(output.stderr_kept)
             truncated = output.truncated
@@ -111,10 +180,16 @@ class ResultCollector:
             original_size_bytes = task.original_size_bytes
             stdout_total, stderr_total = task.stdout_total, task.stderr_total
             stdout_range, stderr_range = task.stdout_range, task.stderr_range
+        verdict = task.status is TaskState.FAILED and self._verdict_programs.is_verdict(
+            task.cmd, task.exit_code, timed_out=task.timed_out
+        )
         return TaskResult(
             task_id=task.task_id,
             status=task.status.protocol_value,
+            execution=self._execution(task),
             exit_code=task.exit_code,
+            failure_is_verdict=True if verdict else None,
+            translation=self._translation(task),
             stdout=stdout,
             stderr=stderr,
             truncated=truncated,
@@ -132,9 +207,11 @@ class ResultCollector:
 
     @staticmethod
     def _chunk_result(task: TaskRecord, chunk: ChunkResult | None) -> TaskResult:
+        # a chunk_request runs no command: the read is local and always happened, served or refused
         return TaskResult(
             task_id=task.task_id,
             status=task.status.protocol_value,
+            execution="ran",
             exit_code=None,
             duration_ms=task.duration_ms,
             reason=task.reason,

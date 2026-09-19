@@ -25,6 +25,7 @@ import pytest
 
 from agentic_local_app.config import AppConfig
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import (
     ErrorType,
     PersistenceError,
@@ -41,6 +42,7 @@ from agentic_local_app.domain.models import (
     SessionRecord,
     TaskRecord,
 )
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ConversationState,
     CycleState,
@@ -176,7 +178,16 @@ class Harness:
         config = _with_drains(config)
         lifecycle = ConversationLifecycleManager(store, bus, clock, ids)
         fake = FakeCommandExecutor(clock)
-        runner = PlanRunner(store, bus, fake, PayloadGuard(config.payload), clock, ids, config)
+        runner = PlanRunner(
+            store,
+            bus,
+            fake,
+            PayloadGuard(config.payload),
+            clock,
+            ids,
+            config,
+            translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
+        )
         gateway = transport or FakeTransportGateway(clock)
         handler = InterruptionHandler(
             store,

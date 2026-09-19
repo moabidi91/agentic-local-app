@@ -21,7 +21,9 @@ from agentic_local_app.config import (
     TransportSection,
 )
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ConversationState,
     CycleState,
@@ -106,6 +108,7 @@ async def _application(
         bus=bus,
         run_recovery=True,
         sleep=advancing_sleep(clock),
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
     )
     engine: MockEngine = mock.state.engine
     return app, engine, executor, recorder

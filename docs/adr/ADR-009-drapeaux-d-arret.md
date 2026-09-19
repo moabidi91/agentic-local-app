@@ -1,6 +1,6 @@
 # ADR-009 — Drapeaux d'arrêt : règle effective, valeurs par défaut, rôle de `critical`
 
-**Statut** : accepté (2026-09-18)
+**Statut** : accepté (2026-09-18) — §1 précisé par [ADR-029](ADR-029-echec-d-outil-comme-verdict.md) §2 : le défaut implicite « un échec arrête le plan » ne s'applique plus au code non nul d'un programme reconnu (`[execution] verdict_programs`) qui a bien tourné ; `critical` et `stop_plan_on_failure` l'emportent toujours, et la règle effective de §2 comme le saut des dépendants de §5 sont inchangés. §1 complété par ADR-029 §3 : `continue_on_error` se résout en `tâche ?? plan ?? false`
 
 ## Contexte
 

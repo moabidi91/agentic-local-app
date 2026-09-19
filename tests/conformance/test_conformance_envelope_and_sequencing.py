@@ -34,9 +34,11 @@ import pytest
 from agentic_local_app.config import AppConfig, ProtocolSection, TransportSection
 from agentic_local_app.domain.canonical import size_bytes
 from agentic_local_app.domain.clock import FakeClock
+from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ErrorType
 from agentic_local_app.domain.events import EventType
 from agentic_local_app.domain.ids import SequentialIdGenerator
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ContextWindowState,
     ConversationState,
@@ -177,6 +179,7 @@ def make_codec_rig(
         bus=bus,
         run_recovery=False,
         sleep=advancing_sleep(clock),
+        translator=ShellTranslator(ShellDialect.POSIX),  # scripted machine, ADR-030
     )
     return Rig(
         app=app,
