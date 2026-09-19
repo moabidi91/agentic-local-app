@@ -1,0 +1,94 @@
+# ============================================================================================
+# agentic-local-app — configuration du MODE DÉMO (demarrage\lancer-web.bat, lancer-desktop.bat)
+#
+# Ce fichier n'est pas la configuration du poste : c'est celle de la démonstration. Il fait
+# tourner la chaîne complète — front, API locale, modèle — sans aucun modèle réel et sans aucun
+# identifiant, en pointant le transport sur le serveur mock que le même script démarre
+# (`agentic-app mock-server --host 127.0.0.1 --port 9000`).
+#
+# La configuration du poste reste `config.toml` à la racine du dépôt : c'est elle qu'utilise le
+# mode « réel » (`lancer-web.bat reel`). Ce fichier-ci n'est jamais lu en dehors du mode démo.
+#
+# Les URL du transport reprennent exactement le contrat ADR-004 que le serveur mock implémente
+# (`src/agentic_local_app/testing/mock_model_server.py`) :
+#   init   POST /v1/conversations
+#   post   POST /v1/conversations/{conversation_id}/messages
+#   get    GET  /v1/conversations/{conversation_id}/messages?after={after}
+#   close  POST /v1/conversations/{conversation_id}/close
+# ============================================================================================
+
+[app]
+name = "agentic-local-app"
+data_dir = "./data-demo"     # base SQLite, blobs et journal d'audit de la démo, à part du réel
+log_level = "INFO"
+env_file = ".env"            # chargé s'il existe, sans écraser une variable déjà définie
+
+# --------------------------------------------------------------------------------------------
+# Transport vers le modèle : le serveur mock local (ADR-004, ADR-020, ADR-021)
+# --------------------------------------------------------------------------------------------
+[transport]
+provider  = "generic_http"   # le serveur mock implémente exactement le contrat ADR-004
+codec     = "passthrough"    # il rend déjà des enveloppes protocolaires : aucune conversion
+init_url  = "http://127.0.0.1:9000/v1/conversations"
+post_url  = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages"
+get_url   = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/messages?after={after}"
+close_url = "http://127.0.0.1:9000/v1/conversations/{conversation_id}/close"
+close_method = "POST"
+token_env = ""               # aucun jeton : les scénarios intégrés n'en exigent aucun
+user_id   = "local-user"
+credential_fields = []       # liste vide explicite (ADR-027) : GET /models rend
+                             # requires_credentials = false, le front n'affiche aucun formulaire
+request_timeout_ms = 15000
+poll_interval_ms   = 250     # le modèle est en local : la démo doit répondre tout de suite
+reply_timeout_ms   = 30000
+gzip = true
+verify_tls = true
+display_name = "Modèle simulé (démo)"
+description  = "Serveur mock local sur 127.0.0.1:9000, aucun jeton, aucun appel sortant"
+
+# --------------------------------------------------------------------------------------------
+# Exécution des commandes (ADR-003, ADR-008)
+#
+# Le scénario « analysis » livré par défaut ne demande aucune commande. Les scénarios « java » et
+# « correction », eux, en font exécuter de vraies sur ce poste (voir demarrage/README.md).
+# --------------------------------------------------------------------------------------------
+[execution]
+shell = ""                   # "" = défaut de la plateforme : PowerShell sous Windows
+cwd = "."
+
+# --------------------------------------------------------------------------------------------
+# Espace de travail par session (ADR-026), séparé de celui du mode réel
+# --------------------------------------------------------------------------------------------
+[scratch]
+enabled = true
+root = "./data-demo/scratch"
+policy = "delete"
+archive_root = "./data-demo/scratch-archive"
+keep_on_failure = true
+
+[skills]
+enabled = true
+root = ""                    # aucun dossier de skills parcouru pendant la démo
+
+# --------------------------------------------------------------------------------------------
+# API HTTP locale (ADR-018, ADR-028)
+# --------------------------------------------------------------------------------------------
+[api]
+host = "127.0.0.1"
+port = 8765
+# Origines autorisées. Le serveur de développement Vite est épinglé sur 1420 (vite.config.ts,
+# strictPort, et devUrl de src-tauri/tauri.conf.json) et la fenêtre Tauri se présente comme
+# tauri://localhost. Les deux orthographes de la boucle locale ne sont pas la même origine pour
+# un navigateur : il faut localhost ET 127.0.0.1.
+cors_origins = [
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "tauri://localhost",
+]
+allow_destructive_admin = false   # POST /admin/reset-database reste fermé, même en démo
+
+# --------------------------------------------------------------------------------------------
+# Protocole côté modèle (ADR-022)
+# --------------------------------------------------------------------------------------------
+[protocol]
+allow_direct_response = true      # le scénario « analysis » répond directement à l'utilisateur

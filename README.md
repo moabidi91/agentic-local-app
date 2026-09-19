@@ -142,6 +142,7 @@ Le détail de chaque couche et le mapping vers les modules Python est dans [`doc
 | Dossier | Contenu |
 |---|---|
 | [`docs/spec/`](docs/spec/SPEC-v1.1.md) | La spécification v1.1, source de vérité |
+| [`demarrage/`](demarrage/README.md) | **Lancer toute la chaîne en un double-clic** (Windows) : `lancer-web.bat` / `lancer-desktop.bat`, modes démo et réel, et le guide de configuration — modèle, jeton, ports et CORS, pause sur 401, données |
 | [`docs/architecture/`](docs/architecture/00-overview.md) | Conception détaillée : composants, machines à états, protocole, exécution, persistance, transport, rotation, interruption, observabilité, module map |
 | [`docs/adr/`](docs/adr/README.md) | Architecture Decision Records : chaque arbitrage pris là où la spec était ambiguë ou muette |
 | [`docs/contracts/`](docs/contracts/front-backend-v1.md) | **Contrat front ↔ application** : chaque route de l'API locale avec sa requête, sa réponse et ses refus, l'enveloppe d'erreur, le flux live, et l'état des lieux méthode par méthode du front de bureau |
