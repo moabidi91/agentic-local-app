@@ -1,0 +1,149 @@
+# pytest report — windows-latest-py3.12 — commit b03d6d562865b4b36360a885bd3bf3e2efe482c0 — run 35557023205
+
+........................................................................ [  2%]
+........................................................................ [  4%]
+........................................................................ [  6%]
+........................................................................ [  8%]
+.....................................................................F.. [ 10%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 17%]
+.......................................................................F [ 19%]
+FF.....F...........................................s.................... [ 21%]
+.............s.......................................................... [ 23%]
+........................................................................ [ 25%]
+........................................................................ [ 27%]
+........................................................................ [ 29%]
+........................................................................ [ 31%]
+........................................................................ [ 34%]
+........................................................................ [ 36%]
+........................................................................ [ 38%]
+........................................................................ [ 40%]
+........................................................................ [ 42%]
+........................................................................ [ 44%]
+........................................................................ [ 46%]
+........................................................................ [ 48%]
+........................................................................ [ 51%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 57%]
+........................................................................ [ 59%]
+........................................................................ [ 61%]
+........................................................................ [ 63%]
+.............s.......................................................... [ 65%]
+..............ss........................................................ [ 68%]
+........................................................................ [ 70%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+........................................................................ [ 80%]
+........................................................................ [ 82%]
+........................................................................ [ 85%]
+........................................................................ [ 87%]
+........................................................................ [ 89%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+........................................................................ [ 95%]
+........................................................................ [ 97%]
+........................................................................ [ 99%]
+...                                                                      [100%]
+================================== FAILURES ===================================
+_________ given_cli_when_help_then_credentials_and_resume_are_listed __________
+tests\integration\test_phase9_cli.py:1500: in given_cli_when_help_then_credentials_and_resume_are_listed
+    assert "--from-env" in credentials_help
+E   AssertionError: assert '--from-env' in '\\x1b[1m \\x1b[0m \\x1b[1m \\x1b[0m\\x1b[1;33mUsage: \\x1b[0m\\x1b[1magentic-app credentials [OPTIONS]\\x1b[0m\\x1b[1m \\x1b[0m...nd exit. \\x1b[2m\u2502\\x1b[0m \\x1b[2m\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\\x1b[0m'
+__ given_user_variable_when_identity_resolved_then_read_from_the_environment __
+tests\unit\test_phase11_models.py:270: in given_user_variable_when_identity_resolved_then_read_from_the_environment
+    assert who == UserIdentity(user_id="alice", source="env:USER", host="workstation")
+E   AssertionError: assert UserIdentity(...'workstation') == UserIdentity(...'workstation')
+E     
+E     Full diff:
+E     - UserIdentity(user_id='alice', source='env:USER', host='workstation')
+E     ?                       ^^^^^           ^ ^^^^^^
+E     + UserIdentity(user_id='unknown', source='unknown', host='workstation')
+E     ?                       ^^^^^^^           ^ ^^^^^
+_____ given_no_user_variable_when_identity_resolved_then_logname_answers ______
+tests\unit\test_phase11_models.py:275: in given_no_user_variable_when_identity_resolved_then_logname_answers
+    assert (who.user_id, who.source) == ("bob", "env:LOGNAME")
+E   AssertionError: assert ('never', 'cmd:whoami') == ('bob', 'env:LOGNAME')
+E     
+E     At index 0 diff: 'never' != 'bob'
+E     
+E     Full diff:
+E       (
+E     -     'bob',
+E     -     'env:LOGNAME',
+E     +     'never',
+E     +     'cmd:whoami',
+E       )
+_ given_no_environment_variable_when_identity_resolved_then_the_command_answers _
+tests\unit\test_phase11_models.py:286: in given_no_environment_variable_when_identity_resolved_then_the_command_answers
+    assert (who.user_id, who.source) == ("carol", "cmd:id")
+E   AssertionError: assert ('carol', 'cmd:whoami') == ('carol', 'cmd:id')
+E     
+E     At index 1 diff: 'cmd:whoami' != 'cmd:id'
+E     
+E     Full diff:
+E       (
+E           'carol',
+E     -     'cmd:id',
+E     ?           -
+E     +     'cmd:whoami',
+E     ?          +++++
+E       )
+_ given_hostname_resolver_without_answer_when_identity_resolved_then_host_is_none _
+tests\unit\test_phase11_models.py:331: in given_hostname_resolver_without_answer_when_identity_resolved_then_host_is_none
+    assert who.host is None and who.user_id == "alice"
+E   AssertionError: assert (None is None and 'unknown' == 'alice'
+E    +  where None = UserIdentity(user_id='unknown', source='unknown', host=None).host
+E     
+E     - alice
+E     + unknown)
+=============================== tests coverage ================================
+______________ coverage: platform win32, python 3.12.14-final-0 _______________
+
+Coverage XML written to file coverage.xml
+=========================== short test summary info ===========================
+SKIPPED [1] tests\unit\test_phase11_scratch.py:115: POSIX permission bits only (ADR-003)
+SKIPPED [1] tests\unit\test_phase11_scratch.py:417: POSIX permission bits only (ADR-003)
+SKIPPED [1] tests\unit\test_phase4_real_subprocess.py:110: SIGTERM handling is POSIX-specific
+SKIPPED [1] tests\unit\test_phase4_task_execution.py:724: /proc is Linux-specific
+SKIPPED [1] tests\unit\test_phase4_task_execution.py:732: /proc is Linux-specific
+FAILED tests/integration/test_phase9_cli.py::given_cli_when_help_then_credentials_and_resume_are_listed - AssertionError: assert '--from-env' in '\\x1b[1m \\x1b[0m \\x1b[1m \\x1b[0m\\x1b[1;33mUsage: \\x1b[0m\\x1b[1magentic-app credentials [OPTIONS]\\x1b[0m\\x1b[1m \\x1b[0m...nd exit. \\x1b[2m\u2502\\x1b[0m \\x1b[2m\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\\x1b[0m'
+FAILED tests/unit/test_phase11_models.py::given_user_variable_when_identity_resolved_then_read_from_the_environment - AssertionError: assert UserIdentity(...'workstation') == UserIdentity(...'workstation')
+  
+  Full diff:
+  - UserIdentity(user_id='alice', source='env:USER', host='workstation')
+  ?                       ^^^^^           ^ ^^^^^^
+  + UserIdentity(user_id='unknown', source='unknown', host='workstation')
+  ?                       ^^^^^^^           ^ ^^^^^
+FAILED tests/unit/test_phase11_models.py::given_no_user_variable_when_identity_resolved_then_logname_answers - AssertionError: assert ('never', 'cmd:whoami') == ('bob', 'env:LOGNAME')
+  
+  At index 0 diff: 'never' != 'bob'
+  
+  Full diff:
+    (
+  -     'bob',
+  -     'env:LOGNAME',
+  +     'never',
+  +     'cmd:whoami',
+    )
+FAILED tests/unit/test_phase11_models.py::given_no_environment_variable_when_identity_resolved_then_the_command_answers - AssertionError: assert ('carol', 'cmd:whoami') == ('carol', 'cmd:id')
+  
+  At index 1 diff: 'cmd:whoami' != 'cmd:id'
+  
+  Full diff:
+    (
+        'carol',
+  -     'cmd:id',
+  ?           -
+  +     'cmd:whoami',
+  ?          +++++
+    )
+FAILED tests/unit/test_phase11_models.py::given_hostname_resolver_without_answer_when_identity_resolved_then_host_is_none - AssertionError: assert (None is None and 'unknown' == 'alice'
+ +  where None = UserIdentity(user_id='unknown', source='unknown', host=None).host
+  
+  - alice
+  + unknown)
+5 failed, 3377 passed, 5 skipped in 104.34s (0:01:44)
