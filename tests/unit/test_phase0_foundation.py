@@ -179,11 +179,14 @@ def given_token_env_set_when_token_read_then_value_returned_and_masked_in_dump(
 
 def given_default_config_when_loaded_then_verdict_programs_cover_the_documented_families() -> None:
     """ADR-029 §2: the shipped list names the build tools, test runners and linters of five
-    families; each entry is a program, or a program and the sub-command that matters."""
+    families; each entry is a program, or a program and the sub-command that matters. ADR-032:
+    ``rustc`` stands next to ``cargo``, as ``javac`` and ``gcc`` stand next to their build tools."""
     programs = AppConfig().execution.verdict_programs
     assert programs == list(DEFAULT_VERDICT_PROGRAMS)
     for expected in ("mvn", "gradlew", "cargo", "dotnet", "go", "make", "pytest", "ruff", "tsc"):
         assert expected in programs
+    for compiler in ("javac", "tsc", "rustc", "go", "gcc", "clang"):  # called directly, too
+        assert compiler in programs
     assert "npm run" in programs and "npm" not in programs  # npm install is not a build
     assert all(1 <= len(entry.split()) <= 2 for entry in programs)
     assert len(programs) == len(set(programs))

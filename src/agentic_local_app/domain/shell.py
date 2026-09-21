@@ -14,7 +14,12 @@ This module answers that question and nothing else:
   bare ``name``, its ``dialect`` and the ``source`` that decided it (pinned by the operator, found
   on the ``PATH``, or the documented fallback);
 - :func:`detect_shell` / :func:`describe_environment` — the detection itself, with ``which``
-  injected (``shutil.which`` by default) so that a test never depends on the machine it runs on.
+  injected (``shutil.which`` by default) so that a test never depends on the machine it runs on;
+- :func:`command_not_run_reason` (ADR-032) — what an exit code means when it is the **shell's**
+  answer rather than the program's: every command runs as ``<shell> -c <cmd>``, so a program that
+  does not exist is reported by a shell that started perfectly well, with the conventional code of
+  its dialect (127 "not found" and 126 "found but not executable" on POSIX, the same codes from
+  PowerShell as the launch script of ADR-032 wraps it, 9009 from ``cmd``).
 
 Nothing here raises: an absent ``PATH``, a ``which`` that returns nothing and an interpreter nobody
 recognises all degrade to a documented value (``/bin/sh``, ``powershell``, ``ShellDialect.UNKNOWN``).
@@ -31,8 +36,11 @@ from enum import StrEnum, unique
 from types import MappingProxyType
 
 __all__ = [
+    "COMMAND_NOT_EXECUTABLE",
+    "COMMAND_NOT_FOUND",
     "DEFAULT_POSIX_SHELL",
     "DEFAULT_WINDOWS_SHELL",
+    "NOT_RUN_EXIT_CODES",
     "POSIX_SHELL_CANDIDATES",
     "WINDOWS_SHELL_CANDIDATES",
     "DetectedShell",
@@ -41,6 +49,7 @@ __all__ = [
     "ShellSource",
     "Which",
     "classify_shell",
+    "command_not_run_reason",
     "describe_environment",
     "detect_shell",
     "operating_system_name",
@@ -111,6 +120,37 @@ _OPERATING_SYSTEMS: Mapping[str, str] = MappingProxyType(
     {"win32": "Windows", "darwin": "macOS", "linux": "Linux"}
 )
 
+#: ADR-032 — the ``reason`` of a task result whose exit code is the shell's answer, not the
+#: program's: the shell found no such program, or found it and could not run it.
+COMMAND_NOT_FOUND = "COMMAND_NOT_FOUND"
+COMMAND_NOT_EXECUTABLE = "COMMAND_NOT_EXECUTABLE"
+
+#: POSIX.1, Shell Command Language, 2.8.2 "Exit Status for Commands": a command that is not found
+#: exits 127, one that is found but is not an executable utility exits 126.
+_POSIX_NOT_RUN: Mapping[int, str] = MappingProxyType(
+    {127: COMMAND_NOT_FOUND, 126: COMMAND_NOT_EXECUTABLE}
+)
+
+#: ADR-032 — per dialect, the exit codes by which the **shell** says it could not run the program a
+#: command names, and the reason each one stands for. These codes are conventions of the shell, not
+#: a promise of the program: a program may exit with one of them on its own, and the reason is then
+#: a presumption. That is acceptable because the reading only ever makes the application more
+#: cautious — such an exit is never a verdict (ADR-029 §2), so the plan stops as for any failure.
+NOT_RUN_EXIT_CODES: Mapping[ShellDialect, Mapping[int, str]] = MappingProxyType(
+    {
+        ShellDialect.POSIX: _POSIX_NOT_RUN,
+        # the launch script of ADR-032 turns PowerShell's own "not found" and "cannot be run"
+        # errors into the POSIX codes (execution/platform.py)
+        ShellDialect.POWERSHELL: _POSIX_NOT_RUN,
+        # cmd's own code for "is not recognized as an internal or external command"; nothing it
+        # answers tells "found but cannot be run" apart from an ordinary failure
+        ShellDialect.CMD: MappingProxyType({9009: COMMAND_NOT_FOUND}),
+        # launched as ``<shell> -c <cmd>`` like a POSIX shell, and read with the POSIX convention:
+        # withholding a verdict is the safe side of a presumption
+        ShellDialect.UNKNOWN: _POSIX_NOT_RUN,
+    }
+)
+
 
 def shell_name(program: str) -> str:
     """``C:\\Windows\\System32\\cmd.exe`` -> ``cmd``, ``/usr/bin/bash`` -> ``bash``, ``""`` -> ``""``.
@@ -133,6 +173,19 @@ def classify_shell(program: str) -> ShellDialect:
     translates anything towards it.
     """
     return _DIALECT_BY_NAME.get(shell_name(program), ShellDialect.UNKNOWN)
+
+
+def command_not_run_reason(dialect: ShellDialect, exit_code: int | None) -> str | None:
+    """``COMMAND_NOT_FOUND`` or ``COMMAND_NOT_EXECUTABLE`` when ``exit_code`` is the conventional
+    answer of a ``dialect`` shell that could not find, or could not run, the program the command
+    names (ADR-032); ``None`` for any other code, and for a command that never returned one.
+
+    The shell did run, so the command is not ``not_started``; the program behind it never did, so
+    its exit code is no verdict, whatever the program.
+    """
+    if exit_code is None:
+        return None
+    return NOT_RUN_EXIT_CODES[dialect].get(exit_code)
 
 
 @dataclass(frozen=True)

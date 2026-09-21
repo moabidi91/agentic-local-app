@@ -75,8 +75,9 @@ DEFAULT_VERDICT_PROGRAMS: tuple[str, ...] = (
     "npx",
     "tsc",
     "eslint",
-    # Rust, .NET, Go
+    # Rust (cargo, and the compiler called directly), .NET, Go
     "cargo",
+    "rustc",
     "dotnet",
     "go",
     # C / C++ and the make family

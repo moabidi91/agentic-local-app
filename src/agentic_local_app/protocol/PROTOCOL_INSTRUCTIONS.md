@@ -179,8 +179,8 @@ You read these; you never write them. Every field you may meet is listed.
 | `task_id` | string | The task. |
 | `status` | string | `completed` · `failed` · `timed_out`. |
 | `execution` | string | **Read it first.** `ran` · `not_started` · `timed_out` · `stopped` — table below. |
-| `exit_code` | integer | The command's own exit code, zero or not. Absent when the command did not run to its end. |
-| `failure_is_verdict` | boolean | Present, `true`, only on a failed task whose recognised program ran: an answer to analyse, not a breakdown (section 5.1). |
+| `exit_code` | integer | The exit code of the command, zero or not: your program's answer, or the shell's when `reason` says the program never ran. Absent when the command did not run to its end. |
+| `failure_is_verdict` | boolean | Present, `true`, only on a failed task whose recognised program ran and answered: an answer to analyse, not a breakdown (section 5.1). Never together with `reason`. |
 | `translation` | object | Present only when your command and the shell were of different dialects (section 6). |
 | `stdout`, `stderr` | string | The kept output of each stream, decoded as UTF-8: all of it, or its end when truncated. |
 | `truncated` | boolean | `true` when output was cut (section 7). |
@@ -191,7 +191,7 @@ You read these; you never write them. Every field you may meet is listed.
 | `timed_out` | boolean | `true` when the command was killed at its deadline. |
 | `timeout_ms_applied` | integer | The deadline actually applied. |
 | `duration_ms` | integer | Run time, in milliseconds. |
-| `reason` | string | Why the task failed without an answer: `SPAWN_FAILED` (the command could not be started), `CHUNK_REF_NOT_FOUND`, `CHUNK_RANGE_INVALID`, or another error code. |
+| `reason` | string | Why the task failed without an answer from your program: {not_run_codes} (the shell ran but could not find or run the program, section 5.1); `SPAWN_FAILED` (the shell itself could not be started); `CHUNK_REF_NOT_FOUND`, `CHUNK_RANGE_INVALID`; or another error code. |
 | `ref_task_id` | string | `chunk_request` only (section 7.2): the task whose output was read. |
 | `stream` | string | `chunk_request` only: `stdout` or `stderr`. |
 | `range` | list of 2 integers | `chunk_request` only: the bytes returned, `[offset, offset + returned]`, end excluded. |
@@ -201,8 +201,9 @@ You read these; you never write them. Every field you may meet is listed.
 
 | `execution` | What happened | What to do with it |
 |---|---|---|
-| `ran` | The command ran to its end. `exit_code` is **its** answer, zero or not. | Read `stdout` and `stderr`: they are the evidence. |
-| `not_started` | No command ever ran: it could not be started (unknown program, not executable, bad working directory: `reason` `SPAWN_FAILED`). | **The only case with no output to read.** Check the command line itself, or find the tool first. |
+| `ran` | The shell ran the command to its end, and `exit_code` is **your program's** answer, zero or not. | Read `stdout` and `stderr`: they are the evidence. |
+| `ran`, with `reason` `COMMAND_NOT_FOUND` or `COMMAND_NOT_EXECUTABLE` | The shell ran, but found no such program or could not run the one it found ({not_run_codes}): your program never ran, and the exit code is the shell's. **Never a verdict.** | Read `stderr`: the shell names the program. Fix the name or the path, or find the tool first (section 5.1). |
+| `not_started` | Nothing ran: the shell itself could not be started, or the working directory is invalid (`reason` `SPAWN_FAILED`). | **The only case with no output to read.** Nothing reached your program: do not read the empty output as its answer. |
 | `timed_out` | It started and was killed at its deadline. The output is partial. | Plan again with a larger `timeout_ms`, or a narrower command. |
 | `stopped` | It started and the application ended it (the plan stopped, or the user interrupted). The output is partial. | Nothing is wrong with the command; it did not finish. |
 
@@ -650,6 +651,57 @@ When a plan stops, running tasks are cancelled (`cancelled_tasks`), tasks not st
 `short_circuited_on_success` for `stop_plan_on_success`. A task whose dependency did not complete
 successfully is skipped (`dependency_failed:<task_id>`, `dependency_skipped:<task_id>`), even when
 the plan continues. No command is ever retried automatically: to retry, plan a new task.
+
+**A program the shell cannot find or run is never a verdict.** Every command goes to the shell of
+section 6. When the program it names does not exist there — a misspelt name, a tool that is not
+installed, a wrong path — or exists but cannot be run, the shell itself answers: `execution` is
+`ran` (the shell did run), `reason` says what happened — {not_run_codes} — and `stderr` carries the
+shell's own message. There is no `failure_is_verdict` then, whatever the program: its answer is
+missing, so the plan stops as for any failure unless you wrote `continue_on_error: true`. These exit
+codes are the shell's convention: a program may also exit with one of them on its own, so `reason`
+is a presumption and `stderr` the evidence. Had you answered `A3` by looking for the JDK 21 where it
+is not installed:
+
+```json N1 after A3
+{
+  "type": "execution_plan",
+  "conversation_id": "conv-1001",
+  "message_id": "model-023",
+  "content": {
+    "plan_id": "plan-9",
+    "objective": "Check the JDK 21 the project targets, then read the release it sets",
+    "execution_policy": "sequential",
+    "tasks": [
+      {"task_id": "t12", "type": "cmd", "cmd": "{cmd_missing_compiler}"},
+      {"task_id": "t13", "type": "cmd", "cmd": "{cmd_read_settings}"}
+    ]
+  }
+}
+```
+
+```json N2
+{
+  "type": "execution_result",
+  "conversation_id": "conv-1001",
+  "message_id": "msg-0008",
+  "content": {
+    "plan_id": "plan-9",
+    "status": "stopped_on_failure",
+    "results": [
+      {example_not_run_result}
+    ],
+    "skipped_tasks": [{"task_id": "t13", "reason": "plan_stopped:task_failed:t12", "execution": "not_started"}],
+    "cancelled_tasks": [],
+    "interrupted_tasks": [],
+    "stop_reason": "task_failed:t12"
+  }
+}
+```
+
+`t12` names a compiler, yet it carries no `failure_is_verdict`: the shell answered, not the
+compiler, so the plan stopped and `t13` never ran. Fix the name or the path, or locate the program
+first; to probe a path without stopping the plan, give that task `continue_on_error: true`, as `A2`
+does.
 
 ### 5.2 Dependencies and parallelism
 

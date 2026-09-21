@@ -34,6 +34,8 @@ from agentic_local_app.execution.plan_runner import (
 )
 from agentic_local_app.execution.platform import (
     POWERSHELL_EXIT_CODE_EPILOGUE,
+    POWERSHELL_NOT_RUN_PROLOGUE,
+    POWERSHELL_NOT_RUN_TRAPS,
     LaunchSpec,
     PlatformAdapter,
     PosixPlatformAdapter,
@@ -49,6 +51,8 @@ from agentic_local_app.execution.result_collector import ResultCollector
 __all__ = [
     "BUDGET_DURATION_STOP_REASON",
     "POWERSHELL_EXIT_CODE_EPILOGUE",
+    "POWERSHELL_NOT_RUN_PROLOGUE",
+    "POWERSHELL_NOT_RUN_TRAPS",
     "BUDGET_EXCEEDED_REASON",
     "INTERRUPT_REASON",
     "PLAN_STOPPED_REASON",

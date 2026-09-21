@@ -1,5 +1,6 @@
 """Phase 5 — plan execution (spec §2.4, §3.7, §5.2, §5.3, §8, §18.2 ; ADR-003, ADR-006, ADR-008,
-ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026).
+ADR-009, ADR-011, ADR-012 §3, ADR-015, ADR-016, ADR-017, ADR-018, ADR-019 §1, ADR-026, ADR-029,
+ADR-032).
 
 Everything runs on the doubles of §18.3 — ``FakeCommandExecutor`` (no process), ``FakeClock``,
 ``InMemoryConversationStore``, ``EventBus`` + ``RecordingSubscriber``, ``SequentialIdGenerator`` —
@@ -1166,6 +1167,104 @@ async def given_second_verdict_after_a_first_one_then_the_plan_still_runs_to_the
     assert result is not None
     assert [r.failure_is_verdict for r in result.results] == [True, True, None]
     assert [r.exit_code for r in result.results] == [1, 2, 0]
+
+
+# ------------------------------------------------------------------------------------------------
+# 2b'. A program the shell could not find or run is no verdict (ADR-032)
+# ------------------------------------------------------------------------------------------------
+NOT_FOUND = b"bash: line 1: /opt/no-such-jdk/bin/javac: No such file or directory\n"
+
+
+@pytest.mark.parametrize(
+    ("dialect", "exit_code", "reason"),
+    [
+        pytest.param(ShellDialect.POSIX, 127, "COMMAND_NOT_FOUND", id="posix-127"),
+        pytest.param(ShellDialect.POSIX, 126, "COMMAND_NOT_EXECUTABLE", id="posix-126"),
+        pytest.param(ShellDialect.POWERSHELL, 127, "COMMAND_NOT_FOUND", id="powershell-127"),
+        pytest.param(ShellDialect.POWERSHELL, 126, "COMMAND_NOT_EXECUTABLE", id="powershell-126"),
+        pytest.param(ShellDialect.CMD, 9009, "COMMAND_NOT_FOUND", id="cmd-9009"),
+        pytest.param(ShellDialect.UNKNOWN, 127, "COMMAND_NOT_FOUND", id="unknown-127"),
+    ],
+)
+async def given_recognised_compiler_the_shell_could_not_run_then_no_verdict_and_the_plan_stops(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+    dialect: ShellDialect,
+    exit_code: int,
+    reason: str,
+) -> None:
+    """A verdict requires evidence that the program ran. The shell answered for a compiler it could
+    not find or run: the plan follows ADR-009 as for any failure — it stops, the listing is
+    skipped — and the result says why, with the shell's own words on stderr."""
+    harness = Harness.build(
+        store, bus, recorder, clock, ids, config, translator=ShellTranslator(dialect)
+    )
+    harness.fake.script(task_id="t1", stderr=NOT_FOUND, exit_code=exit_code)
+    plan, tasks = harness.plan([_cmd("t1", "/opt/no-such-jdk/bin/javac Main.java"), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert harness.runner.shell_dialect is dialect
+    assert outcome.plan.status is PlanState.STOPPED_ON_FAILURE
+    assert outcome.stop_reason == "task_failed:t1"
+    assert harness.statuses() == {"t1": TaskState.FAILED, "t2": TaskState.SKIPPED}
+    record = harness.task("t1")
+    assert record.exit_code == exit_code and record.reason is None  # derived, never persisted
+    result = outcome.execution_result
+    assert result is not None and result.status == "stopped_on_failure"
+    first = result.results[0]
+    assert (first.execution, first.exit_code, first.reason) == ("ran", exit_code, reason)
+    assert first.failure_is_verdict is None
+    assert first.stderr == NOT_FOUND.decode()
+    assert [(s.task_id, s.reason) for s in result.skipped_tasks] == [
+        ("t2", "plan_stopped:task_failed:t1")
+    ]
+
+
+async def given_program_the_shell_could_not_find_with_continue_on_error_then_the_plan_goes_on(
+    harness: Harness,
+) -> None:
+    """ADR-009 exactly as for any failure: an explicit ``continue_on_error`` keeps the plan going."""
+    harness.fake.script(task_id="t1", stderr=NOT_FOUND, exit_code=127)
+    plan, tasks = harness.plan(
+        [_cmd("t1", "/opt/no-such-jdk/bin/javac Main.java", continue_on_error=True), _cmd("t2")]
+    )
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.COMPLETED and outcome.stop_reason is None
+    assert harness.statuses() == {"t1": TaskState.FAILED, "t2": TaskState.COMPLETED}
+    result = outcome.execution_result
+    assert result is not None
+    assert result.results[0].reason == "COMMAND_NOT_FOUND"
+    assert result.results[0].failure_is_verdict is None
+
+
+async def given_program_exiting_127_under_cmd_then_it_is_the_program_s_own_verdict(
+    store: InMemoryConversationStore,
+    bus: EventBus,
+    recorder: RecordingSubscriber,
+    clock: FakeClock,
+    ids: SequentialIdGenerator,
+    config: AppConfig,
+) -> None:
+    """127 is a convention of POSIX shells only: under ``cmd`` it is what the compiler answered."""
+    harness = Harness.build(
+        store, bus, recorder, clock, ids, config, translator=ShellTranslator(ShellDialect.CMD)
+    )
+    harness.fake.script(task_id="t1", exit_code=127)
+    plan, tasks = harness.plan([_cmd("t1", BUILD), _cmd("t2")])
+
+    outcome = await harness.run(plan, tasks)
+
+    assert outcome.plan.status is PlanState.COMPLETED
+    result = outcome.execution_result
+    assert result is not None
+    assert result.results[0].failure_is_verdict is True and result.results[0].reason is None
 
 
 # ------------------------------------------------------------------------------------------------

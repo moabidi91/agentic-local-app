@@ -12,7 +12,8 @@ Five surfaces are pinned here, **without spawning a single process** (§18.3):
    ``fit_message`` and ``serve_chunk`` on the in-memory store;
 4. ``ResultCollector``: one ``execution_result`` per terminal plan, in plan order (ADR-017);
 5. ``VerdictPrograms``: which program a command line invokes and whose non-zero exit is a result
-   to interpret (ADR-029 §2), and what the task result then says about it (ADR-029 §4).
+   to interpret (ADR-029 §2), and what the task result then says about it (ADR-029 §4) — never
+   for the exit code by which the shell says it could not find or run the program (ADR-032).
 
 The real ``SubprocessCommandExecutor`` is exercised in ``test_phase4_real_subprocess.py`` only.
 """
@@ -22,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -46,12 +48,16 @@ from agentic_local_app.domain.dialects import (
 )
 from agentic_local_app.domain.models import BlobRecord, PlanRecord, TaskRecord
 from agentic_local_app.domain.shell import (
+    COMMAND_NOT_EXECUTABLE,
+    COMMAND_NOT_FOUND,
     DEFAULT_POSIX_SHELL,
     DEFAULT_WINDOWS_SHELL,
+    NOT_RUN_EXIT_CODES,
     DetectedShell,
     ShellDialect,
     ShellSource,
     classify_shell,
+    command_not_run_reason,
     describe_environment,
     detect_shell,
     shell_name,
@@ -85,6 +91,8 @@ from agentic_local_app.execution.payload_guard import (
 from agentic_local_app.execution.platform import (
     ORPHAN_START_TOLERANCE_MS,
     POWERSHELL_EXIT_CODE_EPILOGUE,
+    POWERSHELL_NOT_RUN_PROLOGUE,
+    POWERSHELL_NOT_RUN_TRAPS,
     LaunchSpec,
     PlatformAdapter,
     PosixPlatformAdapter,
@@ -1523,6 +1531,7 @@ def given_none_command_when_read_then_no_program() -> None:
         pytest.param("pytest -q", True, id="pytest"),
         pytest.param("ruff check src", True, id="ruff"),
         pytest.param("go build ./...", True, id="go"),
+        pytest.param("rustc --emit=obj -o main.o main.rs", True, id="rustc"),
         pytest.param("ls -la", False, id="plain-tool"),
         pytest.param("grep -n foo pom.xml", False, id="grep"),
         pytest.param("$BUILD_TOOL install", False, id="behind-a-shell-variable"),
@@ -1540,7 +1549,10 @@ def given_empty_program_set_when_matched_then_nothing_is_a_verdict() -> None:
     programs = VerdictPrograms()
     assert bool(programs) is False and len(programs) == 0
     assert programs.matches("mvn clean install") is False
-    assert programs.is_verdict("mvn clean install", 1, timed_out=False) is False
+    assert (
+        programs.is_verdict("mvn clean install", 1, timed_out=False, dialect=ShellDialect.POSIX)
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -1552,13 +1564,66 @@ def given_empty_program_set_when_matched_then_nothing_is_a_verdict() -> None:
         pytest.param(None, False, False, id="never-started"),
         pytest.param(None, True, False, id="timed-out"),
         pytest.param(1, True, False, id="killed-with-a-code"),
+        # ADR-032: the shell answered, not the program
+        pytest.param(127, False, False, id="shell-found-no-such-program"),
+        pytest.param(126, False, False, id="shell-could-not-run-it"),
+        pytest.param(128, False, True, id="next-code-is-the-program-s-again"),
     ],
 )
 def given_recognised_program_when_asked_for_a_verdict_then_only_an_answered_failure_counts(
     exit_code: int | None, timed_out: bool, expected: bool
 ) -> None:
     programs = VerdictPrograms(DEFAULT_VERDICT_PROGRAMS)
-    assert programs.is_verdict("mvn clean install", exit_code, timed_out=timed_out) is expected
+    verdict = programs.is_verdict(
+        "mvn clean install", exit_code, timed_out=timed_out, dialect=ShellDialect.POSIX
+    )
+    assert verdict is expected
+
+
+# ---- ADR-032: the exit code by which the shell says the program never ran ----------------------
+@pytest.mark.parametrize(
+    ("dialect", "exit_code", "reason"),
+    [
+        pytest.param(ShellDialect.POSIX, 127, COMMAND_NOT_FOUND, id="posix-127"),
+        pytest.param(ShellDialect.POSIX, 126, COMMAND_NOT_EXECUTABLE, id="posix-126"),
+        pytest.param(ShellDialect.POSIX, 9009, None, id="posix-9009-is-the-program-s"),
+        pytest.param(ShellDialect.POWERSHELL, 127, COMMAND_NOT_FOUND, id="powershell-127"),
+        pytest.param(ShellDialect.POWERSHELL, 126, COMMAND_NOT_EXECUTABLE, id="powershell-126"),
+        pytest.param(ShellDialect.CMD, 9009, COMMAND_NOT_FOUND, id="cmd-9009"),
+        pytest.param(ShellDialect.CMD, 127, None, id="cmd-127-is-the-program-s"),
+        pytest.param(ShellDialect.CMD, 126, None, id="cmd-126-is-the-program-s"),
+        pytest.param(ShellDialect.UNKNOWN, 127, COMMAND_NOT_FOUND, id="unknown-reads-posix-127"),
+        pytest.param(ShellDialect.UNKNOWN, 126, COMMAND_NOT_EXECUTABLE, id="unknown-reads-posix"),
+        pytest.param(ShellDialect.POSIX, 1, None, id="an-ordinary-failure"),
+        pytest.param(ShellDialect.POSIX, 2, None, id="another-ordinary-failure"),
+        pytest.param(ShellDialect.POSIX, 0, None, id="a-success"),
+        pytest.param(ShellDialect.POSIX, None, None, id="no-code-at-all"),
+    ],
+)
+def given_exit_code_of_a_dialect_when_read_then_only_that_shell_s_own_answers_name_a_reason(
+    dialect: ShellDialect, exit_code: int | None, reason: str | None
+) -> None:
+    assert command_not_run_reason(dialect, exit_code) == reason
+    # and a reason is exactly what withholds the verdict of a recognised program
+    programs = VerdictPrograms(DEFAULT_VERDICT_PROGRAMS)
+    answered = exit_code not in (None, 0)
+    verdict = programs.is_verdict("javac Main.java", exit_code, timed_out=False, dialect=dialect)
+    assert verdict is (answered and reason is None)
+
+
+def given_not_run_table_when_read_then_every_dialect_has_one_and_only_the_two_reasons_appear() -> (
+    None
+):
+    assert set(NOT_RUN_EXIT_CODES) == set(ShellDialect)
+    reasons = {reason for codes in NOT_RUN_EXIT_CODES.values() for reason in codes.values()}
+    assert reasons == {COMMAND_NOT_FOUND, COMMAND_NOT_EXECUTABLE}
+    # POSIX.1, 2.8.2 — and PowerShell as the launch script makes it answer
+    posix = {127: COMMAND_NOT_FOUND, 126: COMMAND_NOT_EXECUTABLE}
+    assert dict(NOT_RUN_EXIT_CODES[ShellDialect.POSIX]) == posix
+    assert dict(NOT_RUN_EXIT_CODES[ShellDialect.POWERSHELL]) == posix
+    assert dict(NOT_RUN_EXIT_CODES[ShellDialect.UNKNOWN]) == posix
+    # cmd tells "not found" apart, and nothing else
+    assert dict(NOT_RUN_EXIT_CODES[ShellDialect.CMD]) == {9009: COMMAND_NOT_FOUND}
 
 
 @pytest.mark.parametrize(
@@ -1636,6 +1701,78 @@ def given_task_result_when_built_then_execution_field_states_what_became_of_the_
     dumped = result.model_dump(mode="json", exclude_none=True)
     assert "failure_is_verdict" not in dumped
     assert dumped["execution"] == execution
+
+
+@pytest.mark.parametrize(
+    ("dialect", "exit_code", "reason"),
+    [
+        pytest.param(ShellDialect.POSIX, 127, COMMAND_NOT_FOUND, id="posix-not-found"),
+        pytest.param(ShellDialect.POSIX, 126, COMMAND_NOT_EXECUTABLE, id="posix-not-executable"),
+        pytest.param(ShellDialect.POWERSHELL, 127, COMMAND_NOT_FOUND, id="powershell-not-found"),
+        pytest.param(
+            ShellDialect.POWERSHELL, 126, COMMAND_NOT_EXECUTABLE, id="powershell-not-runnable"
+        ),
+        pytest.param(ShellDialect.CMD, 9009, COMMAND_NOT_FOUND, id="cmd-not-found"),
+    ],
+)
+def given_recognised_program_the_shell_could_not_run_when_built_then_ran_with_a_reason_and_no_verdict(
+    dialect: ShellDialect, exit_code: int, reason: str
+) -> None:
+    """ADR-032: the shell ran, so ``execution`` stays ``ran`` — but the exit code is the shell's
+    answer, not the compiler's: the result names it in ``reason`` and never marks a verdict."""
+    plan = _plan(PlanState.STOPPED_ON_FAILURE, stop_reason="task_failed:t1")
+    stored = _task(
+        "t1", 0, TaskState.FAILED, exit_code=exit_code, cmd="/opt/no-such-jdk/bin/javac Main.java"
+    )
+    collector = ResultCollector(VerdictPrograms(DEFAULT_VERDICT_PROGRAMS), ShellTranslator(dialect))
+    said = b"bash: line 1: /opt/no-such-jdk/bin/javac: No such file or directory\n"
+
+    result = collector.build(plan, [stored], {"t1": _output(b"", said)}, {}).results[0]
+
+    assert collector.dialect is dialect
+    assert (result.status, result.execution, result.exit_code) == ("failed", "ran", exit_code)
+    assert result.reason == reason and result.failure_is_verdict is None
+    assert result.stderr == said.decode()  # the shell's own words still reach the model
+    dumped = result.model_dump(mode="json", exclude_none=True)
+    assert dumped["reason"] == reason and "failure_is_verdict" not in dumped
+    assert stored.reason is None  # derived when the message is built, never written on the record
+
+
+@pytest.mark.parametrize(
+    ("dialect", "exit_code"),
+    [
+        pytest.param(ShellDialect.CMD, 127, id="127-under-cmd"),
+        pytest.param(ShellDialect.POSIX, 9009, id="9009-under-posix"),
+    ],
+)
+def given_code_that_is_no_convention_of_this_shell_when_built_then_the_program_s_verdict_stands(
+    dialect: ShellDialect, exit_code: int
+) -> None:
+    plan = _plan(PlanState.COMPLETED)
+    tasks = [_task("t1", 0, TaskState.FAILED, exit_code=exit_code, cmd="mvn clean install")]
+    collector = ResultCollector(VerdictPrograms(DEFAULT_VERDICT_PROGRAMS), ShellTranslator(dialect))
+    result = collector.build(plan, tasks, {}, {}).results[0]
+    assert result.failure_is_verdict is True and result.reason is None
+
+
+def given_default_collector_when_a_program_exits_127_then_the_posix_convention_names_it() -> None:
+    """The default collector is aimed at an ``unknown`` shell, read with the POSIX convention — the
+    side that withholds a verdict rather than inventing one."""
+    plan = _plan(PlanState.STOPPED_ON_FAILURE, stop_reason="task_failed:t1")
+    tasks = [_task("t1", 0, TaskState.FAILED, exit_code=127, cmd="gccc -c main.c")]
+    result = ResultCollector().build(plan, tasks, {}, {}).results[0]
+    assert (result.execution, result.exit_code, result.reason) == ("ran", 127, COMMAND_NOT_FOUND)
+
+
+def given_stored_reason_when_built_then_it_is_never_replaced_by_a_derived_one() -> None:
+    plan = _plan(PlanState.STOPPED_ON_FAILURE, stop_reason="task_failed:t1")
+    tasks = [
+        _task("t1", 0, TaskState.FAILED, exit_code=127, reason="OUTPUT_READ_FAILED", cmd="mvn"),
+        _task("t2", 1, TaskState.FAILED, exit_code=None, reason="SPAWN_FAILED", cmd="mvn"),
+    ]
+    results = ResultCollector().build(plan, tasks, {}, {}).results
+    assert [r.reason for r in results] == ["OUTPUT_READ_FAILED", "SPAWN_FAILED"]
+    assert [r.execution for r in results] == ["ran", "not_started"]
 
 
 def given_default_collector_without_programs_then_no_failure_is_a_verdict() -> None:
@@ -1790,11 +1927,15 @@ def given_adapters_when_environment_read_then_platform_and_shell_reported() -> N
 # ================================================================================================
 # 12. The Windows exit code (ADR-030 §2) — verified without Windows
 # ================================================================================================
-def given_powershell_script_when_built_then_command_untouched_and_epilogue_appended() -> None:
+def given_powershell_script_when_built_then_command_untouched_between_prologue_and_epilogue() -> (
+    None
+):
     cmd = 'java -version; echo "a `b` $x" & foo'
-    script = powershell_script(cmd)
-    assert script.splitlines()[0] == cmd
-    assert script.splitlines()[1] == POWERSHELL_EXIT_CODE_EPILOGUE
+    lines = powershell_script(cmd).split("\n")
+    assert lines[0] == POWERSHELL_NOT_RUN_PROLOGUE  # ADR-032: in place before anything can fail
+    assert lines[1] == cmd  # on its own line, untouched
+    assert "\n".join(lines[2:-1]) == POWERSHELL_EXIT_CODE_EPILOGUE
+    assert lines[-1] == ""  # the script ends with a newline
     assert "$LASTEXITCODE" in POWERSHELL_EXIT_CODE_EPILOGUE
 
 
@@ -1814,7 +1955,7 @@ def given_hostile_command_when_encoded_then_it_survives_the_round_trip(cmd: str)
     encoded = encode_powershell_command(cmd)
     decoded = base64.b64decode(encoded).decode("utf-16-le")
     assert decoded == powershell_script(cmd)
-    assert decoded.startswith(cmd)
+    assert decoded.startswith(f"{POWERSHELL_NOT_RUN_PROLOGUE}\n{cmd}\n")
 
 
 def given_windows_powershell_when_launch_built_then_encoded_command_carries_the_exit_code() -> None:
@@ -1824,6 +1965,56 @@ def given_windows_powershell_when_launch_built_then_encoded_command_carries_the_
     assert launch.args[:3] == ("-NoProfile", "-NonInteractive", "-EncodedCommand")
     assert base64.b64decode(launch.args[-1]).decode("utf-16-le") == powershell_script(cmd)
     assert launch.argv[0] == "powershell"
+
+
+_TRAP = re.compile(r"trap \[(?P<type>[\w.]+)\] \{ \$global:LASTEXITCODE = (?P<code>\d+) \}")
+
+
+def given_powershell_launch_when_decoded_then_not_found_exits_127_and_not_runnable_exits_126() -> (
+    None
+):
+    """ADR-032, verified without Windows: decode what the interpreter receives and read its traps.
+    Exception types, not messages: the reading does not depend on the language of the machine."""
+    launch = _windows().build_launch("mvn -B clean install", None)
+    prologue = base64.b64decode(launch.args[-1]).decode("utf-16-le").split("\n")[0]
+    traps = {match["type"]: int(match["code"]) for match in _TRAP.finditer(prologue)}
+    assert traps == {
+        "System.Management.Automation.CommandNotFoundException": 127,
+        "System.Management.Automation.ApplicationFailedException": 126,
+        "System.Management.Automation.PSSecurityException": 126,
+    }
+    assert prologue == "; ".join(match.group(0) for match in _TRAP.finditer(prologue))
+    # a trap only records the code: PowerShell still writes its own message on stderr and goes on
+    # with the next statement, as a POSIX shell does after "command not found"
+    for word in ("continue", "break", "exit", "Write-"):
+        assert word not in prologue
+
+
+def given_powershell_not_run_codes_when_read_back_then_the_domain_names_the_same_reasons() -> None:
+    """What the script makes PowerShell answer and how results read it cannot drift apart."""
+    for exception, code in POWERSHELL_NOT_RUN_TRAPS:
+        not_found = exception.endswith(".CommandNotFoundException")
+        expected = COMMAND_NOT_FOUND if not_found else COMMAND_NOT_EXECUTABLE
+        assert command_not_run_reason(ShellDialect.POWERSHELL, code) == expected
+    codes = {code for _, code in POWERSHELL_NOT_RUN_TRAPS}
+    assert codes == set(NOT_RUN_EXIT_CODES[ShellDialect.POWERSHELL])
+
+
+def given_powershell_epilogue_when_decoded_then_the_command_status_is_read_first_and_kept() -> None:
+    """ADR-030 §2 kept and made explicit (ADR-032): a native code — or the code the prologue
+    recorded — wins; without one the command keeps PowerShell's own 0 or 1, read from ``$?`` on the
+    line right after the command rather than left to the epilogue's own last statement."""
+    cmd = "Get-ChildItem missing"
+    lines = powershell_script(cmd).split("\n")
+    after = lines[lines.index(cmd) + 1 :]
+    assert after == [
+        "$commandSucceeded = $?",
+        "if (Test-Path -LiteralPath variable:\\LASTEXITCODE) { exit $LASTEXITCODE }",
+        "if (-not $commandSucceeded) { exit 1 }",
+        "",
+    ]
+    # a command that succeeded without any native program ends with no explicit exit at all: 0
+    assert "exit 0" not in powershell_script(cmd)
 
 
 @pytest.mark.parametrize("shell", ["cmd", "C:\\Git\\bin\\bash.exe"])

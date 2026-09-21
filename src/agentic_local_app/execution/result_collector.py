@@ -14,6 +14,11 @@ The collector is a pure mapping from persisted records to the protocol content:
 - every entry says plainly what became of its command (ADR-029 §4): ``execution`` is ``ran``,
   ``not_started``, ``timed_out`` or ``stopped``, and ``failure_is_verdict`` marks the non-zero exit
   of a recognised program — a result to interpret, not a task that went wrong;
+- a command whose exit code is the **shell's** answer for a program it could not find or run
+  (ADR-032: 127 / 126 on POSIX and PowerShell, 9009 from ``cmd``) keeps ``execution: "ran"`` — the
+  shell did run — and carries ``reason`` ``COMMAND_NOT_FOUND`` / ``COMMAND_NOT_EXECUTABLE``, never
+  ``failure_is_verdict``. Like the two fields above, that reason is **derived** at build time from
+  the exit code and the dialect of the shell, never stored on the record;
 - a command the dialect dictionary was consulted about carries ``translation`` (ADR-030 §4): what
   the model wrote, what actually ran, which rules fired — or, when nothing was rewritten, why. Like
   ``execution`` and ``failure_is_verdict``, it is **derived** from the record rather than stored:
@@ -27,7 +32,7 @@ from __future__ import annotations
 from agentic_local_app.domain.commands import VerdictPrograms
 from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.models import PlanRecord, TaskRecord
-from agentic_local_app.domain.shell import ShellDialect
+from agentic_local_app.domain.shell import ShellDialect, command_not_run_reason
 from agentic_local_app.domain.states import OutputStream, PlanState, TaskState, TaskType
 from agentic_local_app.execution.payload_guard import ChunkResult, TruncatedOutput, decode_output
 from agentic_local_app.protocol.messages import (
@@ -54,7 +59,11 @@ class ResultCollector:
     """``verdict_programs`` is the recogniser of ADR-029 §2; an empty one marks no verdict, which
     is what an operator who cleared ``execution.verdict_programs`` asked for. ``translator`` is the
     dialect dictionary of ADR-030 §4, aimed at the shell that ran the commands; the default one
-    translates nothing, so a result then carries no ``translation`` field at all."""
+    translates nothing, so a result then carries no ``translation`` field at all.
+
+    The translator's target is also what ADR-032 needs to read an exit code: the dialect of the
+    shell that ran the commands, whose conventional codes for "no such program" and "cannot run it"
+    are never a verdict. The default one (``unknown``) reads them with the POSIX convention."""
 
     def __init__(
         self,
@@ -63,6 +72,11 @@ class ResultCollector:
     ) -> None:
         self._verdict_programs = verdict_programs or VerdictPrograms()
         self._translator = translator or ShellTranslator(ShellDialect.UNKNOWN)
+
+    @property
+    def dialect(self) -> ShellDialect:
+        """The dialect of the shell that ran the commands (the one the translator is aimed at)."""
+        return self._translator.target
 
     def build(
         self,
@@ -180,13 +194,14 @@ class ResultCollector:
             original_size_bytes = task.original_size_bytes
             stdout_total, stderr_total = task.stdout_total, task.stderr_total
             stdout_range, stderr_range = task.stdout_range, task.stderr_range
+        execution = self._execution(task)
         verdict = task.status is TaskState.FAILED and self._verdict_programs.is_verdict(
-            task.cmd, task.exit_code, timed_out=task.timed_out
+            task.cmd, task.exit_code, timed_out=task.timed_out, dialect=self.dialect
         )
         return TaskResult(
             task_id=task.task_id,
             status=task.status.protocol_value,
-            execution=self._execution(task),
+            execution=execution,
             exit_code=task.exit_code,
             failure_is_verdict=True if verdict else None,
             translation=self._translation(task),
@@ -202,8 +217,16 @@ class ResultCollector:
             timed_out=task.timed_out,
             timeout_ms_applied=task.timeout_ms_applied,
             duration_ms=task.duration_ms,
-            reason=task.reason,
+            reason=self._reason(task, execution),
         )
+
+    def _reason(self, task: TaskRecord, execution: TaskExecution) -> str | None:
+        """The stored reason (``SPAWN_FAILED``, an executor error code…), or — ADR-032 — the one
+        derived from an exit code that is the shell's own answer for a program it could not find
+        or run. Only a command that ran to its end has such a code; nothing is ever persisted."""
+        if task.reason is not None or execution != "ran":
+            return task.reason
+        return command_not_run_reason(self.dialect, task.exit_code)
 
     @staticmethod
     def _chunk_result(task: TaskRecord, chunk: ChunkResult | None) -> TaskResult:

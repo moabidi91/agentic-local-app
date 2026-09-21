@@ -31,6 +31,16 @@ the size of the command against a command line Windows caps at 32 767 characters
 still decorates the stderr of a native command with error-record text — the real content is in
 there, wrapped.
 
+**A program PowerShell cannot run (ADR-032).** A POSIX shell answers 127 for a program it cannot
+find and 126 for one it cannot run; PowerShell raised an error and exited 1, the very code of a
+failed compilation. The script now opens with one line of ``trap`` statements that turn
+``CommandNotFoundException`` into 127 and ``ApplicationFailedException`` / ``PSSecurityException``
+(the operating system or the execution policy refused to run it) into 126, recorded where a native
+command records its code; PowerShell's own message still goes to stderr, and the command still
+runs on after it, as a POSIX shell goes on after "command not found". The epilogue reads ``$?`` on
+the line right after the command, so a command that ran no native program keeps PowerShell's own
+code explicitly. None of this is verified on a real Windows machine: the tests decode the script.
+
 Which shell the machine actually runs is answered by :mod:`agentic_local_app.domain.shell`
 (:meth:`PlatformAdapter.detect_shell`, :meth:`PlatformAdapter.environment`), with ``which``
 injected so that no test depends on the machine it runs on. Detection never raises: it degrades to
@@ -77,6 +87,8 @@ __all__ = [
     "CTRL_BREAK_EVENT",
     "ORPHAN_START_TOLERANCE_MS",
     "POWERSHELL_EXIT_CODE_EPILOGUE",
+    "POWERSHELL_NOT_RUN_PROLOGUE",
+    "POWERSHELL_NOT_RUN_TRAPS",
     "LaunchSpec",
     "ProcessTable",
     "PosixProcessTable",
@@ -105,22 +117,50 @@ ORPHAN_START_TOLERANCE_MS = 5_000
 #: Polling step of the bounded blocking waits.
 _POLL_STEP_MS = 50
 
-#: ADR-030 §2 — appended to every PowerShell script so that the exit code of a native command
-#: survives the interpreter. ``$LASTEXITCODE`` only exists once a native command has run: when the
-#: script called none (a pure cmdlet pipeline), the variable is absent and PowerShell's own code is
-#: left alone, which keeps the behaviour that predates the fix for those commands.
+#: ADR-032 — the errors by which PowerShell says it could not run the program a command names, and
+#: the POSIX exit code each one becomes (``domain.shell.NOT_RUN_EXIT_CODES`` reads them back): a name
+#: or a path it cannot find answers 127; a program it found but could not start — the operating
+#: system refused to run the file, or the execution policy forbids the script — answers 126. They
+#: are exception **types**, so the reading does not depend on the language of the machine.
+POWERSHELL_NOT_RUN_TRAPS: tuple[tuple[str, int], ...] = (
+    ("System.Management.Automation.CommandNotFoundException", 127),
+    ("System.Management.Automation.ApplicationFailedException", 126),
+    ("System.Management.Automation.PSSecurityException", 126),
+)
+
+#: ADR-032 — the first line of every PowerShell script. Each trap records its code in
+#: ``$global:LASTEXITCODE``, where a native command records its own, so the last program the command
+#: tried to run gives the exit code whether it ran or not. No trap ends with ``continue`` or
+#: ``break``: PowerShell still writes its own message on stderr, then goes on with the next
+#: statement, as a POSIX shell goes on after "command not found".
+POWERSHELL_NOT_RUN_PROLOGUE = "; ".join(
+    f"trap [{exception}] {{ $global:LASTEXITCODE = {code} }}"
+    for exception, code in POWERSHELL_NOT_RUN_TRAPS
+)
+
+#: ADR-030 §2, ADR-032 — the last lines of every PowerShell script, so that the exit code of a
+#: native command survives the interpreter. ``$?`` is read on the line right after the command,
+#: before anything else can overwrite it. ``$LASTEXITCODE`` only exists once a native command has
+#: run (or the prologue recorded one that could not): when the script called none (a pure cmdlet
+#: pipeline), the variable is absent and the command keeps PowerShell's own code, 0 or 1 from that
+#: ``$?`` — written out, because ``-Command`` otherwise answers with the ``$?`` of the last
+#: statement, which would be the epilogue's own.
 POWERSHELL_EXIT_CODE_EPILOGUE = (
-    "if (Test-Path -LiteralPath variable:\\LASTEXITCODE) { exit $LASTEXITCODE }"
+    "$commandSucceeded = $?\n"
+    "if (Test-Path -LiteralPath variable:\\LASTEXITCODE) { exit $LASTEXITCODE }\n"
+    "if (-not $commandSucceeded) { exit 1 }"
 )
 
 
 def powershell_script(cmd: str) -> str:
-    """The script handed to PowerShell: the command as written, then the exit-code epilogue.
+    """The script handed to PowerShell: the not-run prologue (ADR-032), the command as written, then
+    the exit-code epilogue (ADR-030 §2).
 
-    The command is on its own line and is **not** quoted, escaped or otherwise touched: it is the
-    encoding of the whole script (:func:`encode_powershell_command`) that carries it safely.
+    The command is on its own line(s) and is **not** quoted, escaped or otherwise touched: it is
+    the encoding of the whole script (:func:`encode_powershell_command`) that carries it safely.
+    PowerShell counts the prologue when it reports a position, so a one-line command is line 2.
     """
-    return f"{cmd}\n{POWERSHELL_EXIT_CODE_EPILOGUE}\n"
+    return f"{POWERSHELL_NOT_RUN_PROLOGUE}\n{cmd}\n{POWERSHELL_EXIT_CODE_EPILOGUE}\n"
 
 
 def encode_powershell_command(cmd: str) -> str:
@@ -368,9 +408,11 @@ class PlatformAdapter(ABC):
         """The argv running ``cmd`` under ``shell`` (or the detected shell).
 
         The command is rewritten in exactly one place and for exactly one reason: a PowerShell
-        script gains the exit-code epilogue of ADR-030 §2 and travels Base64-encoded. Nothing else
-        is ever added, removed or quoted here — a translation between dialects is a decision of the
-        plan runner, taken before the command reaches this layer and traced in the task record.
+        script gains the not-run prologue of ADR-032 and the exit-code epilogue of ADR-030 §2, and
+        travels Base64-encoded. Nothing else is ever added, removed or quoted here — a translation
+        between dialects is a decision of the plan runner, taken before the command reaches this
+        layer and traced in the task record. ``cmd /c`` gets the command verbatim: its own code for
+        a program it cannot find, 9009, is read as such where results are built (ADR-032).
         """
         detected = self.detect_shell(shell)
         if detected.dialect is ShellDialect.POWERSHELL:

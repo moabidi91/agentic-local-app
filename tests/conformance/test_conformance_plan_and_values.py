@@ -2209,6 +2209,60 @@ async def given_build_tool_verdict_with_critical_when_plan_runs_then_the_model_i
 
 
 @case(
+    "licit-build-tool-not-found-is-no-verdict",
+    category=UNUSUAL,
+    sends=(
+        "le même plan de diagnostic sur une machine sans Maven : le shell démarre, ne trouve pas "
+        "`mvn` et répond lui-même 127 (`mvn: command not found`)"
+    ),
+    expects=(
+        "le plan **s'arrête**, comme pour tout échec : 127 est la réponse du shell, pas celle de "
+        'Maven, donc jamais un verdict. Le résultat porte `execution: "ran"`, '
+        '`reason: "COMMAND_NOT_FOUND"` et le message du shell sur stderr, sans '
+        "`failure_is_verdict` ; les deux lectures sont sautées"
+    ),
+    code="accepté",
+    policy="accepté (plan arrêté, protocole intact)",
+    ref="§8.3 · ADR-009 §1 · ADR-029 §2 · ADR-032",
+)
+async def given_build_tool_the_shell_cannot_find_when_plan_runs_then_no_verdict_and_the_plan_stops() -> (
+    None
+):
+    rig = make_rig()
+    said = b"bash: line 1: mvn: command not found\n"
+    rig.executor.script(cmd="mvn clean install", stderr=said, exit_code=127)
+
+    session = await run_accepted(
+        rig,
+        discovery_plan(
+            tasks=[
+                cmd_task("t1", "mvn clean install"),
+                cmd_task("t2", "sed -n '40,45p' Service.java"),
+                cmd_task("t3", "javac -version"),
+            ]
+        ),
+        final_answer(message_id="model-msg-0002"),
+    )
+    sid = session.session_id
+
+    plan = rig.plan(sid, "plan-0")
+    assert plan.status is PlanState.STOPPED_ON_FAILURE and plan.stop_reason == "task_failed:t1"
+    assert [rig.task(sid, t).status for t in ("t1", "t2", "t3")] == [
+        TaskState.FAILED,
+        TaskState.SKIPPED,
+        TaskState.SKIPPED,
+    ]
+    assert rig.task(sid, "t1").reason is None  # derived in the message, never stored
+    result = rig.posted(1)["content"]
+    first = result["results"][0]
+    assert (first["status"], first["execution"], first["exit_code"]) == ("failed", "ran", 127)
+    assert first["reason"] == "COMMAND_NOT_FOUND" and "failure_is_verdict" not in first
+    assert first["stderr"] == said.decode()
+    assert result["status"] == "stopped_on_failure" and result["stop_reason"] == "task_failed:t1"
+    assert [ref["task_id"] for ref in result["skipped_tasks"]] == ["t2", "t3"]
+
+
+@case(
     "licit-same-plan-new-ids",
     category=UNUSUAL,
     sends="deux fois le même contenu de plan, avec un `plan_id` et des `task_id` neufs",

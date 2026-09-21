@@ -67,6 +67,9 @@ from agentic_local_app.domain.models import (
     TaskRecord,
 )
 from agentic_local_app.domain.shell import (
+    COMMAND_NOT_EXECUTABLE,
+    COMMAND_NOT_FOUND,
+    NOT_RUN_EXIT_CODES,
     ExecutionEnvironment,
     ShellDialect,
     ShellSource,
@@ -95,6 +98,7 @@ from agentic_local_app.protocol.messages import (
     ProtocolCorrectionRequestContent,
     SessionBudgetContent,
     TaskMessage,
+    TaskResult,
     TaskTranslation,
     UserRequestContent,
     UserResponseContent,
@@ -337,7 +341,8 @@ _VERDICT_RULE_ON = (
     "diagnosis in one turn instead of one exit code. Write `critical: true` or "
     "`stop_plan_on_failure: true` on that task when you do want the plan to stop there: an "
     "explicit instruction from you always wins. A command that could not be started or that timed "
-    "out never answered, so it is not a verdict and stops the plan as usual."
+    "out never answered, and neither did a program the shell could not find or run (below): none "
+    "of them is a verdict, and they stop the plan as usual."
 )
 _VERDICT_RULE_OFF = (
     "This deployment recognises no program whose non-zero exit is a result rather than a failure "
@@ -396,6 +401,8 @@ _POSIX_EXAMPLE_COMMANDS: Mapping[str, str] = MappingProxyType(
         "list_project": "ls -A",
         "read_settings": 'grep "maven.compiler" pom.xml',
         "java_home": 'echo "$JAVA_HOME"',
+        # ADR-032: a recognised compiler, called by a path that does not exist on the machine
+        "missing_compiler": "/usr/lib/jvm/java-21-openjdk/bin/javac -version",
     }
 )
 EXAMPLE_COMMANDS: Mapping[ShellDialect, Mapping[str, str]] = MappingProxyType(
@@ -406,6 +413,7 @@ EXAMPLE_COMMANDS: Mapping[ShellDialect, Mapping[str, str]] = MappingProxyType(
                 "list_project": "Get-ChildItem -Force -Name",
                 "read_settings": '(Get-Content pom.xml) -match "maven.compiler"',
                 "java_home": "$env:JAVA_HOME",
+                "missing_compiler": "C:\\Java\\jdk-21\\bin\\javac.exe -version",
             }
         ),
         ShellDialect.CMD: MappingProxyType(
@@ -413,11 +421,43 @@ EXAMPLE_COMMANDS: Mapping[ShellDialect, Mapping[str, str]] = MappingProxyType(
                 "list_project": "dir /a /b",
                 "read_settings": 'findstr "maven.compiler" pom.xml',
                 "java_home": "echo %JAVA_HOME%",
+                "missing_compiler": "C:\\Java\\jdk-21\\bin\\javac.exe -version",
             }
         ),
         ShellDialect.UNKNOWN: _POSIX_EXAMPLE_COMMANDS,
     }
 )
+#: ADR-032 — what each shell answers for the ``missing_compiler`` command of the example of section
+#: 5.1: the exit code, the shell's own message on stderr, and a plausible run time. The exit code is
+#: written here, not read from ``NOT_RUN_EXIT_CODES``, so that the contract test proves the reason
+#: the result collector derives from it against an independent source.
+_POSIX_NOT_RUN_ANSWER: tuple[int, str, int] = (
+    127,
+    "bash: line 1: /usr/lib/jvm/java-21-openjdk/bin/javac: No such file or directory\n",
+    3,
+)
+_NOT_RUN_EXAMPLE_ANSWERS: Mapping[ShellDialect, tuple[int, str, int]] = MappingProxyType(
+    {
+        ShellDialect.POSIX: _POSIX_NOT_RUN_ANSWER,
+        ShellDialect.POWERSHELL: (
+            127,
+            "C:\\Java\\jdk-21\\bin\\javac.exe: The term 'C:\\Java\\jdk-21\\bin\\javac.exe' is not "
+            "recognized as a name of a cmdlet, function, script file, or executable program.\n"
+            "Check the spelling of the name, or if a path was included, verify that the path is "
+            "correct and try again.\n",
+            412,
+        ),
+        ShellDialect.CMD: (
+            9009,
+            "'C:\\Java\\jdk-21\\bin\\javac.exe' is not recognized as an internal or external "
+            "command,\r\noperable program or batch file.\r\n",
+            23,
+        ),
+        ShellDialect.UNKNOWN: _POSIX_NOT_RUN_ANSWER,
+    }
+)
+#: The order in which the reasons of ADR-032 are named in the contract.
+_NOT_RUN_REASONS = (COMMAND_NOT_FOUND, COMMAND_NOT_EXECUTABLE)
 #: The build of the example exchange: whether its failure is a verdict depends on the configured
 #: ``execution.verdict_programs`` (ADR-029 §2), and the example says what the deployment does.
 _EXAMPLE_BUILD_COMMAND = "mvn -B clean install"
@@ -475,6 +515,44 @@ def _translation_example(dialect: ShellDialect) -> str:
     )
 
 
+def _not_run_codes(dialect: ShellDialect) -> str:
+    """ADR-032 — the reasons of a program the shell could not run, with the exit codes this
+    machine's shell answers, straight from the table the result collector reads."""
+    codes = {reason: code for code, reason in NOT_RUN_EXIT_CODES[dialect].items()}
+    named = [(reason, codes[reason]) for reason in _NOT_RUN_REASONS if reason in codes]
+    (first, first_code), *rest = named
+    return ", ".join(
+        [f"`{first}` for exit code `{first_code}`", *(f"`{r}` for `{c}`" for r, c in rest)]
+    )
+
+
+def _not_run_example(dialect: ShellDialect, config: AppConfig) -> str:
+    """ADR-032 — the task result of the example of section 5.1, on one line as in the other results
+    of the contract: a recognised compiler the shell could not find, as this machine reports it."""
+    exit_code, stderr, duration_ms = _NOT_RUN_EXAMPLE_ANSWERS[dialect]
+    size = len(stderr.encode("utf-8"))
+    result = TaskResult(
+        task_id="t12",
+        status="failed",
+        execution="ran",
+        exit_code=exit_code,
+        stdout="",
+        stderr=stderr,
+        truncated=False,
+        original_size_bytes=size,
+        stdout_total=0,
+        stderr_total=size,
+        stdout_range=(0, 0),
+        stderr_range=(0, size),
+        max_output_bytes_applied=config.payload.default_max_output_bytes,
+        timed_out=False,
+        timeout_ms_applied=config.execution.default_task_timeout_ms,
+        duration_ms=duration_ms,
+        reason=COMMAND_NOT_FOUND,
+    )
+    return json.dumps(result.model_dump(mode="json", exclude_none=True), ensure_ascii=False)
+
+
 def render_instructions(
     config: AppConfig, *, environment: ExecutionEnvironment | None = None
 ) -> str:
@@ -482,7 +560,8 @@ def render_instructions(
     first-message rule of ADR-022 rendered from ``protocol.allow_direct_response``, the correction
     policy of ADR-023 rendered from ``protocol.max_correction_attempts``, the verdict rule of
     ADR-029 rendered from ``execution.verdict_programs``, the environment announcement of
-    ADR-030 §3 and — ADR-031 — the commands of the examples written in the announced dialect.
+    ADR-030 §3, — ADR-031 — the commands of the examples written in the announced dialect and —
+    ADR-032 — the exit codes by which that dialect's shell says it could not run a program.
 
     ``environment`` is the announcement to render; when it is not given it is detected from the
     configuration (:func:`~agentic_local_app.domain.shell.describe_environment`, ``shutil.which``).
@@ -543,6 +622,9 @@ def render_instructions(
             if programs
             else _VERDICT_RULE_OFF
         ),
+        # ADR-032: what the shell of this machine answers for a program it could not run
+        "not_run_codes": _not_run_codes(where.dialect),
+        "example_not_run_result": _not_run_example(where.dialect, config),
         # ADR-031: the examples of the contract
         **{f"cmd_{name}": _json_string_body(command) for name, command in commands.items()},
         "translation_example": _translation_example(where.dialect),

@@ -229,6 +229,9 @@ translate_commands = true
 # l'un d'eux a bien tourné (ni échec de lancement, ni timeout) et rend un code non nul, le plan
 # CONTINUE — sauf si le modèle a demandé l'arrêt sur cette tâche (`critical` ou
 # `stop_plan_on_failure`), une consigne explicite l'emportant toujours sur un défaut implicite.
+# Un programme que le shell n'a pas trouvé ou pas pu lancer n'a PAS tourné : les codes 127 et 126
+# (9009 sous cmd) sont la réponse du shell, jamais un verdict, et le plan suit la règle de tout
+# échec — il s'arrête, sauf continue_on_error (ADR-032).
 #
 # Chaque entrée est un programme (« mvn ») ou un programme et la sous-commande qui compte
 # (« npm run » : `npm install` n'est pas une compilation, et `npm build` n'existe pas). La
@@ -245,8 +248,8 @@ verdict_programs = [
   "mvn", "mvnw", "gradle", "gradlew", "ant", "sbt", "javac",
   # Node et TypeScript
   "npm run", "npm test", "yarn", "pnpm", "npx", "tsc", "eslint",
-  # Rust, .NET, Go
-  "cargo", "dotnet", "go",
+  # Rust (cargo, et le compilateur rustc appelé directement), .NET, Go
+  "cargo", "rustc", "dotnet", "go",
   # C / C++ et la famille make
   "make", "cmake", "ninja", "gcc", "g++", "clang", "clang++",
   # Python

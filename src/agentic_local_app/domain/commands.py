@@ -9,6 +9,10 @@ filesystem. Two questions are answered from the command line alone:
   **result to interpret** (a compiler, a build tool, a test runner, a linter) rather than a task
   that went wrong.
 
+A verdict requires evidence that the program ran (ADR-032): an exit code that is the shell's own
+answer for a program it could not find or run (126 and 127 on POSIX, 9009 from ``cmd`` —
+:func:`~agentic_local_app.domain.shell.command_not_run_reason`) is never one, whatever the program.
+
 The rule is deliberately literal, and what it cannot see is written down in ADR-029: a program
 reached through a shell variable (``$BUILD_TOOL install``), a pipeline whose exit code is the last
 command's (``mvn install | tail -80``), or a wrapper script named after nothing in particular
@@ -20,6 +24,8 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Iterable
+
+from agentic_local_app.domain.shell import ShellDialect, command_not_run_reason
 
 __all__ = ["VerdictPrograms", "invoked", "normalise_program_entry"]
 
@@ -142,9 +148,15 @@ class VerdictPrograms:
             return True
         return argument is not None and (program, argument) in self._pairs
 
-    def is_verdict(self, cmd: str | None, exit_code: int | None, *, timed_out: bool) -> bool:
+    def is_verdict(
+        self, cmd: str | None, exit_code: int | None, *, timed_out: bool, dialect: ShellDialect
+    ) -> bool:
         """Whether this exit code is a **verdict** of a recognised program: the command ran to the
-        end (an exit code exists, no timeout) and answered something other than zero."""
+        end (an exit code exists, no timeout), answered something other than zero, and that answer
+        is the program's — not the code by which a ``dialect`` shell says it could not find or run
+        the program (ADR-032), which is never a verdict whatever the program."""
         if timed_out or exit_code is None or exit_code == 0:
+            return False
+        if command_not_run_reason(dialect, exit_code) is not None:
             return False
         return self.matches(cmd)

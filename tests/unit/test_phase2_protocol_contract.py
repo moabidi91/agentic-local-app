@@ -1,5 +1,5 @@
 """Phase 2 — the protocol contract the model receives (ADR-031, on ADR-004, ADR-022, ADR-023,
-ADR-029 and ADR-030).
+ADR-029, ADR-030 and ADR-032).
 
 ``PROTOCOL_INSTRUCTIONS.md`` is the whole contract between the application and the model, and its
 examples are what a model copies first. Two families of tests make the text impossible to drift
@@ -14,7 +14,9 @@ from the code.
    validates against its content model, in the very form the application serialises. The
    application's own messages are then rebuilt by the real components — the results by the
    ``ResultCollector`` after the real truncation, the summary of a rotation by the
-   ``ContextReducer``, the correction by the adapter — and must equal what the text shows.
+   ``ContextReducer``, the correction by the adapter — and must equal what the text shows. The
+   example of a program the shell could not run (ADR-032) is run end to end by the real
+   ``PlanRunner``, whose ``execution_result`` must be the one the text shows, stop included.
 2. **The dictionary is compared with the models.** Every table of section 2 lists exactly the
    fields of its pydantic model, with the right JSON type, required-ness, default and allowed
    values; the ``context_summary`` table lists the keys the reducer writes; the error-code table
@@ -57,6 +59,8 @@ from agentic_local_app.domain.models import (
     TaskRecord,
 )
 from agentic_local_app.domain.shell import (
+    COMMAND_NOT_FOUND,
+    NOT_RUN_EXIT_CODES,
     DetectedShell,
     ExecutionEnvironment,
     ShellDialect,
@@ -74,8 +78,11 @@ from agentic_local_app.domain.states import (
     SessionState,
     TaskState,
 )
+from agentic_local_app.execution.executor import CancellationToken
 from agentic_local_app.execution.payload_guard import PayloadGuard
+from agentic_local_app.execution.plan_runner import PlanRunner
 from agentic_local_app.execution.result_collector import ResultCollector
+from agentic_local_app.observability.event_bus import EventBus
 from agentic_local_app.persistence.memory import InMemoryConversationStore
 from agentic_local_app.protocol import adapter as adapter_module
 from agentic_local_app.protocol.adapter import (
@@ -106,6 +113,7 @@ from agentic_local_app.protocol.messages import (
     UserResponseContent,
     content_model_for,
 )
+from agentic_local_app.testing.fake_executor import FakeCommandExecutor
 from agentic_local_app.transport.codecs import CodecError, JsonTextCodec, ToolCallCodec
 
 pytestmark = pytest.mark.phase2
@@ -484,7 +492,7 @@ def given_rendered_contract_when_blocks_read_then_every_json_block_is_labelled_a
     assert len(plain) == 2
     labels = labelled(rendered(machine, config_name))
     assert {"A1", "A2", "A3", "A4", "A5", "A6", "B1", "B2", "C1", "C2", "C3", "C4"} <= set(labels)
-    assert {"P1", "K1", "R1", "R2"} <= set(labels)
+    assert {"P1", "K1", "R1", "R2", "N1", "N2"} <= set(labels)
     assert sum(1 for label in labels if label.startswith("M")) >= 10
 
 
@@ -580,7 +588,10 @@ def _ran(
     replay: Replay, plan_label: str, result_label: str
 ) -> tuple[PlanRecord, list[TaskRecord], dict[str, Any]]:
     """The records of ``plan_label`` once its tasks ended as ``result_label`` reports, the kept
-    output recomputed by the real truncation from streams of the reported sizes."""
+    output recomputed by the real truncation from streams of the reported sizes.
+
+    A ``reason`` shown next to an exit code is **not** copied onto the record: the collector derives
+    it from the exit code and the shell's dialect (ADR-032), and that is what the rebuild proves."""
     plan, tasks = _records(replay, plan_label)
     result = ExecutionResultContent.model_validate(replay.blocks[result_label].data["content"])
     guard = PayloadGuard(replay.config.payload)
@@ -602,7 +613,7 @@ def _ran(
                     "exit_code": reported.exit_code,
                     "duration_ms": reported.duration_ms,
                     "timed_out": reported.timed_out,
-                    "reason": reported.reason,
+                    "reason": reported.reason if reported.exit_code is None else None,
                     "truncated": kept.truncated,
                     "original_size_bytes": kept.original_size_bytes,
                     "stdout_total": kept.stdout_total,
@@ -612,6 +623,15 @@ def _ran(
                 }
             )
         )
+    for state, references in (
+        (TaskState.SKIPPED, result.skipped_tasks),
+        (TaskState.CANCELLED, result.cancelled_tasks),
+        (TaskState.INTERRUPTED, result.interrupted_tasks),
+    ):
+        ended += [
+            tasks[ref.task_id].model_copy(update={"status": state, "reason": ref.reason})
+            for ref in references
+        ]
     finished = plan.model_copy(
         update={"status": PlanState(result.status.upper()), "stop_reason": result.stop_reason}
     )
@@ -619,7 +639,7 @@ def _ran(
 
 
 @pytest.mark.parametrize(("machine", "config_name"), RENDERINGS)
-@pytest.mark.parametrize(("plan_label", "result_label"), [("A2", "A3"), ("A4", "A5")])
+@pytest.mark.parametrize(("plan_label", "result_label"), [("A2", "A3"), ("A4", "A5"), ("N1", "N2")])
 def given_example_results_when_rebuilt_by_the_collector_then_identical_to_the_text(
     machine: str, config_name: str, plan_label: str, result_label: str
 ) -> None:
@@ -645,6 +665,72 @@ def given_build_example_when_rendered_then_its_truncation_is_the_one_the_text_ex
     assert end == build["stdout_total"] and end - start == len(build["stdout"].encode())
     assert f"`[{start}, {end}]`" in rendered("posix")  # section 7.1 reads this very range
     assert end - start == build["max_output_bytes_applied"]  # a stream alone gets the whole budget
+
+
+@pytest.mark.parametrize(("machine", "config_name"), RENDERINGS)
+async def given_not_run_example_when_its_plan_runs_then_the_runner_sends_exactly_that_result(
+    machine: str, config_name: str
+) -> None:
+    """ADR-032 — ``N2`` is what the real ``PlanRunner`` sends when the shell of this machine answers
+    as the example says: the plan stopped, ``t13`` skipped, ``reason`` derived, no verdict."""
+    replay = replayed(machine, config_name)
+    plan, tasks = _records(replay, "N1")
+    session = _session(replay.blocks["A1"].data)
+    shown = replay.blocks["N2"].data["content"]
+    answer = shown["results"][0]
+    store = InMemoryConversationStore()
+    store.save_session(session)
+    store.save_conversation(conversation_record(replay.state_after("N1")))
+    store.save_plan(plan)
+    store.save_tasks(list(tasks.values()))
+    clock = FakeClock(T0)
+    shell = FakeCommandExecutor(clock)
+    shell.script(
+        task_id="t12",
+        stderr=answer["stderr"].encode(),
+        exit_code=answer["exit_code"],
+        duration_ms=answer["duration_ms"],
+    )
+    runner = PlanRunner(
+        store,
+        EventBus(),
+        shell,
+        PayloadGuard(replay.config.payload),
+        clock,
+        SequentialIdGenerator(),
+        replay.config,
+        translator=ShellTranslator(
+            ENVIRONMENTS[machine].dialect, enabled=replay.config.execution.translate_commands
+        ),
+    )
+
+    outcome = await runner.run(plan, list(tasks.values()), session, interrupt=CancellationToken())
+
+    assert outcome.execution_result is not None
+    assert outcome.execution_result.model_dump(mode="json", exclude_none=True) == shown
+    assert [call.cmd for call in shell.calls] == [tasks["t12"].cmd]  # t13 never ran
+    assert outcome.tasks[0].reason is None  # the reason is derived, the record keeps none
+
+
+@pytest.mark.parametrize("machine", list(ENVIRONMENTS))
+def given_not_run_rule_when_rendered_then_it_names_exactly_this_shell_s_codes(machine: str) -> None:
+    """The codes the contract gives are the ones results are read with — and no other shell's."""
+    text = rendered(machine)
+    dialect = ENVIRONMENTS[machine].dialect
+    codes = NOT_RUN_EXIT_CODES[dialect]
+    result_table = text.split("#### Task result", 1)[1].split("#### Task reference", 1)[0]
+    rule = text.split("**A program the shell cannot find or run", 1)[1].split("```", 1)[0]
+    for section in (result_table, rule):
+        for code, reason in codes.items():
+            assert f"`{reason}` for" in section and f"`{code}`" in section
+        for other in {code for table in NOT_RUN_EXIT_CODES.values() for code in table} - set(codes):
+            assert f"`{other}`" not in section
+    # the example is a recognised compiler, so its missing verdict demonstrates the rule
+    build = labelled(text)["N1"].data["content"]["tasks"][0]["cmd"]
+    assert VerdictPrograms(AppConfig().execution.verdict_programs).matches(build)
+    result = labelled(text)["N2"].data["content"]["results"][0]
+    assert result["reason"] == COMMAND_NOT_FOUND and "failure_is_verdict" not in result
+    assert result["exit_code"] in codes and result["execution"] == "ran"
 
 
 def given_verdicts_off_when_rendered_then_the_build_example_carries_no_verdict() -> None:
@@ -1008,9 +1094,16 @@ def given_machine_when_rendered_then_every_example_command_is_written_in_its_dia
     assert all(translator.translate(command) is None for command in _commands(text))
 
 
+#: The one line of ``N2`` that is the shell's own answer (ADR-032): exit code, message, sizes.
+_NOT_RUN_RESULT_LINE = re.compile(r'^ *\{"task_id": "t12", "status": "failed".*$', re.M)
+
+
 def given_two_machines_when_rendered_then_only_commands_announcement_and_translation_differ() -> (
     None
 ):
+    """ADR-031 §5, and ADR-032: besides the commands, the announcement and the direction of the
+    ``translation`` fragment, only the shell's own answer to a program it cannot run may differ."""
+
     def neutral(machine: str) -> str:
         text = rendered(machine)
         for name, command in EXAMPLE_COMMANDS[ENVIRONMENTS[machine].dialect].items():
@@ -1018,7 +1111,10 @@ def given_two_machines_when_rendered_then_only_commands_announcement_and_transla
         before, rest = text.split("## 6. ", 1)
         after = rest.split("## 7. ", 1)[1]
         fragment = next(b for b in blocks_of(text) if b.fragment)
-        return (before + after).replace(fragment.body, "<translation>")
+        neutralised = (before + after).replace(fragment.body, "<translation>")
+        neutralised, answers = _NOT_RUN_RESULT_LINE.subn("<not-run result>", neutralised)
+        assert answers == 1
+        return neutralised
 
     assert rendered("posix") != rendered("powershell")
     assert neutral("posix") == neutral("powershell")

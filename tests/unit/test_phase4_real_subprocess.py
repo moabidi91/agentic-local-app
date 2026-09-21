@@ -1,4 +1,4 @@
-"""Phase 4 — ``SubprocessCommandExecutor`` against real processes (ADR-003, ADR-008, ADR-016, ADR-018, ADR-030).
+"""Phase 4 — ``SubprocessCommandExecutor`` against real processes (ADR-003, ADR-008, ADR-016, ADR-018, ADR-030, ADR-032).
 
 These are the **only** tests allowed to spawn a process (marker ``real_subprocess``). Every command
 runs the current interpreter (``sys.executable``) with a quote-free ``-c`` snippet so that the same
@@ -21,6 +21,12 @@ import pytest
 
 from agentic_local_app.config import ExecutionSection
 from agentic_local_app.domain.clock import SystemClock
+from agentic_local_app.domain.shell import (
+    COMMAND_NOT_EXECUTABLE,
+    COMMAND_NOT_FOUND,
+    ShellDialect,
+    command_not_run_reason,
+)
 from agentic_local_app.domain.states import OutputStream, TaskState
 from agentic_local_app.execution.executor import (
     CancellationToken,
@@ -267,6 +273,40 @@ async def given_missing_shell_when_executed_then_spawn_error_names_the_interpret
     raw = await _executor().execute(spec, cancel=CancellationToken())
     assert raw.outcome is TaskState.FAILED and raw.spawn_error is not None
     assert "shell-xyz" in raw.spawn_error or "FileNotFoundError" in raw.spawn_error
+
+
+@pytest.mark.skipif(IS_WINDOWS, reason="the POSIX convention; PowerShell's is proven on its script")
+@pytest.mark.parametrize(
+    ("case", "code", "reason"),
+    [
+        pytest.param("name", 127, COMMAND_NOT_FOUND, id="no-such-program"),
+        pytest.param("path", 127, COMMAND_NOT_FOUND, id="no-such-path"),
+        pytest.param("mode", 126, COMMAND_NOT_EXECUTABLE, id="found-but-not-executable"),
+    ],
+)
+async def given_program_the_shell_cannot_run_when_executed_then_the_shell_answers_its_own_code(
+    tmp_path: Path, case: str, code: int, reason: str
+) -> None:
+    """ADR-032: the shell starts — no spawn error, a pid — and answers for the program with the
+    conventional code of its dialect, which is what results read as ``reason``."""
+    compiler = tmp_path / "javac"
+    compiler.write_text("#!/bin/sh\necho never\n", encoding="utf-8")
+    compiler.chmod(0o644)  # no execute bit for anybody, root included
+    program = {
+        "name": "no-such-compiler-7f3c",
+        "path": shlex.quote(str(tmp_path / "no-such-jdk" / "bin" / "javac")),
+        "mode": shlex.quote(str(compiler)),
+    }[case]
+    executor = _executor()
+
+    raw = await executor.execute(_spec(f"{program} Main.java"), cancel=CancellationToken())
+
+    assert raw.spawn_error is None and raw.pid is not None  # the shell itself did start
+    assert raw.outcome is TaskState.FAILED and raw.exit_code == code
+    assert program.strip("'").encode() in raw.stderr  # the shell names what it could not run
+    dialect = executor.platform.detect_shell().dialect
+    assert dialect is ShellDialect.POSIX
+    assert command_not_run_reason(dialect, raw.exit_code) == reason
 
 
 async def given_already_cancelled_token_when_executed_then_nothing_spawned() -> None:

@@ -2185,8 +2185,9 @@ def given_two_machines_when_instructions_rendered_then_only_announcement_and_com
     config: AppConfig,
 ) -> None:
     """ADR-030 §3 as amended by ADR-031: two machines read the same contract but for the
-    announcement (section 6), the example commands written in each dialect and the direction of
-    the ``translation`` example — nothing else may vary."""
+    announcement (section 6), the example commands written in each dialect, the direction of the
+    ``translation`` example and — ADR-032 — the shell's own answer to a program it cannot run in
+    the result of ``N2``: nothing else may vary."""
     windows = render_instructions(config, environment=_environment())
     posix = render_instructions(
         config, environment=_environment(ShellDialect.POSIX, program="/usr/bin/bash")
@@ -2199,7 +2200,9 @@ def given_two_machines_when_instructions_rendered_then_only_announcement_and_com
         head, rest = text.split("## 6. ", 1)
         example = re.search(r"```json fragment translation\n(.*?)```", text, re.S)
         assert example is not None
-        return (head + rest.split("## 7. ", 1)[1]).replace(example.group(1), "<translation>")
+        text = (head + rest.split("## 7. ", 1)[1]).replace(example.group(1), "<translation>")
+        answer = re.compile(r'^ *\{"task_id": "t12", "status": "failed".*$', re.M)
+        return answer.sub("<not-run result>", text)
 
     assert neutral(windows, ShellDialect.POWERSHELL) == neutral(posix, ShellDialect.POSIX)
 

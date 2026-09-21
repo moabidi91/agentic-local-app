@@ -2,7 +2,7 @@
 
 # Rapport de conformité protocolaire — comportement de l'application face à un modèle qui se trompe
 
-**Généré le 2026-09-21** à partir de la batterie `tests/conformance` (123 cas, tous exécutés à chaque `pytest`).
+**Généré le 2026-09-21** à partir de la batterie `tests/conformance` (124 cas, tous exécutés à chaque `pytest`).
 
 ## 1. Ce que ce rapport mesure
 
@@ -45,9 +45,9 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | Dépendances et exécution | 11 | 11 | 0 | 0 |
 | Valeurs des tâches | 19 | 19 | 0 | 0 |
 | Contenus de conclusion | 16 | 16 | 0 | 0 |
-| Réponses licites mais inattendues | 7 | 7 | 0 | 0 |
+| Réponses licites mais inattendues | 8 | 8 | 0 | 0 |
 
-**Total : 123 cas — 123 conformes, 0 à surveiller, 0 écarts.**
+**Total : 124 cas — 124 conformes, 0 à surveiller, 0 écarts.**
 
 ## 5. La matrice
 
@@ -211,6 +211,7 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | `licit-plan-fails-session-continues` | un plan d'une seule commande qui sort en code non nul | le **plan** échoue (`stopped_on_failure`) et l'`execution_result` le dit ; la session, elle, continue : un échec de commande n'est pas une faute de protocole | `accepté` | accepté (plan arrêté, protocole intact) | §8.3 · ADR-008 §3 · ADR-009 | ✅ |
 | `licit-build-tool-verdict-continues` | un plan de diagnostic dont la première tâche est `mvn clean install` : la compilation échoue (code 1), les tâches suivantes lisent le fichier fautif et la version du JDK | le plan **continue** : un code non nul rendu par un outil reconnu est un verdict, pas une tâche qui a mal tourné. Le plan finit `completed`, les trois résultats sont rapportés et celui de la compilation porte `execution: "ran"` et `failure_is_verdict: true` | `accepté` | accepté (plan mené à son terme) | §8.3 · ADR-009 §1 · ADR-029 §2 · ADR-029 §4 | ✅ |
 | `licit-build-tool-verdict-explicit-stop` | la même compilation qui échoue, mais déclarée `critical: true` par le modèle | le plan s'arrête : une consigne explicite du modèle l'emporte toujours sur le défaut implicite, et le résultat marque quand même le verdict | `accepté` | accepté (plan arrêté sur consigne du modèle) | §8.3 · ADR-009 §3 · ADR-029 §2 | ✅ |
+| `licit-build-tool-not-found-is-no-verdict` | le même plan de diagnostic sur une machine sans Maven : le shell démarre, ne trouve pas `mvn` et répond lui-même 127 (`mvn: command not found`) | le plan **s'arrête**, comme pour tout échec : 127 est la réponse du shell, pas celle de Maven, donc jamais un verdict. Le résultat porte `execution: "ran"`, `reason: "COMMAND_NOT_FOUND"` et le message du shell sur stderr, sans `failure_is_verdict` ; les deux lectures sont sautées | `accepté` | accepté (plan arrêté, protocole intact) | §8.3 · ADR-009 §1 · ADR-029 §2 · ADR-032 | ✅ |
 | `licit-same-plan-new-ids` | deux fois le même contenu de plan, avec un `plan_id` et des `task_id` neufs | accepté : l'unicité porte sur les identifiants, jamais sur le contenu | `accepté` | accepté | §12.2 · ADR-007 · ADR-019 §1 | ✅ |
 | `licit-final-answer-after-discovery` | un `final_answer` dès le résultat du plan de découverte | accepté : rien n'oblige le modèle à un second plan, la session se termine COMPLETED | `accepté` | accepté | §11 · §14 · ADR-007 | ✅ |
 | `licit-user-response-mid-investigation` | un `user_response` après un `execution_result`, au milieu d'une enquête | accepté : le tour est conclu sans `final_answer`, la session est COMPLETED et la conversation reste réutilisable pour la réponse de l'utilisateur | `accepté` | accepté | §11 · ADR-022 §2 · ADR-022 §3 | ✅ |

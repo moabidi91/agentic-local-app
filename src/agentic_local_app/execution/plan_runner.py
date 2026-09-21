@@ -23,7 +23,10 @@ Scheduling (§2.4, §8.2 amended by the ADRs), the same loop for both policies:
 - a non-zero exit from one of the ``execution.verdict_programs`` — a compiler, a build tool, a test
   runner, a linter that **ran** — does not stop the plan (ADR-029 §2): its answer is the result the
   plan exists to produce. An explicit ``critical`` / ``stop_plan_on_failure`` on that task still
-  stops it, a spawn error or a timeout is untouched, and the dependants are skipped as always;
+  stops it, a spawn error or a timeout is untouched, and the dependants are skipped as always. The
+  exit code by which the shell says it could not find or run the program (ADR-032: 127 / 126, 9009
+  under ``cmd``) is no answer of the program, so it is no verdict either and the plan stops as for
+  any failure;
 - after every task the stop conditions of §8.3 / ADR-009 apply; a stop in parallel mode cancels
   the running tasks (``plan_stopped``) and drains them for ``cancel_drain_timeout_ms`` — the
   executor does the two-phase termination — before the plan goes terminal (§17.2); an interruption
@@ -79,6 +82,7 @@ from agentic_local_app.domain.models import (
     SessionRecord,
     TaskRecord,
 )
+from agentic_local_app.domain.shell import ShellDialect
 from agentic_local_app.domain.states import (
     ExecutionPolicy,
     OutputStream,
@@ -240,6 +244,12 @@ class PlanRunner:
         self.result_collector = result_collector or ResultCollector(
             self.verdict_programs, self.translator
         )
+
+    @property
+    def shell_dialect(self) -> ShellDialect:
+        """ADR-032: the dialect of the shell that runs the commands — the one the translator is
+        aimed at. It decides which exit codes are the shell's own answer, never a verdict."""
+        return self.translator.target
 
     async def run(
         self,
@@ -760,13 +770,18 @@ class _PlanExecution:
 
         Its answer is the result the plan was written to obtain, so the plan carries on reading it;
         only an explicit ``critical`` / ``stop_plan_on_failure`` still stops it. A command that
-        could not be started or that timed out never produced an answer and is untouched by this.
+        could not be started or that timed out never produced an answer and is untouched by this,
+        and so is a program the shell could not find or run (ADR-032): the exit code is then the
+        shell's, not the program's.
         """
         return (
             state is TaskState.FAILED
             and task.type is TaskType.CMD
             and self._runner.verdict_programs.is_verdict(
-                task.cmd, task.exit_code, timed_out=task.timed_out
+                task.cmd,
+                task.exit_code,
+                timed_out=task.timed_out,
+                dialect=self._runner.shell_dialect,
             )
         )
 
