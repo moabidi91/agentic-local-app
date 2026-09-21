@@ -9,8 +9,9 @@ message, the way a sign-in screen does, and nothing is sent to the model until t
 paused on a 401, ADR-025), ``config show`` / ``config validate``, ``transport list`` /
 ``transport show`` (the pluggable transport providers of ADR-020; ``show`` also names the effective
 message codec), ``codec list`` / ``codec show`` (the message codecs of ADR-021), ``shell show`` /
-``shell rules`` (the detected shell and the dialect dictionary of ADR-030), ``mock-server``
-(the scripted model), ``version``.
+``shell rules`` (the detected shell and the dialect dictionary of ADR-030), ``protocol show``
+(the contract the model receives, rendered for this machine or for a given dialect, ADR-031),
+``mock-server`` (the scripted model), ``version``.
 
 Everything external is injectable through :class:`CliDependencies` (``ctx.obj``): the application
 factory (``orchestration.wiring.build_application``, imported lazily so that this module never
@@ -37,6 +38,7 @@ import sys
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum, unique
 from pathlib import Path
 from typing import Annotated, Any, Protocol, cast
 
@@ -59,6 +61,7 @@ from agentic_local_app.execution.platform import default_translator, select_plat
 from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.http_api import API_PREFIX, ConversationManagerLike, create_app
 from agentic_local_app.interruption.handler import InterruptionReport
+from agentic_local_app.protocol.adapter import render_instructions
 from agentic_local_app.testing.mock_model_server import (
     BUILTIN_SCENARIOS,
     DEFAULT_SCENARIO_NAME,
@@ -137,11 +140,15 @@ codec_app = typer.Typer(help="Message codecs: list the available ones, show the 
 shell_app = typer.Typer(
     help="Shell: show the detected one, list the dialect translation rules (ADR-030)."
 )
+protocol_app = typer.Typer(
+    help="Protocol: show the contract the model receives, rendered for this machine (ADR-031)."
+)
 app.add_typer(config_app, name="config")
 app.add_typer(audit_app, name="audit")
 app.add_typer(transport_app, name="transport")
 app.add_typer(codec_app, name="codec")
 app.add_typer(shell_app, name="shell")
+app.add_typer(protocol_app, name="protocol")
 
 ConfigOption = Annotated[
     Path | None, typer.Option("--config", help="Path of config.toml (else AGENTIC_APP_CONFIG).")
@@ -1217,6 +1224,71 @@ def shell_rules(json_output: JsonOption = False) -> None:
     typer.echo("")
     typer.echo("Recognised and deliberately NOT translated:")
     _print_rows(refused, ("program", "from", "to", "reason"))
+
+
+# ================================================================================================
+# protocol show (ADR-031) — the sibling of ``transport show`` / ``codec show`` / ``shell show``
+# ================================================================================================
+@unique
+class ContractDialect(StrEnum):
+    """The dialects ``protocol show --dialect`` can render the contract for."""
+
+    POSIX = "posix"
+    POWERSHELL = "powershell"
+    CMD = "cmd"
+
+
+#: The interpreter pinned to render the contract for a dialect: exactly what an operator writing
+#: ``[execution] shell`` would get, so the announcement then says "chosen by the operator".
+_CONTRACT_SHELL: dict[ContractDialect, str] = {
+    ContractDialect.POSIX: "bash",
+    ContractDialect.POWERSHELL: "pwsh",
+    ContractDialect.CMD: "cmd",
+}
+
+DialectOption = Annotated[
+    ContractDialect | None,
+    typer.Option(
+        "--dialect",
+        help="Render for this dialect, as if [execution] shell pinned its interpreter "
+        "(default: the shell detected on this machine).",
+    ),
+]
+
+
+@protocol_app.command("show")
+def protocol_show(
+    ctx: typer.Context,
+    config: ConfigOption = None,
+    dialect: DialectOption = None,
+    json_output: JsonOption = False,
+) -> None:
+    """Print the protocol contract the model receives at the start of every conversation,
+    rendered with the effective configuration and the detected environment."""
+    cfg = _load(_config_path(ctx, config))
+    execution = (
+        cfg.execution
+        if dialect is None
+        else cfg.execution.model_copy(update={"shell": _CONTRACT_SHELL[dialect]})
+    )
+    environment = select_platform(execution).environment()
+    text = render_instructions(cfg, environment=environment)
+    if not json_output:
+        typer.echo(text, nl=False)
+        return
+    size = len(text.encode("utf-8"))
+    document = {
+        "operating_system": environment.operating_system,
+        "shell": environment.shell.program,
+        "dialect": environment.dialect.value,
+        "source": environment.shell.source.value,
+        "cwd": environment.cwd,
+        "size_bytes": size,
+        "context_budget_bytes": cfg.context.budget_bytes,
+        "context_share": round(size / cfg.context.budget_bytes, 4),
+        "instructions": text,
+    }
+    typer.echo(json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False))
 
 
 @app.command()

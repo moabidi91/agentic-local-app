@@ -1249,32 +1249,19 @@ async def given_task_without_timeout_when_projected_then_configured_default_appl
 
 
 @case(
-    "task-values-coerced-from-strings",
+    "task-values-sent-as-strings",
     category=VALUES,
     sends="une tâche dont le budget, le timeout et les drapeaux arrivent en chaînes ou en entiers",
     expects=(
-        'accepté et **converti** sans avertissement : `"2048"` devient un budget, `"1000"` un '
-        'timeout, `"yes"`/`0` des drapeaux, et ce sont ces valeurs qui pilotent l\'exécution'
+        "rejet : un entier s'écrit sans guillemets et un booléen `true` ou `false` (règle 5 du "
+        'contrat) ; `"yes"`, `0`, `"2048"` et `"1000"` sont nommés un à un dans '
+        "`details.errors`, rien n'est converti ni exécuté"
     ),
-    code="accepté",
-    policy="accepté (valeurs converties)",
-    ref="§12.2 · ADR-008 · ADR-009 · ADR-010",
-    verdict="à surveiller",
-    note=(
-        "Les contenus sont validés en mode **laxiste** (pydantic par défaut) : un entier accepte "
-        'une chaîne numérique (`"2048"`) et un flottant entier (`2048.0`), un booléen accepte '
-        '`"yes"`, `"no"`, `"on"`, `0`, `1`. La conversion est silencieuse et sert ensuite de '
-        "base aux valeurs appliquées : plafonnement ADR-010, timeout passé au shell (ADR-008), "
-        "règle d'arrêt ADR-009 — un `continue_on_error: 0` décide donc de l'arrêt du plan. Rien "
-        "n'est incohérent ici (les valeurs obtenues sont celles que le modèle voulait) et les "
-        "identifiants, eux, restent strictement des chaînes, mais la frontière du protocole est "
-        "plus floue que ce que le §12 laisse entendre. À trancher : soit valider les contenus en "
-        "mode strict (`strict=True` sur `ProtocolModel`), soit documenter explicitement la "
-        "tolérance dans `PROTOCOL_INSTRUCTIONS.md` (ADR-004). Même cause que "
-        "`user-response-expects-reply-coerced`."
-    ),
+    code="SCHEMA_INVALID",
+    policy="échec",
+    ref="§12.2 · ADR-008 · ADR-009 · ADR-010 · ADR-031",
 )
-async def given_task_values_sent_as_strings_when_projected_then_coerced_and_applied() -> None:
+async def given_task_values_sent_as_strings_when_validated_then_each_one_is_refused() -> None:
     rig = make_rig()
     task_as_text: dict[str, Any] = {
         "task_id": "t1",
@@ -1286,20 +1273,33 @@ async def given_task_values_sent_as_strings_when_projected_then_coerced_and_appl
         "continue_on_error": 0,
     }
 
-    session = await run_accepted(
-        rig,
-        plan_message(tasks=[task_as_text]),
-        final_answer(message_id="model-msg-0002"),
-    )
-    sid = session.session_id
+    errors = await schema_errors(rig, plan_message(tasks=[task_as_text]))
 
-    task = rig.task(sid, "t1")
-    assert (task.max_output_bytes, task.max_output_bytes_applied) == (2_048, 2_048)
-    assert (task.timeout_ms, task.timeout_ms_applied) == (1_000, 1_000)
-    assert (task.critical, task.continue_on_error) == (True, False)
-    assert task.stops_plan_on_failure is True  # derived from the coerced flags (ADR-009 §2)
-    assert [call.timeout_ms for call in rig.executor.calls] == [1_000]  # the shell got the string
-    assert rig.events(EventType.AUDIT_WARNING) == []  # converted silently, nothing is reported
+    # ADR-031 §4: the strict pass names every value the default pass would have converted
+    assert errors == [
+        {
+            "loc": "content.tasks.0.critical",
+            "type": "bool_type",
+            "msg": "Input should be a valid boolean",
+        },
+        {
+            "loc": "content.tasks.0.continue_on_error",
+            "type": "bool_type",
+            "msg": "Input should be a valid boolean",
+        },
+        {
+            "loc": "content.tasks.0.max_output_bytes",
+            "type": "int_type",
+            "msg": "Input should be a valid integer",
+        },
+        {
+            "loc": "content.tasks.0.timeout_ms",
+            "type": "int_type",
+            "msg": "Input should be a valid integer",
+        },
+    ]
+    assert rig.executor.calls == []  # a refused plan is never executed
+    assert rig.store.list_tasks(SESSION) == []
 
 
 @case(
@@ -1818,35 +1818,34 @@ async def given_initial_user_request_when_expects_reply_is_not_a_boolean_then_sc
 
 
 @case(
-    "user-response-expects-reply-coerced",
+    "user-response-expects-reply-as-string",
     category=CONCLUSIONS,
     sends="un `user_response` dont `expects_reply` vaut la chaîne `yes`",
-    expects="accepté et **converti** en `true` par la coercition laxiste de pydantic",
-    code="accepté",
-    policy="accepté (valeur convertie)",
-    ref="ADR-022 §1 · ADR-022 §4",
-    verdict="à surveiller",
-    note=(
-        "Même cause que `task-values-coerced-from-strings` (validation laxiste), mais sur le "
-        "drapeau qui décide de la suite du tour : `expects_reply` garde la conversation "
-        "réutilisable sous `auto_close_on_final_answer` (ADR-022 §4) et il est ici dérivé d'une "
-        'chaîne. `"yes"`, `"on"`, `"1"` donnent `true` ; `"sometimes"` reste refusé. Même '
-        "arbitrage à rendre : validation stricte des contenus, ou tolérance documentée."
+    expects=(
+        "rejet : `expects_reply` décide de la suite du tour et s'écrit `true` ou `false`, jamais "
+        "en chaîne — la même règle que pour `sometimes`, sans conversion préalable"
     ),
+    code="SCHEMA_INVALID",
+    policy="échec",
+    ref="ADR-022 §1 · ADR-022 §4 · ADR-031",
 )
-async def given_initial_user_request_when_expects_reply_is_the_string_yes_then_coerced_to_true() -> (
+async def given_initial_user_request_when_expects_reply_is_the_string_yes_then_schema_invalid() -> (
     None
 ):
     rig = make_rig()
     message = user_response()
     message["content"]["expects_reply"] = "yes"
 
-    session = await run_accepted(rig, message)
+    errors = await schema_errors(rig, message)
 
-    received = rig.events(EventType.USER_RESPONSE_RECEIVED)
-    assert len(received) == 1 and received[0].payload["expects_reply"] is True
-    assert session.status is SessionState.COMPLETED
-    assert rig.conversation(CONV).status is ConversationState.WAITING_USER
+    assert errors == [
+        {
+            "loc": "content.expects_reply",
+            "type": "bool_type",
+            "msg": "Input should be a valid boolean",
+        }
+    ]
+    assert rig.events(EventType.USER_RESPONSE_RECEIVED) == []
 
 
 @case(

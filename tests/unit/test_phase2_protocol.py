@@ -17,7 +17,9 @@ What is pinned here:
    ADR-011 chunk fields;
 6. the **protocol instructions** sent to the model at init (ADR-004): configuration values injected,
    every rule named, every embedded JSON example valid against the schemas, the first-message
-   rule rendered from the ADR-022 flag.
+   rule rendered from the ADR-022 flag. The contract of ADR-031 — its examples replayed against the
+   real components, its field dictionary against the models — is pinned by
+   ``test_phase2_protocol_contract.py``.
 
 Only the doubles of ``tests/conftest.py`` are used (no shell, network or real database, §18.3).
 """
@@ -78,6 +80,7 @@ from agentic_local_app.domain.states import (
 from agentic_local_app.protocol import adapter as adapter_module
 from agentic_local_app.protocol.adapter import (
     CORRECTION_EXAMPLE_MESSAGE_ID,
+    EXAMPLE_COMMANDS,
     EXPECTED_INBOUND,
     InboundMessage,
     OutboundMessage,
@@ -2118,7 +2121,7 @@ def given_detected_environment_when_instructions_rendered_then_os_shell_and_cwd_
 ) -> None:
     """ADR-030 §3: the model is told where it is, next to the byte and timeout limits."""
     text = render_instructions(config, environment=_environment())
-    section = text.split("### 3.6")[1].split("## 4.")[0]
+    section = text.split("## 6. The machine your commands run on")[1].split("## 7.")[0]
     assert "**Windows**" in section
     assert "C:\\Program Files\\PowerShell\\7\\pwsh.exe" in section
     assert "**powershell**" in section
@@ -2178,15 +2181,27 @@ def given_no_translation_when_instructions_rendered_then_the_rule_is_announced_a
     assert "may translate" not in text
 
 
-def given_two_machines_when_instructions_rendered_then_only_the_announcement_differs(
+def given_two_machines_when_instructions_rendered_then_only_announcement_and_commands_differ(
     config: AppConfig,
 ) -> None:
+    """ADR-030 §3 as amended by ADR-031: two machines read the same contract but for the
+    announcement (section 6), the example commands written in each dialect and the direction of
+    the ``translation`` example — nothing else may vary."""
     windows = render_instructions(config, environment=_environment())
     posix = render_instructions(
         config, environment=_environment(ShellDialect.POSIX, program="/usr/bin/bash")
     )
     assert windows != posix
-    assert windows.split("### 3.6")[0] == posix.split("### 3.6")[0]
+
+    def neutral(text: str, dialect: ShellDialect) -> str:
+        for name, command in EXAMPLE_COMMANDS[dialect].items():
+            text = text.replace(json.dumps(command)[1:-1], f"<{name}>")
+        head, rest = text.split("## 6. ", 1)
+        example = re.search(r"```json fragment translation\n(.*?)```", text, re.S)
+        assert example is not None
+        return (head + rest.split("## 7. ", 1)[1]).replace(example.group(1), "<translation>")
+
+    assert neutral(windows, ShellDialect.POWERSHELL) == neutral(posix, ShellDialect.POSIX)
 
 
 def given_instructions_when_rendered_then_no_placeholder_left_unresolved(
@@ -2286,7 +2301,8 @@ def given_instructions_when_rendered_then_rule_keyword_present(
 
 
 def _table_row(text: str, label: str) -> str:
-    """The row of the "You received / You may send" table whose first cell starts with ``label``."""
+    """The row of the "After you receive / You may send" table whose first cell starts with
+    ``label``."""
     rows = [line for line in text.splitlines() if line.startswith(f"| `{label}")]
     assert rows, f"no table row for {label}"
     return rows[0]
@@ -2297,12 +2313,12 @@ def given_direct_response_allowed_when_instructions_rendered_then_first_message_
 ) -> None:
     assert config.protocol.allow_direct_response is True
     text = render_instructions(config)
-    first_row = _table_row(text, "user_request` (first message")
+    first_row = _table_row(text, "user_request` — the first")
     assert "`discovery_plan`, `user_response`" in first_row
     assert "unless the request needs no command at all" in text
     assert "discovery_plan | user_response" in text
-    assert "**always**" not in text.split("## 1.")[1].split("```")[0]
-    assert "## 9. Answering the user directly: user_response" in text
+    assert "**always**" not in text.split("## 1.")[1].split("## 2.")[0]
+    assert "## 9. Concluding: final_answer or user_response" in text
     assert re.findall(r"\{[a-z_]+\}", text) == []
 
 
@@ -2311,7 +2327,7 @@ def given_direct_response_disabled_when_instructions_rendered_then_first_message
 ):
     strict = AppConfig(protocol=ProtocolSection(allow_direct_response=False))
     text = render_instructions(strict)
-    first_row = _table_row(text, "user_request` (first message")
+    first_row = _table_row(text, "user_request` — the first")
     assert first_row.rstrip().endswith("| `discovery_plan` |")
     assert "`user_response`" not in first_row
     assert "is **always** a" in text
@@ -2320,17 +2336,30 @@ def given_direct_response_disabled_when_instructions_rendered_then_first_message
     assert "discovery_plan | user_response" not in text
     # the other rows and the user_response section are unchanged
     assert "`user_response`" in _table_row(text, "execution_result`")
-    assert "`user_response`" in _table_row(text, "user_request` (follow-up")
-    assert "## 9. Answering the user directly: user_response" in text
+    assert "`user_response`" in _table_row(text, "user_request` — a follow-up")
+    assert "## 9. Concluding: final_answer or user_response" in text
     assert re.findall(r"\{[a-z_]+\}", text) == []
     assert text != render_instructions(AppConfig())
+
+
+_JSON_EXAMPLE = re.compile(r"^```json(?P<info>[^\n]*)\n(?P<body>.*?)^```", re.M | re.S)
+
+
+def _json_examples(text: str) -> list[Any]:
+    """The JSON examples of the instructions, but for those the fence line marks ``refused``:
+    each of these is proven refused, with its code, by ``test_phase2_protocol_contract``."""
+    return [
+        json.loads(match["body"])
+        for match in _JSON_EXAMPLE.finditer(text)
+        if "refused" not in match["info"].split()
+    ]
 
 
 def given_instructions_when_user_response_examples_extracted_then_both_validate_and_one_asks(
     config: AppConfig,
 ) -> None:
     text = render_instructions(config)
-    blocks = [json.loads(b) for b in re.findall(r"```json[ \t]*\n(.*?)```", text, re.S)]
+    blocks = _json_examples(text)
     responses = [b for b in blocks if isinstance(b, dict) and b.get("type") == "user_response"]
     assert len(responses) == 2
     contents = [UserResponseContent.model_validate(r["content"]) for r in responses]
@@ -2343,11 +2372,10 @@ def given_instructions_when_json_examples_extracted_then_every_message_validates
     config: AppConfig,
 ) -> None:
     text = render_instructions(config)
-    blocks = re.findall(r"```json[ \t]*\n(.*?)```", text, re.S)
+    blocks = _json_examples(text)
     assert len(blocks) >= 8, "the instructions must embed the message schemas as JSON examples"
     messages = 0
-    for block in blocks:
-        data = json.loads(block)
+    for data in blocks:
         if isinstance(data, dict) and "type" in data and "content" in data:
             envelope = Envelope.model_validate(data)
             content_model_for(envelope.type).model_validate(envelope.content)
@@ -2359,7 +2387,7 @@ def given_instructions_when_rendered_then_every_protocol_message_type_exemplifie
     config: AppConfig,
 ) -> None:
     text = render_instructions(config)
-    blocks = [json.loads(b) for b in re.findall(r"```json[ \t]*\n(.*?)```", text, re.S)]
+    blocks = _json_examples(text)
     exemplified = {b["type"] for b in blocks if isinstance(b, dict) and "type" in b}
     assert exemplified >= {m.value for m in OUTBOUND_MESSAGE_TYPES | INBOUND_MESSAGE_TYPES}
     assert "system_error" not in exemplified  # internal only, never exchanged (ADR-007)
@@ -2370,7 +2398,7 @@ def given_instructions_plan_examples_when_parsed_by_adapter_then_accepted(
 ) -> None:
     """The examples we give to the model must pass our own validation (with their outputs stored)."""
     text = render_instructions(config)
-    blocks = [json.loads(b) for b in re.findall(r"```json[ \t]*\n(.*?)```", text, re.S)]
+    blocks = _json_examples(text)
     plans = [b for b in blocks if isinstance(b, dict) and b.get("type") in PLAN_MESSAGE_TYPES]
     assert plans
     for raw in plans:
@@ -2540,6 +2568,42 @@ def given_unexpected_type_the_model_attempted_when_correction_built_then_that_ty
     )
 
     assert content.example["type"] == "final_answer"
+
+
+@pytest.mark.parametrize(
+    "attempted", [MessageType.USER_RESPONSE, MessageType.FINAL_ANSWER, MessageType.EXECUTION_PLAN]
+)
+def given_schema_fault_on_an_expected_type_when_correction_built_then_that_type_illustrated(
+    adapter: ProtocolAdapter, attempted: MessageType
+) -> None:
+    """ADR-023: the example is the shape the model got wrong when that type is expected. A schema
+    refusal records the attempted type as ``message_type`` (it has no ``received``): before
+    ADR-031 that branch could never fire and the fallback — a ``discovery_plan`` with a POSIX
+    command — illustrated a ``user_response`` fault, whatever the machine."""
+    details = {
+        "stage": "content",
+        "message_type": attempted.value,
+        "message_id": "msg-200",
+        "errors": [{"loc": "content.x", "type": "missing", "msg": "Field required"}],
+    }
+    content = _correction_content(
+        _correction(adapter, "SCHEMA_INVALID", details, expected=AFTER_FOLLOW_UP_REQUEST)
+    )
+
+    assert content.example["type"] == attempted.value
+    assert content.example == example_envelope_for(attempted, REMOTE_ID)
+
+
+def given_schema_fault_on_the_envelope_when_type_unreadable_then_the_preferred_example() -> None:
+    """A ``message_type`` that names no type (an envelope refused before its type was read) falls
+    back to the stable preference order, as before."""
+    adapter = ProtocolAdapter(AppConfig())
+    details = {"stage": "envelope", "message_type": "plan", "errors": []}
+    content = _correction_content(
+        _correction(adapter, "SCHEMA_INVALID", details, expected=AFTER_FOLLOW_UP_REQUEST)
+    )
+
+    assert content.example["type"] == "discovery_plan"
 
 
 @pytest.mark.parametrize(

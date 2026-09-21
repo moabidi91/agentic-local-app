@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from agentic_local_app.config import AppConfig
 from agentic_local_app.domain.canonical import size_bytes
 from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import ConfigError, ErrorType, TransportError
@@ -198,6 +199,30 @@ async def given_scripted_java_scenario_when_session_runs_then_three_canonical_me
         CMD_JAVA_HOME,
         CMD_GREP,
     ]
+
+
+async def given_default_configuration_when_a_session_opens_then_the_contract_leaves_the_window_healthy(
+    rig: Rig,
+) -> None:
+    """ADR-031 §6 on ADR-013: the whole contract is counted in the window of every conversation and
+    sent again at each rotation. Under the default configuration a session opens HEALTHY, with
+    nearly all of the budget left for the exchange, and never leaves that state on the §12 loop."""
+    assert rig.config.context == AppConfig().context  # the default budget and thresholds
+    rig.script_java_scenario()
+
+    session = await rig.run()
+
+    assert session.status is SessionState.COMPLETED
+    contract = render_instructions(rig.config)
+    assert rig.transport.inits[0]["instructions"] == contract
+    size = len(contract.encode("utf-8"))
+    assert 40 * 1024 < size <= 60 * 1024, size  # the full contract, within its own budget
+    opening = rig.store.list_messages("conv-0001")[0]
+    assert opening.message_type is MessageType.USER_REQUEST
+    thresholds = rig.app.monitor.thresholds()
+    assert size + opening.size_bytes < thresholds.warning_bytes // 4
+    assert rig.conversation("conv-0001").context_window_state is ContextWindowState.HEALTHY
+    assert rig.events(EventType.CONTEXT_WINDOW_STATE_CHANGED) == []
 
 
 async def given_scripted_java_scenario_when_session_completes_then_records_states_and_counters_consistent(

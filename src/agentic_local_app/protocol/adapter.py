@@ -21,7 +21,14 @@ it (ADR-030 §3) unless the caller passes the :class:`ExecutionEnvironment` itse
   being a :class:`ProtocolError` with an explicit code and JSON-serialisable ``details``;
 - the projection of an accepted plan onto ``PlanRecord`` / ``TaskRecord`` with the effective
   values of ADR-008 (timeouts), ADR-009 (flags), ADR-010 (output budgets) and ADR-011 (chunks);
-- the rendering of ``PROTOCOL_INSTRUCTIONS.md`` sent to the model at init (ADR-004).
+- the rendering of ``PROTOCOL_INSTRUCTIONS.md`` sent to the model at init (ADR-004): the contract
+  of ADR-031, whose examples carry commands written in the announced dialect
+  (:data:`EXAMPLE_COMMANDS`) and values taken from the configuration, and whose JSON blocks are
+  proven against this very adapter by ``tests/unit/test_phase2_protocol_contract.py``.
+
+Content is validated twice (ADR-031 §4): pydantic's default pass, then the same content as JSON in
+strict mode, so that a number written as a string or a boolean written as ``"yes"`` is refused
+instead of being converted silently — the contract says a number is a number.
 
 Outbound payloads are the pydantic dump of the content model with ``exclude_none=True``: the
 optional extensions of the ADRs never appear unless set, so the messages stay identical to the
@@ -31,6 +38,7 @@ than serialised as ``null`` (the model reads absence as "no stop reason").
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -44,9 +52,10 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from agentic_local_app.config import AppConfig
+from agentic_local_app.config import AppConfig, ProtocolSection
 from agentic_local_app.domain.canonical import canonical_json, size_bytes
 from agentic_local_app.domain.clock import Clock
+from agentic_local_app.domain.commands import VerdictPrograms
 from agentic_local_app.domain.dialects import ShellTranslator
 from agentic_local_app.domain.errors import NormalizedError, ProtocolError
 from agentic_local_app.domain.models import (
@@ -86,12 +95,14 @@ from agentic_local_app.protocol.messages import (
     ProtocolCorrectionRequestContent,
     SessionBudgetContent,
     TaskMessage,
+    TaskTranslation,
     UserRequestContent,
     UserResponseContent,
 )
 
 __all__ = [
     "CORRECTION_EXAMPLE_MESSAGE_ID",
+    "EXAMPLE_COMMANDS",
     "EXPECTED_INBOUND",
     "INSTRUCTIONS_FILENAME",
     "InboundContent",
@@ -280,37 +291,35 @@ def _instructions_template() -> str:
 #: Text of the first-message rule rendered into the instructions (ADR-022), by flag value.
 _INITIAL_REPLY_RULE_DIRECT = (
     "Your first response to a `user_request` in a new conversation is a `discovery_plan` "
-    "(that is how you learn the operating system, the shell, the working directory, the installed "
-    "tools and their versions), unless the request needs no command at all — an explanation, an "
-    "analysis of the text you were given, or a question back to the user: then it is a "
-    "`user_response` (section 9). A request about the machine always starts with a "
-    "`discovery_plan`."
+    "(that is how you learn what section 6 does not announce: the installed tools, their versions, "
+    "the project), unless the request needs no command at all — an explanation, an analysis of "
+    "the text you were given, or a question back to the user: then it is a `user_response` "
+    "(section 9). A request about the machine always starts with a `discovery_plan`."
 )
 _INITIAL_REPLY_RULE_STRICT = (
     "Your first response to a `user_request` in a new conversation is **always** a "
-    "`discovery_plan`: that is how you learn the operating system, the shell, the working "
-    "directory, the installed tools and their versions. A `user_response` (section 9) is only "
-    "accepted after an `execution_result` or a follow-up `user_request`."
+    "`discovery_plan`: that is how you learn what section 6 does not announce — the installed "
+    "tools, their versions, the project. A `user_response` (section 9) is only accepted after an "
+    "`execution_result` or a follow-up `user_request`."
 )
 
 #: What a refused message means for the model (ADR-023), rendered from
 #: ``protocol.max_correction_attempts``: with the policy off the instructions must not promise a
 #: correction round that will never come.
 _REJECTION_RULE_CORRECTED = (
-    "A rejected message is **not** the end of the exchange: the application answers it with a "
-    "`protocol_correction_request` (section 10) telling you exactly what was wrong and what it "
-    "expects, and reads your next message against the same expectation. After "
-    "{max_correction_attempts} refused replies in a row the session stops, so read that message "
-    "carefully rather than resending."
+    "You then receive a `protocol_correction_request` (section 10) naming the fault, and your "
+    "next message is read against the same expectation. Up to **{max_correction_attempts}** "
+    "refused replies in a row are answered this way; one more ends the session in failure."
 )
 _REJECTION_RULE_STRICT = (
-    "A rejected message ends the conversation: this deployment asks for no correction, so "
-    "re-read this table when in doubt — there is no second chance."
+    "In this deployment the first refused reply **ends the session**: there is no correction "
+    "round, so check section 12 before every message — there is no second chance."
 )
 _CORRECTION_BUDGET_RULE_ON = (
-    "After **{max_correction_attempts}** refused replies in a row, the application stops asking "
-    "and the session ends in failure. `attempt` and `max_attempts` tell you where you stand. A "
-    "reply that is accepted resets the count to zero."
+    "Up to **{max_correction_attempts}** refused replies in a row each get a correction; when "
+    "`attempt` equals `max_attempts`, the next refused reply ends the session in failure. An "
+    "accepted message resets the count to zero. A conversation already near its size limit is "
+    "moved to a new one instead (section 8), where the count starts again."
 )
 _CORRECTION_BUDGET_RULE_OFF = (
     "The correction policy is **disabled** in this deployment "
@@ -322,13 +331,13 @@ _VERDICT_RULE_ON = (
     "**One exception, and it is the important one.** Some programs answer by their exit code: a "
     "compiler that refuses to compile, a test runner that reports a failing test, a linter that "
     "finds a fault. Their non-zero exit is the **result** you asked for, not something that went "
-    "wrong. When the command of a task starts one of them — {verdict_programs} — and that command "
-    '**ran** (`execution: "ran"`), a non-zero exit does **not** stop the plan, and the result '
-    "carries `failure_is_verdict: true`. The rest of your plan runs, so you get the diagnosis in "
-    "one turn instead of one exit code. Write `critical: true` or `stop_plan_on_failure: true` on "
-    "that task when you do want the plan to stop there: an explicit instruction from you always "
-    "wins. A command that could not be started or that timed out never answered, so it is not a "
-    "verdict and stops the plan as usual."
+    "wrong. When the command line of a task begins with one of them — {verdict_programs} — and "
+    'that command **ran** (`execution: "ran"`), a non-zero exit does **not** stop the plan, and '
+    "the result carries `failure_is_verdict: true`. The rest of your plan runs, so you get the "
+    "diagnosis in one turn instead of one exit code. Write `critical: true` or "
+    "`stop_plan_on_failure: true` on that task when you do want the plan to stop there: an "
+    "explicit instruction from you always wins. A command that could not be started or that timed "
+    "out never answered, so it is not a verdict and stops the plan as usual."
 )
 _VERDICT_RULE_OFF = (
     "This deployment recognises no program whose non-zero exit is a result rather than a failure "
@@ -377,11 +386,93 @@ _TRANSLATION_RULE_ON = (
     "runs **exactly as you wrote it** and `translation.reason` says what stopped the dictionary. "
     "Read that reason and rewrite the command yourself: nothing is ever guessed on your behalf."
 )
+#: ADR-031 — the commands of the examples of the contract, written in each dialect. Only these
+#: strings vary from one machine to another: the rest of every example is the same everywhere.
+#: Their outputs in the examples are identical by construction (names only, matching lines only,
+#: one value), and none of them is ever rewritten by the dictionary of ADR-030 on its own shell.
+#: ``unknown`` borrows the POSIX spelling, the most common one among unrecognised interpreters.
+_POSIX_EXAMPLE_COMMANDS: Mapping[str, str] = MappingProxyType(
+    {
+        "list_project": "ls -A",
+        "read_settings": 'grep "maven.compiler" pom.xml',
+        "java_home": 'echo "$JAVA_HOME"',
+    }
+)
+EXAMPLE_COMMANDS: Mapping[ShellDialect, Mapping[str, str]] = MappingProxyType(
+    {
+        ShellDialect.POSIX: _POSIX_EXAMPLE_COMMANDS,
+        ShellDialect.POWERSHELL: MappingProxyType(
+            {
+                "list_project": "Get-ChildItem -Force -Name",
+                "read_settings": '(Get-Content pom.xml) -match "maven.compiler"',
+                "java_home": "$env:JAVA_HOME",
+            }
+        ),
+        ShellDialect.CMD: MappingProxyType(
+            {
+                "list_project": "dir /a /b",
+                "read_settings": 'findstr "maven.compiler" pom.xml',
+                "java_home": "echo %JAVA_HOME%",
+            }
+        ),
+        ShellDialect.UNKNOWN: _POSIX_EXAMPLE_COMMANDS,
+    }
+)
+#: The build of the example exchange: whether its failure is a verdict depends on the configured
+#: ``execution.verdict_programs`` (ADR-029 §2), and the example says what the deployment does.
+_EXAMPLE_BUILD_COMMAND = "mvn -B clean install"
+_EXAMPLE_VERDICT_FIELD = '"failure_is_verdict": true, '
+_EXAMPLE_VERDICT_NOTE_ON = (
+    "`t4` failed with `failure_is_verdict: true`: Maven ran and answered, and that answer is the "
+    "evidence (section 5.1)."
+)
+_EXAMPLE_VERDICT_NOTE_OFF = "`t4` ran and failed with exit code 1: its output is the evidence."
+#: One command per direction of the dictionary, for the ``translation`` example of the contract:
+#: the example shows the direction this machine would use (a PowerShell machine for the dialects
+#: that have no table, since the field is described there all the same).
+_TRANSLATION_EXAMPLE_SOURCE: Mapping[ShellDialect, str] = MappingProxyType(
+    {
+        ShellDialect.POSIX: "Get-Content build.log -TotalCount 20",
+        ShellDialect.POWERSHELL: "head -n 20 build.log",
+    }
+)
+_CORRECTION_WALKTHROUGH_ON = "It shows what becomes of a refused message."
+_CORRECTION_WALKTHROUGH_OFF = (
+    "It shows a refused message and the correction round of the deployments that run one; in "
+    "this one, `C2` would end the session."
+)
+
 _TRANSLATION_RULE_OFF = (
     "This deployment never rewrites a command (`execution.translate_commands = false`): what you "
     "write is what runs, character for character. A command written for another shell simply "
     "fails, and no result carries a `translation` object."
 )
+
+
+def _json_string_body(value: str) -> str:
+    """``value`` escaped for the inside of a JSON string literal (the quotes are the template's)."""
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _translation_example(dialect: ShellDialect) -> str:
+    """The ``translation`` object of the contract, computed by the dictionary itself (ADR-030 §4)
+    for the direction this machine would use, exactly as a task result would carry it."""
+    target = ShellDialect.POSIX if dialect is ShellDialect.POSIX else ShellDialect.POWERSHELL
+    decided = ShellTranslator(target).translate(_TRANSLATION_EXAMPLE_SOURCE[target])
+    if decided is None:  # pragma: no cover - both sources are entries of the dictionary
+        raise ValueError(f"no translation example towards {target.value}")
+    translation = TaskTranslation(
+        status="translated" if decided.translated else "unchanged",
+        from_dialect=decided.source.value,
+        to_dialect=decided.target.value,
+        original_cmd=decided.original,
+        executed_cmd=decided.executed,
+        rules=list(decided.rules),
+        reason=decided.reason,
+    )
+    return json.dumps(
+        translation.model_dump(mode="json", exclude_none=True), indent=2, ensure_ascii=False
+    )
 
 
 def render_instructions(
@@ -390,8 +481,8 @@ def render_instructions(
     """The protocol text sent to the model at init, with the configured limits injected, the
     first-message rule of ADR-022 rendered from ``protocol.allow_direct_response``, the correction
     policy of ADR-023 rendered from ``protocol.max_correction_attempts``, the verdict rule of
-    ADR-029 rendered from ``execution.verdict_programs`` and the environment announcement of
-    ADR-030 §3.
+    ADR-029 rendered from ``execution.verdict_programs``, the environment announcement of
+    ADR-030 §3 and — ADR-031 — the commands of the examples written in the announced dialect.
 
     ``environment`` is the announcement to render; when it is not given it is detected from the
     configuration (:func:`~agentic_local_app.domain.shell.describe_environment`, ``shutil.which``).
@@ -408,6 +499,8 @@ def render_instructions(
             config.execution.shell, config.execution.cwd, platform=sys.platform
         )
     )
+    commands = EXAMPLE_COMMANDS[where.dialect]
+    build_is_verdict = VerdictPrograms(programs).matches(_EXAMPLE_BUILD_COMMAND)
     values = {
         "environment_os": where.operating_system,
         "environment_shell": where.shell.program,
@@ -449,6 +542,21 @@ def render_instructions(
             )
             if programs
             else _VERDICT_RULE_OFF
+        ),
+        # ADR-031: the examples of the contract
+        **{f"cmd_{name}": _json_string_body(command) for name, command in commands.items()},
+        "translation_example": _translation_example(where.dialect),
+        "example_verdict_field": _EXAMPLE_VERDICT_FIELD if build_is_verdict else "",
+        "example_verdict_note": (
+            _EXAMPLE_VERDICT_NOTE_ON if build_is_verdict else _EXAMPLE_VERDICT_NOTE_OFF
+        ),
+        "example_max_attempts": (
+            attempts
+            if corrects
+            else ProtocolSection.model_fields["max_correction_attempts"].default
+        ),
+        "correction_walkthrough_intro": (
+            _CORRECTION_WALKTHROUGH_ON if corrects else _CORRECTION_WALKTHROUGH_OFF
         ),
     }
 
@@ -996,19 +1104,28 @@ class ProtocolAdapter:
         expected: frozenset[MessageType], details: Mapping[str, Any], remote: str
     ) -> dict[str, Any]:
         """A minimal valid example of one expected type: the type the model attempted when it is
-        one of them (the shape it got wrong), otherwise the first of :data:`_EXAMPLE_PREFERENCE`."""
+        one of them (the shape it got wrong), otherwise the first of :data:`_EXAMPLE_PREFERENCE`.
+
+        The attempted type is read where the refusal recorded it: ``received`` for a type refused
+        by the expectation table, ``message_type`` for a message refused by its schema — the case
+        where the attempted type **is** expected and only its shape is wrong. Reading ``received``
+        alone left that branch unreachable, since a type refused by the table is never expected
+        (found by the contract replay of ADR-031).
+        """
         candidates = [
             message_type for message_type in _ordered(expected) if message_type in _EXAMPLE_CONTENT
         ]
         if not candidates:
             return {}
-        received = details.get("received")
-        if isinstance(received, str):
+        for key in ("received", "message_type"):
+            value = details.get(key)
+            if not isinstance(value, str):
+                continue
             try:
-                attempted = MessageType(received)
+                attempted = MessageType(value)
             except ValueError:
-                attempted = None
-            if attempted is not None and attempted in candidates:
+                continue
+            if attempted in candidates:
                 return example_envelope_for(attempted, remote)
         return example_envelope_for(candidates[0], remote)
 
@@ -1141,16 +1258,40 @@ class ProtocolAdapter:
 
     @staticmethod
     def _validate_content(envelope: Envelope, model: type[ContentT]) -> ContentT:
+        """The content against its model, then against the exact JSON types (ADR-031 §4).
+
+        The first pass is pydantic's default validation, whose errors keep their usual wording.
+        The second validates the same content as JSON in strict mode: on anything the first pass
+        accepted, it can only object to a value the first pass would have **converted** — an
+        integer written as ``"600000"`` or ``600000.0``, a boolean written as ``"true"``,
+        ``"yes"`` or ``1``. Rule 5 of the contract forbids those, so they are refused here instead
+        of being read as what the model probably meant. The two passes report together (the second
+        adds only the fields the first did not already name): one correction lists every fault.
+        """
+        errors: list[dict[str, str]] = []
+        content: ContentT | None = None
         try:
-            return model.model_validate(envelope.content)
+            content = model.model_validate(envelope.content)
         except ValidationError as exc:
+            errors = _pydantic_errors(exc, prefix="content")
+        try:
+            model.model_validate_json(canonical_json(envelope.content), strict=True)
+        except ValidationError as exc:
+            named = {error["loc"] for error in errors}
+            errors.extend(
+                error
+                for error in _pydantic_errors(exc, prefix="content")
+                if error["loc"] not in named
+            )
+        if content is None or errors:
             raise ProtocolError(
                 "SCHEMA_INVALID",
                 stage="content",
                 message_type=envelope.type.value,
                 message_id=envelope.message_id,
-                errors=_pydantic_errors(exc, prefix="content"),
-            ) from exc
+                errors=errors,
+            )
+        return content
 
     def _validate_plan(
         self,

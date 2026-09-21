@@ -19,9 +19,10 @@ import pytest
 from typer.testing import CliRunner
 
 from agentic_local_app import __version__
-from agentic_local_app.config import ApiSection, AppConfig, TransportSection
+from agentic_local_app.config import ApiSection, AppConfig, TransportSection, load_config
 from agentic_local_app.domain.models import SessionBudget
 from agentic_local_app.domain.states import SessionState
+from agentic_local_app.execution.platform import select_platform
 from agentic_local_app.identity import UserIdentity
 from agentic_local_app.interfaces.cli import (
     EXIT_FAILED,
@@ -32,6 +33,7 @@ from agentic_local_app.interfaces.cli import (
     app,
     main,
 )
+from agentic_local_app.protocol.adapter import render_instructions
 from agentic_local_app.testing.mock_model_server import (
     default_analysis_scenario,
     default_java_debug_scenario,
@@ -1190,6 +1192,92 @@ def given_cli_when_help_then_shell_command_listed(runner: CliRunner) -> None:
     assert result.exit_code == 0 and "shell" in result.output
     sub = runner.invoke(app, ["shell", "--help"])
     assert sub.exit_code == 0 and "show" in sub.output and "rules" in sub.output
+
+
+# ================================================================================================
+# protocol show (ADR-031)
+# ================================================================================================
+def _contract_for(path: Path) -> str:
+    """What ``protocol show`` must print for the configuration at ``path``: the very text the
+    wiring sends at init (``render_instructions`` on the environment ``shell show`` reports)."""
+    config = load_config(path)
+    return render_instructions(config, environment=select_platform(config.execution).environment())
+
+
+def given_pinned_shell_when_protocol_show_then_the_contract_for_this_machine_is_printed(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "shell.toml"
+    path.write_text('[execution]\nshell = "pwsh"\n', encoding="utf-8")
+    result = runner.invoke(app, ["protocol", "show", "--config", str(path)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout == _contract_for(path)  # byte for byte: `protocol show > contract.md`
+    assert result.stdout.startswith("# Protocol contract for the planning model\n")
+    assert "Shell dialect | **powershell**" in result.stdout
+    assert '"cmd": "Get-ChildItem -Force -Name"' in result.stdout
+    assert "(chosen by the operator)" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("dialect", "command", "absent"),
+    [
+        ("posix", '"cmd": "ls -A"', "Get-ChildItem -Force -Name"),
+        ("powershell", '"cmd": "Get-ChildItem -Force -Name"', '"cmd": "ls -A"'),
+        ("cmd", '"cmd": "dir /a /b"', '"cmd": "ls -A"'),
+    ],
+)
+def given_dialect_option_when_protocol_show_then_rendered_as_if_that_shell_were_pinned(
+    runner: CliRunner, config_file: Path, dialect: str, command: str, absent: str
+) -> None:
+    result = runner.invoke(
+        app, ["protocol", "show", "--config", str(config_file), "--dialect", dialect]
+    )
+    assert result.exit_code == 0, result.output
+    assert f"Shell dialect | **{dialect}**" in result.stdout
+    assert command in result.stdout and absent not in result.stdout
+    assert "(chosen by the operator)" in result.stdout
+
+
+def given_protocol_show_json_then_environment_size_and_share_of_the_context_budget(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "shell.toml"
+    path.write_text(
+        '[execution]\nshell = "bash"\n[context]\nbudget_bytes = 500000\n', encoding="utf-8"
+    )
+    result = runner.invoke(app, ["protocol", "show", "--json", "--config", str(path)])
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    assert document["instructions"] == _contract_for(path)
+    assert document["dialect"] == "posix" and document["shell"] == "bash"
+    assert document["source"] == "configured" and Path(document["cwd"]).is_absolute()
+    size = len(document["instructions"].encode("utf-8"))
+    assert document["size_bytes"] == size and size <= 60 * 1024
+    assert document["context_budget_bytes"] == 500_000
+    assert document["context_share"] == round(size / 500_000, 4)
+
+
+def given_unknown_dialect_when_protocol_show_then_usage_error(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["protocol", "show", "--dialect", "fish"])
+    assert result.exit_code == 2
+    assert "fish" in result.output
+
+
+def given_invalid_config_file_when_protocol_show_then_exit_1_config_invalid(
+    runner: CliRunner, tmp_path: Path
+) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text("[protocol]\nmax_correction_attempts = -1\n", encoding="utf-8")
+    result = runner.invoke(app, ["protocol", "show", "--config", str(path)])
+    assert result.exit_code == 1, result.output
+    assert "CONFIG_INVALID" in result.output and "protocol.max_correction_attempts" in result.output
+
+
+def given_cli_when_help_then_protocol_command_listed(runner: CliRunner) -> None:
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0 and "protocol" in result.output
+    sub = runner.invoke(app, ["protocol", "--help"])
+    assert sub.exit_code == 0 and "show" in sub.output
 
 
 def given_cli_when_help_then_transport_command_listed(runner: CliRunner) -> None:

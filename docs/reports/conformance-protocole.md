@@ -2,7 +2,7 @@
 
 # Rapport de conformité protocolaire — comportement de l'application face à un modèle qui se trompe
 
-**Généré le 2026-09-19** à partir de la batterie `tests/conformance` (123 cas, tous exécutés à chaque `pytest`).
+**Généré le 2026-09-21** à partir de la batterie `tests/conformance` (123 cas, tous exécutés à chaque `pytest`).
 
 ## 1. Ce que ce rapport mesure
 
@@ -43,11 +43,11 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | Politique appliquée | 5 | 5 | 0 | 0 |
 | Structure du plan | 17 | 17 | 0 | 0 |
 | Dépendances et exécution | 11 | 11 | 0 | 0 |
-| Valeurs des tâches | 19 | 18 | 1 | 0 |
-| Contenus de conclusion | 16 | 15 | 1 | 0 |
+| Valeurs des tâches | 19 | 19 | 0 | 0 |
+| Contenus de conclusion | 16 | 16 | 0 | 0 |
 | Réponses licites mais inattendues | 7 | 7 | 0 | 0 |
 
-**Total : 123 cas — 121 conformes, 2 à surveiller, 0 écarts.**
+**Total : 123 cas — 123 conformes, 0 à surveiller, 0 écarts.**
 
 ## 5. La matrice
 
@@ -173,7 +173,7 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | `task-timeout-zero` | `timeout_ms = 0` | rejet par le schéma (`gt = 0`) : zéro n'est pas « pas de limite » | `SCHEMA_INVALID` | échec | §12.2 · ADR-008 | ✅ |
 | `task-timeout-clamped` | `timeout_ms` au-dessus de `execution.max_task_timeout_ms` | accepté et ramené au plafond : `timeout_ms_applied` vaut le plafond, et c'est ce délai que reçoit l'exécuteur | `accepté` | accepté (valeur normalisée) | ADR-008 §1 | ✅ |
 | `task-timeout-default` | une tâche sans `timeout_ms` | accepté : le défaut de configuration s'applique, la déclaration reste vide et l'exécuteur reçoit `execution.default_task_timeout_ms` | `accepté` | accepté (défaut appliqué) | ADR-008 §1 | ✅ |
-| `task-values-coerced-from-strings` | une tâche dont le budget, le timeout et les drapeaux arrivent en chaînes ou en entiers | accepté et **converti** sans avertissement : `"2048"` devient un budget, `"1000"` un timeout, `"yes"`/`0` des drapeaux, et ce sont ces valeurs qui pilotent l'exécution | `accepté` | accepté (valeurs converties) | §12.2 · ADR-008 · ADR-009 · ADR-010 | ⚠️ |
+| `task-values-sent-as-strings` | une tâche dont le budget, le timeout et les drapeaux arrivent en chaînes ou en entiers | rejet : un entier s'écrit sans guillemets et un booléen `true` ou `false` (règle 5 du contrat) ; `"yes"`, `0`, `"2048"` et `"1000"` sont nommés un à un dans `details.errors`, rien n'est converti ni exécuté | `SCHEMA_INVALID` | échec | §12.2 · ADR-008 · ADR-009 · ADR-010 · ADR-031 | ✅ |
 | `plan-default-output-budget` | un plan portant `default_max_output_bytes`, avec une tâche qui déclare et une qui non | précédence tâche > plan > configuration, lisible sur chaque `max_output_bytes_applied` : le défaut du plan ne touche que les tâches muettes et ne survit pas au plan suivant | `accepté` | accepté (valeur normalisée) | §2.5 · ADR-010 | ✅ |
 | `chunk-missing-ref-task-id` | un `chunk_request` sans `ref_task_id` | rejet : sans référence, il n'y a rien à relire | `SCHEMA_INVALID` | échec | §12.6 · ADR-011 | ✅ |
 | `chunk-missing-range` | un `chunk_request` sans `byte_offset`, puis sans `max_bytes` | rejet : la plage est obligatoire, aucune valeur implicite | `SCHEMA_INVALID` | échec | §12.6 · ADR-011 | ✅ |
@@ -196,7 +196,7 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 | `user-response-empty-body` | un `user_response` au corps vide | rejet : répondre à l'utilisateur sans rien lui dire n'est pas une réponse | `SCHEMA_INVALID` | échec | ADR-022 §1 | ✅ |
 | `user-response-too-large` | un `user_response` dont le corps dépasse `payload.max_message_bytes` | rejet ; `details` porte la taille du corps, la borne et le message fautif | `USER_RESPONSE_TOO_LARGE` | échec | ADR-010 · ADR-022 §1 | ✅ |
 | `user-response-expects-reply-not-a-bool` | un `user_response` dont `expects_reply` vaut la chaîne `sometimes` | rejet : `expects_reply` décide de la suite du tour, il doit être un booléen | `SCHEMA_INVALID` | échec | ADR-022 §1 · ADR-022 §4 | ✅ |
-| `user-response-expects-reply-coerced` | un `user_response` dont `expects_reply` vaut la chaîne `yes` | accepté et **converti** en `true` par la coercition laxiste de pydantic | `accepté` | accepté (valeur convertie) | ADR-022 §1 · ADR-022 §4 | ⚠️ |
+| `user-response-expects-reply-as-string` | un `user_response` dont `expects_reply` vaut la chaîne `yes` | rejet : `expects_reply` décide de la suite du tour et s'écrit `true` ou `false`, jamais en chaîne — la même règle que pour `sometimes`, sans conversion préalable | `SCHEMA_INVALID` | échec | ADR-022 §1 · ADR-022 §4 · ADR-031 | ✅ |
 | `user-response-unknown-status` | un `user_response` dont le `status` est hors domaine (`done`) | rejet : trois statuts existent (`completed`, `partial`, `failed`) | `SCHEMA_INVALID` | échec | ADR-022 §1 | ✅ |
 | `user-response-json-body-not-json` | un `user_response` déclaré `format = "json"` dont le corps n'est pas du JSON | **accepté** : le corps est opaque, jamais analysé ; il est persisté verbatim et `format` ne sert qu'au rendu côté utilisateur | `accepté` | accepté | ADR-022 §1 | ✅ |
 | `user-response-envelope-look-alike` | un `user_response` dont le corps contient une enveloppe de protocole en texte | accepté verbatim : rien du corps n'est réinjecté dans le protocole, aucun plan n'est créé, aucun message n'est posté | `accepté` | accepté | ADR-022 §1 · ADR-022 §5 | ✅ |
@@ -217,8 +217,7 @@ La batterie a été écrite contre l'application telle qu'elle était, sans rien
 
 ## 6. Constats et recommandations
 
-- ⚠️ **`task-values-coerced-from-strings`** (Valeurs des tâches) — Les contenus sont validés en mode **laxiste** (pydantic par défaut) : un entier accepte une chaîne numérique (`"2048"`) et un flottant entier (`2048.0`), un booléen accepte `"yes"`, `"no"`, `"on"`, `0`, `1`. La conversion est silencieuse et sert ensuite de base aux valeurs appliquées : plafonnement ADR-010, timeout passé au shell (ADR-008), règle d'arrêt ADR-009 — un `continue_on_error: 0` décide donc de l'arrêt du plan. Rien n'est incohérent ici (les valeurs obtenues sont celles que le modèle voulait) et les identifiants, eux, restent strictement des chaînes, mais la frontière du protocole est plus floue que ce que le §12 laisse entendre. À trancher : soit valider les contenus en mode strict (`strict=True` sur `ProtocolModel`), soit documenter explicitement la tolérance dans `PROTOCOL_INSTRUCTIONS.md` (ADR-004). Même cause que `user-response-expects-reply-coerced`.
-- ⚠️ **`user-response-expects-reply-coerced`** (Contenus de conclusion) — Même cause que `task-values-coerced-from-strings` (validation laxiste), mais sur le drapeau qui décide de la suite du tour : `expects_reply` garde la conversation réutilisable sous `auto_close_on_final_answer` (ADR-022 §4) et il est ici dérivé d'une chaîne. `"yes"`, `"on"`, `"1"` donnent `true` ; `"sometimes"` reste refusé. Même arbitrage à rendre : validation stricte des contenus, ou tolérance documentée.
+Aucun écart : tous les cas de la matrice se comportent comme la spécification et les ADR le prescrivent.
 
 ## 7. Comment rejouer la batterie
 
